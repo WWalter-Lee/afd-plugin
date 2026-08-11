@@ -402,21 +402,30 @@ def recv_control_payload(
     device: torch.device,
 ) -> AFDControlPayload:
     """Receive and decode a DP-metadata payload from ``src`` over ``group``."""
-    size_tensor = torch.empty(1, dtype=torch.long, device=device)
+    # Gloo can return from recv without touching the destination after its peer
+    # closes. Zero initialization makes that state deterministic instead of
+    # interpreting allocator contents as a frame length or JSON body.
+    size_tensor = torch.zeros(1, dtype=torch.long, device=device)
     rank_size = torch.distributed.recv(size_tensor, src=src, group=group)
+    if rank_size != src:
+        raise AFDControlPlaneClosedError(
+            "Attention control plane closed before the payload size arrived"
+        )
     object_size = int(size_tensor.item())
     if object_size <= 0:
         raise AFDControlPlaneClosedError(
             "Attention control plane closed before the payload size arrived"
         )
-    object_tensor = torch.empty(
+    object_tensor = torch.zeros(
         object_size,
         dtype=torch.uint8,
         device=device,
     )
     rank_object = torch.distributed.recv(object_tensor, src=src, group=group)
-    if rank_object != rank_size:
-        raise RuntimeError("received AFD DP metadata fragments from different ranks")
+    if rank_object != src:
+        raise AFDControlPlaneClosedError(
+            "Attention control plane closed before the payload body arrived"
+        )
     object_bytes = object_tensor.cpu().numpy().tobytes()
     if not object_bytes.strip(b"\x00"):
         raise AFDControlPlaneClosedError(
