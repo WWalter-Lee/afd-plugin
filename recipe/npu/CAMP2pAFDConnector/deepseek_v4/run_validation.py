@@ -219,6 +219,47 @@ def _role_log_gate(log_dir: Path) -> dict[str, Any]:
     }
 
 
+def _profile_output_gate(profile_dir: Path) -> dict[str, Any]:
+    roles: dict[str, Any] = {}
+    for role in ("attention", "ffn"):
+        trace_dirs = sorted((profile_dir / role).glob("*_ascend_pt"))
+        required_sizes: dict[str, int] = {}
+        cann_raw_file_count = 0
+        if len(trace_dirs) == 1:
+            trace_dir = trace_dirs[0]
+            for relative_path in (
+                Path("profiler_info_0.json"),
+                Path("FRAMEWORK/torch.op_range"),
+            ):
+                path = trace_dir / relative_path
+                required_sizes[str(relative_path)] = (
+                    path.stat().st_size if path.is_file() else 0
+                )
+            cann_raw_file_count = sum(
+                1
+                for prof_dir in trace_dir.glob("PROF_*")
+                if prof_dir.is_dir()
+                for path in prof_dir.rglob("*")
+                if path.is_file() and path.stat().st_size > 0
+            )
+        role_passed = bool(
+            len(trace_dirs) == 1
+            and required_sizes
+            and all(size > 0 for size in required_sizes.values())
+            and cann_raw_file_count > 0
+        )
+        roles[role] = {
+            "passed": role_passed,
+            "trace_dirs": [str(path) for path in trace_dirs],
+            "required_sizes": required_sizes,
+            "cann_raw_file_count": cann_raw_file_count,
+        }
+    return {
+        "roles": roles,
+        "passed": all(result["passed"] for result in roles.values()),
+    }
+
+
 def _capture_command(command: list[str], output: Path) -> None:
     with output.open("wb") as handle:
         subprocess.run(command, stdout=handle, stderr=subprocess.STDOUT, check=False)
@@ -380,10 +421,16 @@ def main() -> None:
                 for handle in handles:
                     handle.close()
                 cycle_result["log_gate"] = _role_log_gate(cycle_dir)
+                profile_passed = True
+                if profile_dir is not None:
+                    profile_gate = _profile_output_gate(profile_dir)
+                    cycle_result["profile"]["output_gate"] = profile_gate
+                    profile_passed = profile_gate["passed"]
                 cycle_result["passed"] = bool(
                     cycle_result.get("passed", False)
                     and cycle_result["shutdown"]["passed"]
                     and cycle_result["log_gate"]["passed"]
+                    and profile_passed
                 )
                 _capture_command(
                     ["npu-smi", "info"], cycle_dir / "npu_after_cleanup.txt"

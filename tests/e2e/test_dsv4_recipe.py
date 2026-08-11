@@ -135,3 +135,27 @@ def test_dsv4_log_gate_rejects_hidden_worker_fatal(tmp_path):
     assert result["roles"]["ffn"]["fatal_markers"] == [
         "AFD NPU FFN worker loop failed"
     ]
+
+
+def test_dsv4_profile_gate_requires_one_nonempty_dp0_trace_per_role(tmp_path):
+    runner = _load_runner()
+    for role in ("attention", "ffn"):
+        trace_dir = tmp_path / role / f"{role}_dp0_ascend_pt"
+        (trace_dir / "FRAMEWORK").mkdir(parents=True)
+        (trace_dir / "profiler_info_0.json").write_text("{}\n", encoding="utf-8")
+        (trace_dir / "FRAMEWORK/torch.op_range").write_bytes(b"torch-ops")
+        raw_dir = trace_dir / "PROF_000001/device_0/data"
+        raw_dir.mkdir(parents=True)
+        (raw_dir / "stars.data").write_bytes(b"cann-data")
+
+    result = runner._profile_output_gate(tmp_path)
+
+    assert result["passed"] is True
+    assert result["roles"]["attention"]["cann_raw_file_count"] == 1
+
+    (tmp_path / "attention/extra_ascend_pt").mkdir()
+
+    result = runner._profile_output_gate(tmp_path)
+
+    assert result["passed"] is False
+    assert result["roles"]["attention"]["passed"] is False

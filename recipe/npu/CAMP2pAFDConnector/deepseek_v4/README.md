@@ -51,7 +51,8 @@ python recipe/npu/CAMP2pAFDConnector/deepseek_v4/run_validation.py \
 
 Both role profilers run only on role-local DP0 and use
 `TORCH_PROFILER_WITH_STACK=0`; their schedule is wait 2, warmup 1, active 10,
-repeat 1, with no skipped steps.
+repeat 1, with no skipped steps. Profile validation also requires exactly one
+non-empty raw Ascend trace for each role.
 
 For a startup smoke test while developing the recipe:
 
