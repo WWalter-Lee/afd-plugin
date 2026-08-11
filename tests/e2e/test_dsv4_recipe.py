@@ -86,6 +86,7 @@ def test_dsv4_runtime_manifest_records_graph_u1(monkeypatch):
 
 def test_dsv4_shutdown_gate_requires_both_roles_to_exit_cleanly(monkeypatch):
     runner = _load_runner()
+    stop_calls = []
 
     class FakeProcess:
         def __init__(self, returncode):
@@ -95,7 +96,11 @@ def test_dsv4_shutdown_gate_requires_both_roles_to_exit_cleanly(monkeypatch):
         def poll(self):
             return self.returncode
 
-    monkeypatch.setattr(runner, "_stop_process", lambda _process: None)
+    monkeypatch.setattr(
+        runner,
+        "_stop_process",
+        lambda process, **kwargs: stop_calls.append((process, kwargs)),
+    )
 
     clean = runner._shutdown_roles(
         {"attention": FakeProcess(0), "ffn": FakeProcess(0)}
@@ -106,3 +111,26 @@ def test_dsv4_shutdown_gate_requires_both_roles_to_exit_cleanly(monkeypatch):
 
     assert clean["passed"] is True
     assert failed["passed"] is False
+    assert [kwargs for _process, kwargs in stop_calls] == [
+        {},
+        {"signal_group": False},
+        {},
+        {"signal_group": False},
+    ]
+
+
+def test_dsv4_log_gate_rejects_hidden_worker_fatal(tmp_path):
+    runner = _load_runner()
+    (tmp_path / "attention.log").write_text("clean shutdown\n", encoding="utf-8")
+    (tmp_path / "ffn.log").write_text(
+        "AFD NPU FFN worker loop failed\n",
+        encoding="utf-8",
+    )
+
+    result = runner._role_log_gate(tmp_path)
+
+    assert result["passed"] is False
+    assert result["roles"]["attention"]["passed"] is True
+    assert result["roles"]["ffn"]["fatal_markers"] == [
+        "AFD NPU FFN worker loop failed"
+    ]

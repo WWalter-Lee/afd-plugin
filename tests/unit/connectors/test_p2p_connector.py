@@ -14,6 +14,7 @@ from afd_plugin.config import AFDConfig, afd_config_from_mapping  # noqa: E402
 from afd_plugin.connectors import (  # noqa: E402
     AFDConnectorFactory,
     AFDControlPayload,
+    AFDControlPlaneClosedError,
     AFDDPMetadata,
 )
 from afd_plugin.distributed import build_rank_mapping  # noqa: E402
@@ -299,6 +300,24 @@ def test_p2p_shutdown_control_payload_round_trip():
 
     assert decoded.dp_metadata_list == {}
     assert decoded.shutdown is True
+
+
+def test_control_payload_zero_size_is_peer_shutdown(monkeypatch):
+    module = importlib.import_module("afd_plugin.connectors.metadata")
+    recv_calls = []
+
+    def recv(tensor, *, src, group):
+        recv_calls.append((src, group))
+        tensor.zero_()
+        return src
+
+    monkeypatch.setattr(module.torch.distributed, "recv", recv)
+    group = object()
+
+    with pytest.raises(AFDControlPlaneClosedError, match="payload size"):
+        module.recv_control_payload(src=3, group=group, device=torch.device("cpu"))
+
+    assert recv_calls == [(3, group)]
 
 
 def test_p2p_custom_ops_register_send_recv_with_fake_impls(monkeypatch):

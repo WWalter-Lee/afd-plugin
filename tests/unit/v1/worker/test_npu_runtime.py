@@ -1742,6 +1742,18 @@ def test_npu_ffn_worker_treats_attention_gloo_eof_as_shutdown(caplog):
     assert "AFD NPU FFN worker loop failed" not in caplog.text
 
 
+def test_npu_ffn_worker_recognizes_control_plane_close_only():
+    from afd_plugin.connectors import AFDControlPlaneClosedError
+    from afd_plugin.v1.worker.npu.ffn_worker import (
+        _is_attention_control_plane_shutdown,
+    )
+
+    assert _is_attention_control_plane_shutdown(
+        AFDControlPlaneClosedError("peer closed")
+    )
+    assert not _is_attention_control_plane_shutdown(ValueError("bad payload"))
+
+
 def test_npu_ffn_worker_stops_loop_before_parent_shutdown(monkeypatch):
     _require_npu_runtime()
     from afd_plugin.v1.worker.npu import ffn_worker

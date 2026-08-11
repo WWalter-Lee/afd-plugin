@@ -17,6 +17,11 @@ from typing import Any
 
 RECIPE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = RECIPE_DIR.parents[3]
+FATAL_LOG_MARKERS = (
+    "AFD NPU FFN worker loop failed",
+    "EngineCore encountered a fatal error",
+    "RuntimeError: Worker failed with error",
+)
 
 
 def _port_is_free(port: int) -> bool:
@@ -152,8 +157,22 @@ def _signal_group(process: subprocess.Popen[bytes], sig: signal.Signals) -> None
             os.killpg(process.pid, sig)
 
 
-def _stop_process(process: subprocess.Popen[bytes], timeout: float = 30) -> None:
-    _signal_group(process, signal.SIGTERM)
+def _signal_process(process: subprocess.Popen[bytes], sig: signal.Signals) -> None:
+    if process.poll() is None:
+        with suppress(ProcessLookupError):
+            os.kill(process.pid, sig)
+
+
+def _stop_process(
+    process: subprocess.Popen[bytes],
+    timeout: float = 30,
+    *,
+    signal_group: bool = True,
+) -> None:
+    if signal_group:
+        _signal_group(process, signal.SIGTERM)
+    else:
+        _signal_process(process, signal.SIGTERM)
     try:
         process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -174,7 +193,10 @@ def _shutdown_roles(processes: dict[str, subprocess.Popen[bytes]]) -> dict[str, 
             time.sleep(2)
             ffn_exited_after_attention = ffn.poll() is not None
         result["ffn_exited_after_attention"] = ffn_exited_after_attention
-        _stop_process(ffn)
+        # FFN uses a supervising shell. Signal only that shell first so its
+        # trap can ask the vLLM parent to shut down descendants in order. The
+        # timeout path in _stop_process still kills the full process group.
+        _stop_process(ffn, signal_group=False)
         result["ffn_returncode"] = ffn.returncode
     result["passed"] = all(
         result.get(f"{role}_returncode") == 0
@@ -182,6 +204,19 @@ def _shutdown_roles(processes: dict[str, subprocess.Popen[bytes]]) -> dict[str, 
         if role in processes
     )
     return result
+
+
+def _role_log_gate(log_dir: Path) -> dict[str, Any]:
+    roles: dict[str, Any] = {}
+    for role in ("attention", "ffn"):
+        log_path = log_dir / f"{role}.log"
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+        markers = [marker for marker in FATAL_LOG_MARKERS if marker in text]
+        roles[role] = {"passed": not markers, "fatal_markers": markers}
+    return {
+        "roles": roles,
+        "passed": all(result["passed"] for result in roles.values()),
+    }
 
 
 def _capture_command(command: list[str], output: Path) -> None:
@@ -340,12 +375,14 @@ def main() -> None:
                 cycle_result["passed"] = True
             finally:
                 cycle_result["shutdown"] = _shutdown_roles(processes)
+                for handle in handles:
+                    handle.close()
+                cycle_result["log_gate"] = _role_log_gate(cycle_dir)
                 cycle_result["passed"] = bool(
                     cycle_result.get("passed", False)
                     and cycle_result["shutdown"]["passed"]
+                    and cycle_result["log_gate"]["passed"]
                 )
-                for handle in handles:
-                    handle.close()
                 _capture_command(
                     ["npu-smi", "info"], cycle_dir / "npu_after_cleanup.txt"
                 )

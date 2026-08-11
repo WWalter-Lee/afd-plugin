@@ -311,6 +311,10 @@ def _to_int(value: object) -> int:
     return int(item() if callable(item) else value)
 
 
+class AFDControlPlaneClosedError(RuntimeError):
+    """The peer closed while a control payload was being received."""
+
+
 def encode_control_payload(payload: AFDControlPayload) -> bytes:
     """Serialize an ``AFDControlPayload`` to a compact JSON byte string.
 
@@ -400,15 +404,25 @@ def recv_control_payload(
     """Receive and decode a DP-metadata payload from ``src`` over ``group``."""
     size_tensor = torch.empty(1, dtype=torch.long, device=device)
     rank_size = torch.distributed.recv(size_tensor, src=src, group=group)
+    object_size = int(size_tensor.item())
+    if object_size <= 0:
+        raise AFDControlPlaneClosedError(
+            "Attention control plane closed before the payload size arrived"
+        )
     object_tensor = torch.empty(
-        int(size_tensor.item()),
+        object_size,
         dtype=torch.uint8,
         device=device,
     )
     rank_object = torch.distributed.recv(object_tensor, src=src, group=group)
     if rank_object != rank_size:
         raise RuntimeError("received AFD DP metadata fragments from different ranks")
-    return decode_control_payload(object_tensor.cpu().numpy().tobytes())
+    object_bytes = object_tensor.cpu().numpy().tobytes()
+    if not object_bytes.strip(b"\x00"):
+        raise AFDControlPlaneClosedError(
+            "Attention control plane closed before the payload body arrived"
+        )
+    return decode_control_payload(object_bytes)
 
 
 __all__ = [
@@ -418,6 +432,7 @@ __all__ = [
     "AFDTransferMetadata",
     "AFDDPMetadata",
     "AFDControlPayload",
+    "AFDControlPlaneClosedError",
     "AFDF2ATransferPayload",
     "AFDForwardContextMetadata",
     "AFDA2FTransferPayload",

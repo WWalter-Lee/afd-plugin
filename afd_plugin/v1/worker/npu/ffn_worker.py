@@ -19,6 +19,7 @@ from afd_plugin.compat.npu import (
     fix_all2all_backend_for_afd,
     npu_afd_num_ubatches,
 )
+from afd_plugin.connectors import AFDControlPlaneClosedError
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
 from afd_plugin.validation import NPU_FFN_WORKER_FQCN, assert_compatible_afd_stack
@@ -198,6 +199,8 @@ def _is_attention_control_plane_shutdown(error: BaseException) -> bool:
     seen: set[int] = set()
     while current is not None and id(current) not in seen:
         seen.add(id(current))
+        if isinstance(current, AFDControlPlaneClosedError):
+            return True
         message = str(current).lower()
         if "gloo" in message and (
             "connection closed by peer" in message
