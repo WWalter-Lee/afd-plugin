@@ -163,6 +163,9 @@ def test_runner_drops_flashcomm_for_npu_role_without_tp(monkeypatch):
     env = runner.build_env("2,3", args, role="ffn")
 
     assert "VLLM_ASCEND_ENABLE_FLASHCOMM1" not in env
+    assert env["VLLM_PLUGINS"] == (
+        "ascend,ascend_model,ascend_model_loader,ascend_kv_connector,afd"
+    )
 
 
 def test_runner_forces_gpu_v1_model_runner(monkeypatch):

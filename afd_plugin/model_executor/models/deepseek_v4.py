@@ -287,9 +287,9 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
 
         self.start_layer, self.end_layer, self.layers = native.make_layers(
             config.num_hidden_layers,
-            lambda layer_prefix: AFDDeepseekV4DecoderLayer(
+            lambda prefix: AFDDeepseekV4DecoderLayer(
                 vllm_config,
-                layer_prefix,
+                prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
             ),
             prefix=f"{prefix}.layers",

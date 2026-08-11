@@ -168,7 +168,9 @@ def test_ffn_layer_owns_moe_only(
 
 def _patch_make_layers(monkeypatch):
     def make_layers(count, factory, *, prefix):
-        layers = nn.ModuleList(factory(f"{prefix}.{idx}") for idx in range(count))
+        layers = nn.ModuleList(
+            factory(prefix=f"{prefix}.{idx}") for idx in range(count)
+        )
         return 0, count, layers
 
     monkeypatch.setattr(adapter.native, "make_layers", make_layers)
