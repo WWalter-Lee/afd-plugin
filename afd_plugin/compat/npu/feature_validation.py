@@ -34,6 +34,9 @@ def fail_if_unsupported_npu_afd_features(
         vllm_config,
     )
 
+    if _is_deepseek_v4(vllm_config):
+        _fail_if_unsupported_deepseek_v4_features(vllm_config, afd_config)
+
     if afd_config.connector == AFD_ASYNC_CONNECTOR:
         _fail_if_unsupported_npu_afd_async_features(
             vllm_config,
@@ -122,6 +125,51 @@ def _fail_if_unsupported_npu_afd_async_features(
         raise RuntimeError(
             "CAMAsyncAFDConnector currently supports only dynamicQuant 0 or 1",
         )
+
+
+def _is_deepseek_v4(vllm_config: VllmConfig) -> bool:
+    hf_config = getattr(vllm_config.model_config, "hf_config", None)
+    architectures = getattr(hf_config, "architectures", None) or []
+    return any(
+        architecture in {"DeepseekV4ForCausalLM", "AFDDeepseekV4ForCausalLM"}
+        for architecture in architectures
+    )
+
+
+def _fail_if_unsupported_deepseek_v4_features(
+    vllm_config: VllmConfig,
+    afd_config: AFDConfig,
+) -> None:
+    """Keep the first DSV4 AFD release inside its validated correctness box."""
+    parallel_config = vllm_config.parallel_config
+    if afd_config.connector != "CAMP2pAFDConnector":
+        raise RuntimeError("DeepSeek-V4 AFD supports only CAMP2pAFDConnector")
+    if afd_config.num_attention_ranks != afd_config.num_ffn_ranks:
+        raise RuntimeError("DeepSeek-V4 AFD requires equal Attention and FFN ranks")
+    if parallel_config.tensor_parallel_size != 1:
+        raise RuntimeError("DeepSeek-V4 AFD supports only tensor_parallel_size=1")
+    if parallel_config.pipeline_parallel_size != 1:
+        raise RuntimeError("DeepSeek-V4 AFD supports only pipeline_parallel_size=1")
+    if parallel_config.prefill_context_parallel_size != 1:
+        raise RuntimeError(
+            "DeepSeek-V4 AFD supports only prefill context parallel size 1"
+        )
+    if parallel_config.decode_context_parallel_size != 1:
+        raise RuntimeError(
+            "DeepSeek-V4 AFD supports only decode context parallel size 1"
+        )
+    if parallel_config.use_sequence_parallel_moe:
+        raise RuntimeError("DeepSeek-V4 AFD does not support sequence-parallel MoE")
+    if parallel_config.use_ubatching:
+        raise RuntimeError("DeepSeek-V4 AFD does not support DBO/ubatching yet")
+    if afd_config.compute_gate_on_attention:
+        raise RuntimeError("DeepSeek-V4 AFD requires FFN-side gate computation")
+    if not vllm_config.model_config.enforce_eager:
+        raise RuntimeError("DeepSeek-V4 AFD supports only eager execution yet")
+    if vllm_config.speculative_config is not None:
+        raise RuntimeError("DeepSeek-V4 AFD does not support MTP/speculative decoding")
+    if getattr(vllm_config, "kv_transfer_config", None) is not None:
+        raise RuntimeError("DeepSeek-V4 AFD standalone baseline does not support PD")
 
 
 def _fail_if_unsupported_npu_async_moe_ubatching_features(

@@ -195,6 +195,8 @@ def _vllm_config(
     use_mla=False,
     cudagraph_mode="FULL",
     speculative_config=None,
+    architecture=None,
+    kv_transfer_config=None,
     **parallel_overrides,
 ):
     async_dp = bool(parallel_overrides.pop("async_dp", False))
@@ -214,6 +216,9 @@ def _vllm_config(
         parallel_config=_parallel_config(**parallel_overrides),
         model_config=SimpleNamespace(
             enforce_eager=True,
+            hf_config=SimpleNamespace(
+                architectures=[] if architecture is None else [architecture],
+            ),
             hf_text_config=SimpleNamespace(),
             use_mla=use_mla,
         ),
@@ -227,6 +232,7 @@ def _vllm_config(
             fast_moe_cold_start=False,
         ),
         speculative_config=speculative_config,
+        kv_transfer_config=kv_transfer_config,
     )
 
 
@@ -1531,6 +1537,79 @@ def test_npu_feature_validation_uses_selected_connector_extra_info_parser():
                 extra_config={"core_num": 8},
             ),
         )
+
+
+def _dsv4_config(**kwargs):
+    parallel_defaults = {
+        "tensor_parallel_size": 1,
+        "pipeline_parallel_size": 1,
+        "prefill_context_parallel_size": 1,
+        "decode_context_parallel_size": 1,
+        "use_sequence_parallel_moe": False,
+    }
+    parallel_defaults.update(kwargs)
+    config = _vllm_config(
+        architecture="DeepseekV4ForCausalLM",
+        **parallel_defaults,
+    )
+    config.additional_config["afd"].update(
+        num_attention_ranks=1,
+        num_ffn_ranks=1,
+    )
+    return config
+
+
+def test_dsv4_feature_validation_accepts_only_eager_u1_camp2p():
+    fail_if_unsupported_npu_afd_features(_dsv4_config())
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda config: config.additional_config["afd"].update(
+            connector="P2pNcclAFDConnector"
+        ), "only CAMP2pAFDConnector"),
+        (lambda config: config.additional_config["afd"].update(
+            num_ffn_ranks=2
+        ), "equal Attention and FFN"),
+        (lambda config: setattr(
+            config.parallel_config, "tensor_parallel_size", 2
+        ), "tensor_parallel_size=1"),
+        (lambda config: setattr(
+            config.parallel_config, "pipeline_parallel_size", 2
+        ), "pipeline_parallel_size=1"),
+        (lambda config: setattr(
+            config.parallel_config, "prefill_context_parallel_size", 2
+        ), "prefill context parallel"),
+        (lambda config: setattr(
+            config.parallel_config, "decode_context_parallel_size", 2
+        ), "decode context parallel"),
+        (lambda config: setattr(
+            config.parallel_config, "use_sequence_parallel_moe", True
+        ), "sequence-parallel MoE"),
+        (lambda config: setattr(
+            config.parallel_config, "use_ubatching", True
+        ), "DBO/ubatching"),
+        (lambda config: config.additional_config["afd"].update(
+            compute_gate_on_attention=True
+        ), "FFN-side gate"),
+        (lambda config: setattr(
+            config.model_config, "enforce_eager", False
+        ), "only eager"),
+        (lambda config: setattr(
+            config, "speculative_config", object()
+        ), "MTP/speculative"),
+        (lambda config: setattr(
+            config, "kv_transfer_config", object()
+        ), "does not support PD"),
+    ],
+)
+def test_dsv4_feature_validation_rejects_unvalidated_modes(mutation, message):
+    config = _dsv4_config()
+    mutation(config)
+
+    with pytest.raises(RuntimeError, match=message):
+        fail_if_unsupported_npu_afd_features(config)
 
 
 def test_npu_feature_validation_allows_two_ubatches_only():
