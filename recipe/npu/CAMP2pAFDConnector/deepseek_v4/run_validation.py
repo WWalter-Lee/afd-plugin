@@ -239,6 +239,7 @@ def _runtime_manifest(*, execution_mode: str, profile: bool) -> dict[str, Any]:
         "execution_mode": execution_mode,
         "u_batches": 1,
         "profile": profile,
+        "profile_role_ranks": [0] if profile else [],
         "torch_profiler_with_stack": False,
         "commits": {
             "afd_plugin": git_head(str(REPO_ROOT)),
@@ -319,6 +320,7 @@ def main() -> None:
                     "wait": 2,
                     "warmup": 1,
                     "active": 10,
+                    "role_ranks": [0],
                     "with_stack": False,
                 }
             try:

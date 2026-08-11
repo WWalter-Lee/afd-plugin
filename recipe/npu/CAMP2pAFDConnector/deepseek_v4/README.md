@@ -49,8 +49,9 @@ python recipe/npu/CAMP2pAFDConnector/deepseek_v4/run_validation.py \
   --output-dir /mnt/workspace/validation/dsv4_afd_graph_u1_profile_$(date +%Y%m%d_%H%M%S)
 ```
 
-Both role profilers use `TORCH_PROFILER_WITH_STACK=0`; their schedule is wait
-2, warmup 1, active 10, repeat 1, with no skipped steps.
+Both role profilers run only on role-local DP0 and use
+`TORCH_PROFILER_WITH_STACK=0`; their schedule is wait 2, warmup 1, active 10,
+repeat 1, with no skipped steps.
 
 For a startup smoke test while developing the recipe:
 

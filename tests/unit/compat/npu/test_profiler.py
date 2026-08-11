@@ -112,6 +112,12 @@ def test_create_npu_profiler_uses_configured_schedule(monkeypatch):
     assert profiler_module.trace_dir == "/tmp/afd-ffn"
 
 
+def test_create_npu_profiler_skips_nonzero_role_rank(monkeypatch):
+    monkeypatch.setenv("AFD_NPU_FFN_PROFILER_ENABLE", "true")
+
+    assert create_afd_npu_profiler("ffn", role_rank=1) is None
+
+
 def test_step_npu_profiler_ignores_disabled_profiler():
     step_afd_npu_profiler(None)
 

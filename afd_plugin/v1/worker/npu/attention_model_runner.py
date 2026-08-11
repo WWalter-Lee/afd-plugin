@@ -144,7 +144,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         self._afd_async_moe_ubatch_metadata = None
         self._afd_live_execution = False
         self.ubatch_slices = None
-        self.prof = create_afd_npu_profiler("attention")
+        self.prof = create_afd_npu_profiler("attention", role_rank=rank)
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:

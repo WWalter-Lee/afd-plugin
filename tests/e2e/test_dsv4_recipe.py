@@ -81,6 +81,7 @@ def test_dsv4_runtime_manifest_records_graph_u1(monkeypatch):
     assert manifest["execution_mode"] == "full-decode-only"
     assert manifest["u_batches"] == 1
     assert manifest["profile"] is True
+    assert manifest["profile_role_ranks"] == [0]
     assert manifest["torch_profiler_with_stack"] is False
 
 
