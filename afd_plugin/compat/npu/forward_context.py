@@ -22,6 +22,7 @@ def ascend_forward_context(
     vllm_config: VllmConfig,
     afd_metadata: AFDForwardContextMetadata,
     model_instance: torch.nn.Module | None = None,
+    input_ids: torch.Tensor | None = None,
     num_tokens: int = 0,
     num_tokens_across_dp: torch.Tensor | None = None,
     aclgraph_runtime_mode: CUDAGraphMode | None = None,
@@ -43,6 +44,7 @@ def ascend_forward_context(
         model_instance=model_instance,
         num_tokens=int(num_tokens),
         num_tokens_across_dp=num_tokens_across_dp,
+        input_ids=input_ids,
     ):
         forward_context = get_forward_context()
         if forward_context.additional_kwargs is None:

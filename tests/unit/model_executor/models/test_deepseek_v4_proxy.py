@@ -26,7 +26,8 @@ class _FakeMoE(nn.Module):
         super().__init__()
         self.quantized = quantized
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, input_ids=None):
+        del input_ids
         output = hidden_states.float() * 0.375
         if self.quantized:
             output = torch.round(output * 32.0) / 32.0
@@ -129,11 +130,16 @@ def test_loopback_layer_matches_local_reference(
         "get_afd_metadata_from_forward_context",
         lambda: afd_metadata,
     )
+    fake_forward_context = SimpleNamespace(
+        ubatch_idx=0,
+        input_ids=torch.arange(num_tokens, dtype=torch.int32),
+    )
     monkeypatch.setattr(
         proxy_runtime,
         "get_forward_context",
-        lambda: SimpleNamespace(ubatch_idx=0),
+        lambda: fake_forward_context,
     )
+    monkeypatch.setattr(adapter, "get_forward_context", lambda: fake_forward_context)
     monkeypatch.setattr(
         proxy_runtime,
         "maybe_apply_dbo_yield",

@@ -87,6 +87,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         )
         self.prof = create_afd_npu_profiler("ffn")
         self._is_shutdown = False
+        self._ffn_input_ids_cache: dict[int, torch.Tensor] = {}
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
@@ -221,60 +222,87 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         )
         stage_ids = sorted(int(stage_idx) for stage_idx in dp_metadata_list) or [0]
         rank_ffn_output = None
-
-        for layer_idx in _ffn_layer_indices(self):
-            for stage_idx in stage_ids:
-                num_tokens_across_dp = _ffn_token_counts_across_ranks(
-                    self.connector,
-                    dp_metadata_list,
-                    stage_idx,
-                    fallback=self.max_num_tokens,
-                )
-                num_tokens = _ffn_token_count_for_rank(
-                    self.connector,
-                    num_tokens_across_dp,
-                )
-                # DBO stages can have different token counts. Build a fresh
-                # Ascend context for each stage so its MC2 padding mask matches
-                # the hidden states received for that stage.
-                dp_num_tokens_across_dp = _to_dp_level_token_counts(
-                    num_tokens_across_dp,
-                    dp_size=int(self.vllm_config.parallel_config.data_parallel_size),
-                )
-                with ascend_forward_context(
-                    vllm_config=self.vllm_config,
-                    afd_metadata=afd_metadata,
-                    model_instance=self.model,
-                    num_tokens=num_tokens,
-                    num_tokens_across_dp=dp_num_tokens_across_dp,
-                    aclgraph_runtime_mode=aclgraph_runtime_mode,
-                ) as forward_context:
+        model_config = getattr(self, "model_config", self.vllm_config.model_config)
+        num_hash_layers = int(getattr(model_config.hf_config, "num_hash_layers", 0))
+        input_ids_cache = getattr(self, "_ffn_input_ids_cache", None)
+        if input_ids_cache is None:
+            input_ids_cache = self._ffn_input_ids_cache = {}
+        input_ids_cache.clear()
+        try:
+            for layer_idx in _ffn_layer_indices(self):
+                for stage_idx in stage_ids:
+                    num_tokens_across_dp = _ffn_token_counts_across_ranks(
+                        self.connector,
+                        dp_metadata_list,
+                        stage_idx,
+                        fallback=self.max_num_tokens,
+                    )
+                    num_tokens = _ffn_token_count_for_rank(
+                        self.connector,
+                        num_tokens_across_dp,
+                    )
+                    dp_num_tokens_across_dp = _to_dp_level_token_counts(
+                        num_tokens_across_dp,
+                        dp_size=int(
+                            self.vllm_config.parallel_config.data_parallel_size
+                        ),
+                    )
                     payload = self.connector.recv_attn_output(
                         ubatch_idx=stage_idx,
                         layer_idx=layer_idx,
                         max_num_tokens=self.max_num_tokens,
                     )
-                    context = payload.context
-                    metadata = context.metadata
-                    states = context.states
-                    hidden_states = payload.hidden_states
-                    metadata.layer_idx = layer_idx
-                    metadata.stage_idx = stage_idx
-                    forward_context.dp_metadata = dp_metadata_list.get(stage_idx)
-                    forward_context.additional_kwargs["afd_metadata"] = metadata
-                    assert states, "Context.states must not be None"
-                    _set_moe_layer_index(forward_context, layer_idx)
+                    if layer_idx == 0 and num_hash_layers > 0:
+                        if payload.input_ids is None:
+                            raise RuntimeError(
+                                "DSV4 FFN layer 0 did not receive input_ids"
+                            )
+                        input_ids_cache[stage_idx] = payload.input_ids
+                    elif payload.input_ids is not None:
+                        raise RuntimeError(
+                            "DSV4 FFN received input_ids after layer 0"
+                        )
+                    hash_input_ids = (
+                        input_ids_cache.get(stage_idx)
+                        if layer_idx < num_hash_layers
+                        else None
+                    )
+                    with ascend_forward_context(
+                        vllm_config=self.vllm_config,
+                        afd_metadata=afd_metadata,
+                        model_instance=self.model,
+                        input_ids=hash_input_ids,
+                        num_tokens=num_tokens,
+                        num_tokens_across_dp=dp_num_tokens_across_dp,
+                        aclgraph_runtime_mode=aclgraph_runtime_mode,
+                    ) as forward_context:
+                        context = payload.context
+                        metadata = context.metadata
+                        states = context.states
+                        hidden_states = payload.hidden_states
+                        metadata.layer_idx = layer_idx
+                        metadata.stage_idx = stage_idx
+                        forward_context.dp_metadata = dp_metadata_list.get(stage_idx)
+                        forward_context.additional_kwargs["afd_metadata"] = metadata
+                        assert states, "Context.states must not be None"
+                        _set_moe_layer_index(forward_context, layer_idx)
 
-                    rank_ffn_output = self.model.compute_ffn_output(
-                        hidden_states=hidden_states,
-                        layer_idx=layer_idx,
-                    )
-                    _send_ffn_output(
-                        self.connector,
-                        rank_ffn_output,
-                        context,
-                        stage_idx=stage_idx,
-                    )
+                        compute_kwargs = {}
+                        if hash_input_ids is not None:
+                            compute_kwargs["input_ids"] = hash_input_ids
+                        rank_ffn_output = self.model.compute_ffn_output(
+                            hidden_states=hidden_states,
+                            layer_idx=layer_idx,
+                            **compute_kwargs,
+                        )
+                        _send_ffn_output(
+                            self.connector,
+                            rank_ffn_output,
+                            context,
+                            stage_idx=stage_idx,
+                        )
+        finally:
+            input_ids_cache.clear()
         return rank_ffn_output
 
     def _ffn_forward_connector_driven(

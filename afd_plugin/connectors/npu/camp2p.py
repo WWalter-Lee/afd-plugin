@@ -270,6 +270,8 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         self.scheduler_config = vllm_config.scheduler_config
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.afd_pg_list: list[ProcessGroup] = []
+        self.ids_pg_list: list[ProcessGroup] = []
+        self.input_ids_buffers: list[torch.Tensor] = []
         self.afd_pg: ProcessGroup | None = None
         self.p2p_pg: ProcessGroup | None = None
         self.ffn_pg: ProcessGroup | None = None
@@ -283,6 +285,20 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         self.hidden_size = hf_config.hidden_size
         self.num_experts_per_tok = hf_config.num_experts_per_tok
         self.num_routed_experts = hf_config.n_routed_experts
+        architectures = getattr(hf_config, "architectures", None) or []
+        self.requires_input_ids = any(
+            architecture
+            in {"DeepseekV4ForCausalLM", "AFDDeepseekV4ForCausalLM"}
+            for architecture in architectures
+        )
+        self.vocab_size = int(getattr(hf_config, "vocab_size", 0))
+        self.max_num_batched_tokens = int(
+            getattr(
+                self.scheduler_config,
+                "max_num_batched_tokens",
+                self.max_num_reqs,
+            )
+        )
         self.control_plane = CAMP2pAFDControlPlane(self)
 
     @property
@@ -315,6 +331,8 @@ class CAMP2pAFDConnector(AFDConnectorBase):
 
         num_ubatches = max(1, self.vllm_config.parallel_config.num_ubatches)
         self.afd_pg_list = []
+        self.ids_pg_list = []
+        self.input_ids_buffers = []
         self.hccl_comm_name_list = []
         for ubatch_idx in range(num_ubatches):
             group_name = "afd" if ubatch_idx == 0 else f"afd{ubatch_idx}"
@@ -331,6 +349,28 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             self.hccl_comm_name_list.append(
                 str(backend.get_hccl_comm_name(self.world_rank)),
             )
+            if self.requires_input_ids:
+                ids_group_name = (
+                    "afd_ids" if ubatch_idx == 0 else f"afd_ids{ubatch_idx}"
+                )
+                ids_pg = init_afd_process_group(
+                    backend="hccl",
+                    init_method=(
+                        f"tcp://{self.afd_config.host}:{self.afd_config.port}"
+                    ),
+                    world_size=self.ffn_size + self.attn_size,
+                    rank=self.world_rank,
+                    group_name=ids_group_name,
+                    timeout=timedelta(minutes=30),
+                )
+                self.ids_pg_list.append(ids_pg)
+                self.input_ids_buffers.append(
+                    torch.empty(
+                        self.max_num_batched_tokens,
+                        dtype=torch.int32,
+                        device="npu",
+                    )
+                )
         self.afd_pg = self.afd_pg_list[0]
         self.hccl_comm_name = self.hccl_comm_name_list[0]
         self.hccl_comm_name2 = (
@@ -370,7 +410,12 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         The method also clears saved HCCL group names and marks the connector as
         uninitialized. It is safe to initialize the connector again afterward.
         """
-        groups = [self.p2p_pg, self.ffn_pg, *self.afd_pg_list]
+        groups = [
+            self.p2p_pg,
+            self.ffn_pg,
+            *self.ids_pg_list,
+            *self.afd_pg_list,
+        ]
         if self.afd_pg is not None and not self.afd_pg_list:
             groups.append(self.afd_pg)
         destroyed_group_ids: set[int] = set()
@@ -385,6 +430,8 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         self.ffn_pg = None
         self.afd_pg = None
         self.afd_pg_list = []
+        self.ids_pg_list = []
+        self.input_ids_buffers = []
         self.hccl_comm_name = ""
         self.hccl_comm_name2 = ""
         self.hccl_comm_name3 = ""
@@ -435,6 +482,15 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         forward_context = get_forward_context()
         forward_context.cam_afdtransfer_state = transfer_state
         forward_context.ubatch_idx = ubatch_idx
+
+        if self.requires_input_ids:
+            input_ids = kwargs.get("input_ids")
+            if metadata.layer_idx == 0:
+                if input_ids is None:
+                    raise RuntimeError("DSV4 CAMP2P layer 0 requires input_ids")
+                self._send_input_ids(input_ids, ubatch_idx=ubatch_idx)
+            elif input_ids is not None:
+                raise RuntimeError("DSV4 CAMP2P sends input_ids only at layer 0")
 
         torch.ops.vllm.afd_camp2p_send_attn_output(
             hidden_states,
@@ -542,6 +598,11 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             metadata=metadata,
             states=custom_states,
         )
+        input_ids = (
+            self._recv_input_ids(batch_size, ubatch_idx=ubatch_idx)
+            if self.requires_input_ids and layer_idx == 0
+            else None
+        )
 
         group_ep = _get_group_ep(
             ubatch_idx,
@@ -569,7 +630,68 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         return AFDA2FTransferPayload(
             hidden_states=outputs[0],
             context=context,
+            input_ids=input_ids,
         )
+
+    def _send_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        ubatch_idx: int,
+    ) -> None:
+        buffer, group = self._input_ids_buffer_and_group(ubatch_idx)
+        flat_ids = input_ids.reshape(-1)
+        num_tokens = int(flat_ids.numel())
+        if num_tokens > self.max_num_batched_tokens:
+            raise ValueError(
+                "DSV4 input_ids token count exceeds the preallocated CAMP2P "
+                f"buffer: {num_tokens} > {self.max_num_batched_tokens}"
+            )
+        if num_tokens == 0:
+            raise ValueError("DSV4 input_ids cannot be empty")
+        min_id = int(flat_ids.min().item())
+        max_id = int(flat_ids.max().item())
+        if min_id < -1 or max_id >= self.vocab_size:
+            raise ValueError(
+                "DSV4 input_ids must contain -1 padding or IDs in "
+                f"[0, {self.vocab_size}); got [{min_id}, {max_id}]"
+            )
+        buffer[:num_tokens].copy_(flat_ids, non_blocking=False)
+        dist.send(
+            buffer[:num_tokens],
+            dst=self.role_rank,
+            group=group,
+        )
+
+    def _recv_input_ids(
+        self,
+        num_tokens: int,
+        *,
+        ubatch_idx: int,
+    ) -> torch.Tensor:
+        buffer, group = self._input_ids_buffer_and_group(ubatch_idx)
+        if num_tokens > self.max_num_batched_tokens:
+            raise ValueError(
+                "DSV4 input_ids token count exceeds the preallocated CAMP2P "
+                f"buffer: {num_tokens} > {self.max_num_batched_tokens}"
+            )
+        source_rank = self.ffn_size + self.role_rank
+        dist.recv(
+            buffer[:num_tokens],
+            src=source_rank,
+            group=group,
+        )
+        return buffer[:num_tokens]
+
+    def _input_ids_buffer_and_group(
+        self,
+        ubatch_idx: int,
+    ) -> tuple[torch.Tensor, ProcessGroup]:
+        if ubatch_idx < 0 or ubatch_idx >= len(self.ids_pg_list):
+            raise RuntimeError(
+                f"DSV4 CAMP2P input IDs stage {ubatch_idx} is not initialized"
+            )
+        return self.input_ids_buffers[ubatch_idx], self.ids_pg_list[ubatch_idx]
 
     def send_ffn_output(
         self,

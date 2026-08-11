@@ -263,11 +263,13 @@ class AFDA2FTransferPayload:
         context: Transfer context describing the received transfer, including
             transfer metadata and backend-produced transfer state.
         router_logits: Optional Attention-side routing tensor.
+        input_ids: Optional one-shot DSV4 hash-router IDs for this stage.
     """
 
     hidden_states: torch.Tensor
     context: AFDTransferContext
     router_logits: torch.Tensor | None = None
+    input_ids: torch.Tensor | None = None
 
 
 @dataclass(slots=True)

@@ -11,6 +11,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
+from vllm.forward_context import get_forward_context
 from vllm_ascend.models import deepseek_v4 as native
 
 from afd_plugin.config import parse_afd_config
@@ -46,6 +47,16 @@ def _iter_role_weights(
 
 class AFDDeepseekV4RemoteMoEProxy(RemoteFFNProxy):
     """Parameter-free DSV4 MoE stage executed by the remote FFN role."""
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_ids = None
+        if self.layer_idx == 0:
+            input_ids = getattr(get_forward_context(), "input_ids", None)
+            if input_ids is None:
+                raise RuntimeError(
+                    "DSV4 layer 0 requires input_ids in the forward context"
+                )
+        return self._send_and_receive(hidden_states, input_ids=input_ids)
 
 
 class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
@@ -209,10 +220,15 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
         return hidden_states, residual
 
-    def compute_ffn_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def compute_ffn_output(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if self.afd_role != "ffn":
             raise RuntimeError("DSV4 Attention role does not own local MoE weights")
-        return self.mlp(hidden_states)
+        return self.mlp(hidden_states, input_ids=input_ids)
 
 
 @native.support_torch_compile(
@@ -403,8 +419,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         layer_idx: int,
         **kwargs: Any,
     ) -> torch.Tensor:
-        del kwargs
-        return self.layers[layer_idx].compute_ffn_output(hidden_states)
+        return self.layers[layer_idx].compute_ffn_output(hidden_states, **kwargs)
 
 
 class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):

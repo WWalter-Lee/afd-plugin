@@ -10,13 +10,14 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 
-from afd_plugin.compat.npu import (
+from afd_plugin.compat.npu import (  # noqa: E402
     fail_if_unsupported_npu_afd_features,
     npu_afd_num_ubatches,
 )
-from afd_plugin.connectors import (
+from afd_plugin.config import AFDConfig  # noqa: E402
+from afd_plugin.connectors import (  # noqa: E402
     AFDA2FTransferPayload,
     AFDControlPayload,
     AFDF2ATransferPayload,
@@ -27,13 +28,14 @@ from afd_plugin.connectors import (
 )
 
 
-def _ffn_payload(hidden_states, metadata, states=None):
+def _ffn_payload(hidden_states, metadata, states=None, input_ids=None):
     return AFDA2FTransferPayload(
         hidden_states=hidden_states,
         context=AFDTransferContext(
             metadata=metadata,
             states=states if states is not None else AFDTransferState(),
         ),
+        input_ids=input_ids,
     )
 
 
@@ -366,6 +368,8 @@ def _new_ffn_runner():
     runner.prof = None
     runner.device = SimpleNamespace(type="npu")
     runner._is_shutdown = False
+    runner.afd_config = AFDConfig(role="ffn")
+    runner._ffn_input_ids_cache = {}
     return runner
 
 
@@ -943,6 +947,148 @@ def test_npu_ffn_runner_builds_forward_context_for_each_dbo_stage(monkeypatch):
         [6],
         [7],
     ]
+
+
+def test_dsv4_ffn_runner_reuses_ids_per_stage_and_clears_each_step(monkeypatch):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    context_calls = []
+
+    @contextmanager
+    def fake_ascend_forward_context(**kwargs):
+        context_calls.append(kwargs)
+        yield SimpleNamespace(
+            additional_kwargs={},
+            dp_metadata=None,
+            all_moe_layers={},
+        )
+
+    monkeypatch.setattr(
+        ffn_model_runner,
+        "ascend_forward_context",
+        fake_ascend_forward_context,
+    )
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(role="ffn")
+    runner.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(num_hash_layers=3),
+    )
+    runner.connector = _FakeFFNConnector(attn_size=2, ffn_size=2)
+    runner.model = _RecordingFakeModel()
+    runner.num_layers = 4
+    runner.max_num_tokens = 8
+    runner.use_aclgraph = False
+    runner._acl_graphs = {}
+
+    def enqueue_step(ids_by_stage):
+        for layer_idx in range(4):
+            for stage_idx, input_ids in enumerate(ids_by_stage):
+                metadata = AFDTransferMetadata.create_attention_metadata(
+                    layer_idx=layer_idx,
+                    stage_idx=stage_idx,
+                    seq_len=len(input_ids),
+                )
+                runner.connector.attn_outputs.append(
+                    _ffn_payload(
+                        f"hidden-{layer_idx}-{stage_idx}",
+                        metadata,
+                        input_ids=(
+                            torch.tensor(input_ids, dtype=torch.int32)
+                            if layer_idx == 0
+                            else None
+                        ),
+                    )
+                )
+
+    first_ids = ([-1, 0, 31], [4, 5])
+    enqueue_step(first_ids)
+    runner.execute_model(
+        dp_metadata_list={
+            0: _FakeDPMetadata([3, 1]),
+            1: _FakeDPMetadata([2, 1]),
+        }
+    )
+
+    first_calls = runner.model.calls
+    assert len(first_calls) == 8
+    for call_idx, (_hidden, layer_idx, kwargs) in enumerate(first_calls):
+        stage_idx = call_idx % 2
+        if layer_idx < 3:
+            assert kwargs["input_ids"].tolist() == list(first_ids[stage_idx])
+        else:
+            assert kwargs == {}
+    assert [
+        None if call["input_ids"] is None else call["input_ids"].tolist()
+        for call in context_calls
+    ] == [
+        [-1, 0, 31],
+        [4, 5],
+        [-1, 0, 31],
+        [4, 5],
+        [-1, 0, 31],
+        [4, 5],
+        None,
+        None,
+    ]
+    assert runner._ffn_input_ids_cache == {}
+
+    second_ids = ([7], [8, 9, 10, 11])
+    enqueue_step(second_ids)
+    runner.execute_model(
+        dp_metadata_list={
+            0: _FakeDPMetadata([1, 1]),
+            1: _FakeDPMetadata([4, 1]),
+        }
+    )
+
+    second_calls = runner.model.calls[8:]
+    assert second_calls[0][2]["input_ids"].tolist() == [7]
+    assert second_calls[1][2]["input_ids"].tolist() == [8, 9, 10, 11]
+    assert runner._ffn_input_ids_cache == {}
+
+
+def test_dsv4_ffn_runner_clears_ids_cache_after_exception(monkeypatch):
+    _patch_ffn_forward_context(monkeypatch)
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(role="ffn")
+    runner.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(num_hash_layers=3),
+    )
+    runner.connector = _FakeFFNConnector()
+    runner.num_layers = 2
+    runner.max_num_tokens = 2
+
+    class FailingModel:
+        def compute_ffn_output(self, hidden_states, layer_idx, **kwargs):
+            del hidden_states, kwargs
+            if layer_idx == 1:
+                raise RuntimeError("injected FFN failure")
+            return "layer-0-output"
+
+    runner.model = FailingModel()
+    for layer_idx in range(2):
+        metadata = AFDTransferMetadata.create_attention_metadata(
+            layer_idx=layer_idx,
+            stage_idx=0,
+            seq_len=2,
+        )
+        runner.connector.attn_outputs.append(
+            _ffn_payload(
+                f"hidden-{layer_idx}",
+                metadata,
+                input_ids=(
+                    torch.tensor([-1, 31], dtype=torch.int32)
+                    if layer_idx == 0
+                    else None
+                ),
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="injected FFN failure"):
+        runner._ffn_forward(dp_metadata_list={0: _FakeDPMetadata([2])})
+
+    assert runner._ffn_input_ids_cache == {}
 
 
 def test_npu_ffn_runner_dp_path_invokes_model_with_hidden_states_and_layer(monkeypatch):
