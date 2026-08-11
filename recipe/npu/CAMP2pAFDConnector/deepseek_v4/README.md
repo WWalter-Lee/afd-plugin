@@ -29,6 +29,29 @@ first cycle idles for 1800 seconds and repeats a golden request.
 Shutdown always signals Attention before FFN and captures `npu-smi info` after
 cleanup.
 
+The next correctness gate keeps U1 and enables decode-only ACL graphs:
+
+```bash
+source tools/dsv4/activate_runtime.sh
+python recipe/npu/CAMP2pAFDConnector/deepseek_v4/run_validation.py \
+  --execution-mode full-decode-only \
+  --output-dir /mnt/workspace/validation/dsv4_afd_graph_u1_$(date +%Y%m%d_%H%M%S)
+```
+
+This selects `FULL_DECODE_ONLY` with capture sizes 1/2/4/8. DBO remains
+disabled. Collect Attention and FFN traces in a separate one-cycle run so the
+profiler does not perturb the correctness comparison:
+
+```bash
+python recipe/npu/CAMP2pAFDConnector/deepseek_v4/run_validation.py \
+  --execution-mode full-decode-only --profile \
+  --cycles 1 --idle-seconds 0 --rounds 1 --batch-sizes 1 \
+  --output-dir /mnt/workspace/validation/dsv4_afd_graph_u1_profile_$(date +%Y%m%d_%H%M%S)
+```
+
+Both role profilers use `TORCH_PROFILER_WITH_STACK=0`; their schedule is wait
+2, warmup 1, active 10, repeat 1, with no skipped steps.
+
 For a startup smoke test while developing the recipe:
 
 ```bash

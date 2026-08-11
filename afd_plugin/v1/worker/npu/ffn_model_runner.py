@@ -114,6 +114,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
     ) -> None:
         if dp_metadata_list is None:
             raise RuntimeError("AFD NPU FFN requires dp_metadata_list")
+        input_ids_by_stage = self._receive_input_ids_before_model(dp_metadata_list)
         if bool(self.use_aclgraph) and (is_graph_capturing or is_warmup):
             logger.debug(
                 "AFD NPU FFN execute_ffn_step enters capture_model; "
@@ -126,9 +127,13 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 dp_metadata_list=dp_metadata_list,
                 is_warmup=is_warmup,
                 is_attn_graph_capturing=is_graph_capturing,
+                input_ids_by_stage=input_ids_by_stage,
             )
             return None
-        self.execute_model(dp_metadata_list=dp_metadata_list)
+        self.execute_model(
+            dp_metadata_list=dp_metadata_list,
+            input_ids_by_stage=input_ids_by_stage,
+        )
         return None
 
     def execute_connector_driven_step(self) -> None:
@@ -149,6 +154,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata] | None = None,
         is_graph_capturing: bool = False,
         is_warmup: bool = False,
+        input_ids_by_stage: dict[int, torch.Tensor] | None = None,
     ) -> None:
         step_afd_npu_profiler(self.prof)
         if dp_metadata_list is None:
@@ -163,6 +169,16 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             graph_enabled=graph_enabled,
             graph_exists=graph_info is not None,
         )
+        if run_mode in (AFDGraphRunMode.WARMUP, AFDGraphRunMode.CAPTURE):
+            return self.execute_ffn_step(
+                dp_metadata_list=dp_metadata_list,
+                is_graph_capturing=is_graph_capturing,
+                is_warmup=is_warmup,
+            )
+        if input_ids_by_stage is None:
+            input_ids_by_stage = self._receive_input_ids_before_model(
+                dp_metadata_list
+            )
         if run_mode is AFDGraphRunMode.REPLAY:
             logger.debug(
                 "AFD NPU FFN replaying ACL graph; key=%s cached_graphs=%d",
@@ -171,15 +187,37 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             )
             graph_info["graph"].replay()
             return None
-        if run_mode in (AFDGraphRunMode.WARMUP, AFDGraphRunMode.CAPTURE):
-            return self.execute_ffn_step(
-                dp_metadata_list=dp_metadata_list,
-                is_graph_capturing=is_graph_capturing,
-                is_warmup=is_warmup,
-            )
 
-        self._ffn_forward(dp_metadata_list=dp_metadata_list)
+        self._ffn_forward(
+            dp_metadata_list=dp_metadata_list,
+            input_ids_by_stage=input_ids_by_stage,
+        )
         return None
+
+    def _receive_input_ids_before_model(
+        self,
+        dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
+    ) -> dict[int, torch.Tensor]:
+        """Receive DSV4 IDs before entering an ACL graph region."""
+        if not getattr(self.connector, "requires_input_ids", False):
+            return {}
+        input_ids_by_stage: dict[int, torch.Tensor] = {}
+        for stage_idx in sorted(int(index) for index in dp_metadata_list) or [0]:
+            num_tokens_across_dp = _ffn_token_counts_across_ranks(
+                self.connector,
+                dp_metadata_list,
+                stage_idx,
+                fallback=self.max_num_tokens,
+            )
+            num_tokens = _ffn_token_count_for_rank(
+                self.connector,
+                num_tokens_across_dp,
+            )
+            input_ids_by_stage[stage_idx] = self.connector.recv_input_ids(
+                num_tokens,
+                ubatch_idx=stage_idx,
+            )
+        return input_ids_by_stage
 
     def _make_graph_key(
         self,
@@ -199,6 +237,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         aclgraph_runtime_mode: CUDAGraphMode | None = None,
         is_graph_capturing: bool = False,
         update_connector_state: bool = True,
+        input_ids_by_stage: dict[int, torch.Tensor] | None = None,
     ) -> torch.Tensor | None:
         if update_connector_state:
             assert self.connector.control_plane, (
@@ -251,6 +290,11 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                         ubatch_idx=stage_idx,
                         layer_idx=layer_idx,
                         max_num_tokens=self.max_num_tokens,
+                        input_ids=(
+                            input_ids_by_stage.get(stage_idx)
+                            if input_ids_by_stage is not None and layer_idx == 0
+                            else None
+                        ),
                     )
                     if layer_idx == 0 and num_hash_layers > 0:
                         if payload.input_ids is None:
@@ -365,11 +409,16 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata] | None = None,
         is_warmup: bool = False,
         is_attn_graph_capturing: bool = True,
+        input_ids_by_stage: dict[int, torch.Tensor] | None = None,
     ) -> int:
         if not self.use_aclgraph:
             return 0
         if dp_metadata_list is None:
             raise RuntimeError("AFD NPU FFN capture requires dp_metadata_list")
+        if input_ids_by_stage is None:
+            input_ids_by_stage = self._receive_input_ids_before_model(
+                dp_metadata_list
+            )
 
         logger.debug(
             "AFD NPU FFN capture_model start; key=%s is_warmup=%s "
@@ -385,6 +434,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 self._ffn_forward(
                     dp_metadata_list=dp_metadata_list,
                     is_graph_capturing=False,
+                    input_ids_by_stage=input_ids_by_stage,
                 )
             else:
                 with graph_capture(device=self.device):
@@ -392,6 +442,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                         aclgraph_runtime_mode=CUDAGraphMode.FULL,
                         dp_metadata_list=dp_metadata_list,
                         is_attn_graph_capturing=is_attn_graph_capturing,
+                        input_ids_by_stage=input_ids_by_stage,
                     )
         finally:
             set_cudagraph_capturing_enabled(False)
@@ -411,6 +462,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         aclgraph_runtime_mode: CUDAGraphMode,
         dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
         is_attn_graph_capturing: bool = True,
+        input_ids_by_stage: dict[int, torch.Tensor] | None = None,
     ) -> None:
         assert self.connector.control_plane, (
             "Only DP metadata control plane supports graph capturing."
@@ -443,6 +495,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 aclgraph_runtime_mode=aclgraph_runtime_mode,
                 is_graph_capturing=is_attn_graph_capturing,
                 update_connector_state=False,
+                input_ids_by_stage=input_ids_by_stage,
             )
             logger.debug("AFD NPU FFN left _ffn_forward for key=%s", graph_key)
         self._acl_graphs[graph_key] = {

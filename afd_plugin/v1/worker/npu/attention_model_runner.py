@@ -213,7 +213,31 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 forward_context,
                 num_tokens_padded,
             )
-        hidden_states = run_model()
+        # ### PATCH START: DSV4 graph-safe IDs side channel
+        # torch_npu lowers dist.send inside a compiled model to an op whose
+        # symbolic shape is incompatible with the pinned runtime. Send once in
+        # the Python runner so every graph replay sees the current IDs while the
+        # model-side layer-0 proxy only launches the hidden-state custom op.
+        connector = getattr(self, "connector", None)
+        pretransfer_input_ids = bool(
+            connector is not None
+            and getattr(connector, "requires_input_ids", False)
+        )
+        if pretransfer_input_ids:
+            if input_ids is None:
+                raise RuntimeError("DSV4 Attention model forward requires input_ids")
+            connector.send_input_ids(input_ids, ubatch_idx=0)
+        previous_pretransfer = getattr(
+            forward_context,
+            "afd_input_ids_pretransferred",
+            False,
+        )
+        forward_context.afd_input_ids_pretransferred = pretransfer_input_ids
+        try:
+            hidden_states = run_model()
+        finally:
+            forward_context.afd_input_ids_pretransferred = previous_pretransfer
+        # ### PATCH END: DSV4 graph-safe IDs side channel
         if not self.enable_enpu and not wrapper_owns_full_graph_update:
             self._update_full_graph_params_if_needed(
                 forward_context,
@@ -1334,7 +1358,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         forward_context.additional_kwargs["afd_metadata"] = self._afd_pending_metadata
         if self.connector.control_plane is None:
             return
-        if self._afd_suppress_metadata_send:
+        if getattr(self, "_afd_suppress_metadata_send", False):
             return
         dp_metadata = forward_context.dp_metadata
         ubatch_slices = forward_context.ubatch_slices
@@ -1757,6 +1781,23 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
 
     def shutdown(self) -> None:
         stop_afd_npu_profiler(self.prof)
+        control_plane = self.connector.control_plane
+        if control_plane is not None:
+            try:
+                control_plane.send_dp_metadata_list(
+                    AFDControlPayload(
+                        dp_metadata_list={},
+                        is_graph_capturing=False,
+                        is_warmup=False,
+                        shutdown=True,
+                    )
+                )
+            except Exception:
+                # A peer that has already exited must not prevent local cleanup.
+                logger.debug(
+                    "AFD NPU Attention could not send FFN shutdown payload",
+                    exc_info=True,
+                )
         self.connector.close()
         super().shutdown()
 
@@ -1781,9 +1822,10 @@ def _dp_metadata_debug_key(
 ) -> tuple[tuple[int, tuple]]:
     key_parts: list[tuple[int, tuple]] = []
     for stage_idx, metadata in sorted(dp_metadata_list.items()):
-        values_tuple = tuple(
-            int(value) for value in metadata.num_tokens_across_dp_cpu.tolist()
-        )
+        values = metadata.num_tokens_across_dp_cpu
+        if hasattr(values, "tolist"):
+            values = values.tolist()
+        values_tuple = tuple(int(value) for value in values)
         key_parts.append((int(stage_idx), values_tuple))
     return tuple(key_parts)
 

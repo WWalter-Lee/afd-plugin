@@ -37,6 +37,8 @@ def _start_role(
     output_dir: Path,
     api_port: int,
     afd_port: int,
+    execution_mode: str,
+    profile_dir: Path | None,
 ) -> tuple[subprocess.Popen[bytes], Any]:
     log_handle = (output_dir / f"{role}.log").open("wb")
     env = os.environ.copy()
@@ -47,8 +49,26 @@ def _start_role(
             "AFD_HOST": "127.0.0.1",
             "HCCL_IF_IP": env.get("HCCL_IF_IP", "192.169.91.106"),
             "PYTHONUNBUFFERED": "1",
+            "EXECUTION_MODE": execution_mode,
         }
     )
+    if profile_dir is not None:
+        role_prefix = f"AFD_NPU_{role.upper()}_PROFILER"
+        role_dir = profile_dir / role
+        role_dir.mkdir(parents=True, exist_ok=True)
+        env.update(
+            {
+                f"{role_prefix}_ENABLE": "1",
+                f"{role_prefix}_WAIT": "2",
+                f"{role_prefix}_WARMUP": "1",
+                f"{role_prefix}_ACTIVE": "10",
+                f"{role_prefix}_REPEAT": "1",
+                f"{role_prefix}_SKIP_FIRST": "0",
+                f"{role_prefix}_DIR": str(role_dir),
+                f"{role_prefix}_WITH_STACK": "0",
+                "TORCH_PROFILER_WITH_STACK": "0",
+            }
+        )
     script = RECIPE_DIR / f"afd_{role}.sh"
     process = subprocess.Popen(
         ["bash", str(script)],
@@ -156,6 +176,11 @@ def _shutdown_roles(processes: dict[str, subprocess.Popen[bytes]]) -> dict[str, 
         result["ffn_exited_after_attention"] = ffn_exited_after_attention
         _stop_process(ffn)
         result["ffn_returncode"] = ffn.returncode
+    result["passed"] = all(
+        result.get(f"{role}_returncode") == 0
+        for role in ("attention", "ffn")
+        if role in processes
+    )
     return result
 
 
@@ -164,7 +189,7 @@ def _capture_command(command: list[str], output: Path) -> None:
         subprocess.run(command, stdout=handle, stderr=subprocess.STDOUT, check=False)
 
 
-def _runtime_manifest() -> dict[str, Any]:
+def _runtime_manifest(*, execution_mode: str, profile: bool) -> dict[str, Any]:
     def git_head(path: str) -> str:
         return subprocess.check_output(
             ["git", "-C", path, "rev-parse", "HEAD"], text=True
@@ -176,6 +201,10 @@ def _runtime_manifest() -> dict[str, Any]:
         "cann": "/mnt/workspace/code/.ascend/cann-9.0.1/cann-9.0.1",
         "venv": "/mnt/workspace/code/.venvs/afd-v026",
         "model": "/mnt/workspace/models/DeepSeek-V4-Flash-w8a8-mtp",
+        "execution_mode": execution_mode,
+        "u_batches": 1,
+        "profile": profile,
+        "torch_profiler_with_stack": False,
         "commits": {
             "afd_plugin": git_head(str(REPO_ROOT)),
             "vllm": git_head("/mnt/workspace/code/vllm-afd-v0.26.0"),
@@ -206,6 +235,16 @@ def main() -> None:
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--batch-sizes", type=int, nargs="*", default=[1, 8, 32])
     parser.add_argument("--prompt-indices", type=int, nargs="*")
+    parser.add_argument(
+        "--execution-mode",
+        choices=("eager", "full-decode-only"),
+        default="eager",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Collect plugin-owned Attention and FFN torch-npu traces.",
+    )
     args = parser.parse_args()
 
     for port in (args.attention_port, args.ffn_port, args.afd_port):
@@ -213,7 +252,15 @@ def main() -> None:
             raise RuntimeError(f"port {port} is already in use")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "runtime.json").write_text(
-        json.dumps(_runtime_manifest(), indent=2, sort_keys=True) + "\n"
+        json.dumps(
+            _runtime_manifest(
+                execution_mode=args.execution_mode,
+                profile=args.profile,
+            ),
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
     )
 
     cycles = []
@@ -229,12 +276,24 @@ def main() -> None:
                 "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             }
             startup_started = time.monotonic()
+            profile_dir = cycle_dir / "profiles" if args.profile else None
+            if profile_dir is not None:
+                cycle_result["profile"] = {
+                    "enabled": True,
+                    "root": str(profile_dir),
+                    "wait": 2,
+                    "warmup": 1,
+                    "active": 10,
+                    "with_stack": False,
+                }
             try:
                 ffn_process, ffn_handle = _start_role(
                     "ffn",
                     output_dir=cycle_dir,
                     api_port=args.ffn_port,
                     afd_port=args.afd_port,
+                    execution_mode=args.execution_mode,
+                    profile_dir=profile_dir,
                 )
                 processes["ffn"] = ffn_process
                 handles.append(ffn_handle)
@@ -244,6 +303,8 @@ def main() -> None:
                     output_dir=cycle_dir,
                     api_port=args.attention_port,
                     afd_port=args.afd_port,
+                    execution_mode=args.execution_mode,
+                    profile_dir=profile_dir,
                 )
                 processes["attention"] = attention_process
                 handles.append(attention_handle)
@@ -279,6 +340,10 @@ def main() -> None:
                 cycle_result["passed"] = True
             finally:
                 cycle_result["shutdown"] = _shutdown_roles(processes)
+                cycle_result["passed"] = bool(
+                    cycle_result.get("passed", False)
+                    and cycle_result["shutdown"]["passed"]
+                )
                 for handle in handles:
                     handle.close()
                 _capture_command(
@@ -297,6 +362,9 @@ def main() -> None:
             "passed": overall_passed,
             "cycles": cycles,
             "golden": str(args.golden),
+            "execution_mode": args.execution_mode,
+            "u_batches": 1,
+            "profile": args.profile,
         }
         (args.output_dir / "validation_summary.json").write_text(
             json.dumps(summary, indent=2, sort_keys=True) + "\n"

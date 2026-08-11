@@ -379,6 +379,53 @@ def test_dsv4_camp2p_sends_ids_before_hidden(monkeypatch):
     assert events[0][2:] == (0, connector.ids_pg_list[0])
 
 
+def test_dsv4_camp2p_skips_duplicate_ids_after_runner_pretransfer(monkeypatch):
+    events = []
+    connector = CAMP2pAFDConnector(
+        0,
+        0,
+        _vllm_config(dsv4=True),
+        _dsv4_afd_config(role="attention"),
+        0,
+    )
+    connector._initialized = True
+    connector.ids_pg_list = [object()]
+    connector.input_ids_buffers = [torch.empty(16, dtype=torch.int32)]
+    connector.hccl_comm_name = "hidden"
+    connector.hccl_comm_name2 = "hidden"
+    monkeypatch.setattr(
+        camp2p_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(afd_input_ids_pretransferred=True),
+    )
+    monkeypatch.setattr(
+        camp2p_module.dist,
+        "send",
+        lambda *_args, **_kwargs: events.append("ids"),
+    )
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "afd_camp2p_send_attn_output",
+        lambda hidden_states, *_args: events.append("hidden") or hidden_states,
+        raising=False,
+    )
+    context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=0,
+            stage_idx=0,
+            seq_len=2,
+        )
+    )
+
+    connector.send_attn_output(
+        torch.ones(2, 16),
+        context,
+        input_ids=torch.tensor([1, 2]),
+    )
+
+    assert events == ["hidden"]
+
+
 @pytest.mark.parametrize("input_ids", [[-2], [32]])
 def test_dsv4_camp2p_rejects_invalid_input_ids(monkeypatch, input_ids):
     connector = CAMP2pAFDConnector(
@@ -410,6 +457,54 @@ def test_dsv4_camp2p_rejects_invalid_input_ids(monkeypatch, input_ids):
             context,
             input_ids=torch.tensor(input_ids),
         )
+
+
+def test_dsv4_camp2p_skips_value_guard_while_graph_compiling(monkeypatch):
+    connector = CAMP2pAFDConnector(
+        0,
+        0,
+        _vllm_config(dsv4=True),
+        _dsv4_afd_config(role="attention"),
+        0,
+    )
+    connector._initialized = True
+    connector.ids_pg_list = [object()]
+    connector.input_ids_buffers = [torch.empty(16, dtype=torch.int32)]
+    connector.hccl_comm_name = "hidden"
+    connector.hccl_comm_name2 = "hidden"
+    monkeypatch.setattr(
+        camp2p_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(),
+    )
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    sent_ids = []
+    monkeypatch.setattr(
+        camp2p_module.dist,
+        "send",
+        lambda tensor, **_kwargs: sent_ids.append(tensor.clone()),
+    )
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "afd_camp2p_send_attn_output",
+        lambda hidden_states, *_args: hidden_states,
+        raising=False,
+    )
+    context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=0,
+            stage_idx=0,
+            seq_len=1,
+        )
+    )
+
+    connector.send_attn_output(
+        torch.ones(1, 16),
+        context,
+        input_ids=torch.tensor([32]),
+    )
+
+    assert sent_ids[0].tolist() == [32]
 
 
 def test_dsv4_camp2p_receives_ids_before_hidden(monkeypatch):

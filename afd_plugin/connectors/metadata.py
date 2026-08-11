@@ -123,11 +123,15 @@ class AFDControlPayload:
         is_warmup: Whether the payload belongs to a warmup step. This is
             separate from graph capture because warmup may prepare state without
             representing a real serving step.
+        shutdown: Whether Attention is intentionally closing the control plane.
+            Shutdown payloads contain no DP metadata and let FFN leave its
+            blocking receive loop before the Gloo process group is destroyed.
     """
 
     dp_metadata_list: dict[int, AFDDPMetadata]
     is_graph_capturing: bool
     is_warmup: bool
+    shutdown: bool = False
 
     def __post_init__(self) -> None:
         self.dp_metadata_list = {
@@ -327,6 +331,7 @@ def encode_control_payload(payload: AFDControlPayload) -> bytes:
         "dp_metadata_list": metadata_payload,
         "is_graph_capturing": bool(payload.is_graph_capturing),
         "is_warmup": bool(payload.is_warmup),
+        "shutdown": bool(payload.shutdown),
     }
     return json.dumps(wire_payload, separators=(",", ":"), sort_keys=True).encode(
         "utf-8",
@@ -355,6 +360,7 @@ def decode_control_payload(payload_bytes: bytes) -> AFDControlPayload:
         dp_metadata_list=dp_metadata_list,
         is_graph_capturing=bool(payload.get("is_graph_capturing", False)),
         is_warmup=bool(payload.get("is_warmup", False)),
+        shutdown=bool(payload.get("shutdown", False)),
     )
 
 

@@ -111,7 +111,11 @@ class AFDNPUFFNWorker(NPUWorker):
                 self._run_ffn_server_loop()
             except Exception as exc:
                 shutdown_event = self._ffn_shutdown_event
-                if shutdown_event is not None and shutdown_event.is_set():
+                if shutdown_event is not None and (
+                    shutdown_event.is_set()
+                    or _is_attention_control_plane_shutdown(exc)
+                ):
+                    shutdown_event.set()
                     logger.debug(
                         "AFD NPU FFN receive loop stopped during shutdown",
                         exc_info=True,
@@ -140,6 +144,10 @@ class AFDNPUFFNWorker(NPUWorker):
                 continue
 
             payload = self.model_runner.connector.control_plane.recv_dp_metadata_list()
+            if payload.shutdown:
+                logger.info("AFD NPU FFN received Attention shutdown payload")
+                event.set()
+                return
             dp_metadata_list = payload.dp_metadata_list
             is_attn_graph_capturing = payload.is_graph_capturing
             is_warmup = payload.is_warmup
@@ -152,7 +160,7 @@ class AFDNPUFFNWorker(NPUWorker):
             torch.npu.synchronize()
 
     def raise_ffn_loop_error_if_any(self) -> None:
-        error = self._ffn_loop_error
+        error = getattr(self, "_ffn_loop_error", None)
         if error is not None:
             self._ffn_loop_error = None
             raise RuntimeError("AFD NPU FFN worker loop failed") from error
@@ -182,6 +190,22 @@ class AFDNPUFFNWorker(NPUWorker):
         # runner and its tensors.
         self.stop_ffn_server_loop()
         super().shutdown()
+
+
+def _is_attention_control_plane_shutdown(error: BaseException) -> bool:
+    """Recognize the Gloo EOF produced when Attention workers stop first."""
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        if "gloo" in message and (
+            "connection closed by peer" in message
+            or "connection reset by peer" in message
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 __all__ = ["AFDNPUFFNWorker"]

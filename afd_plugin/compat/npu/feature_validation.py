@@ -140,7 +140,7 @@ def _fail_if_unsupported_deepseek_v4_features(
     vllm_config: VllmConfig,
     afd_config: AFDConfig,
 ) -> None:
-    """Keep the first DSV4 AFD release inside its validated correctness box."""
+    """Keep DSV4 AFD inside its validated eager/U1 and graph/U1 boxes."""
     parallel_config = vllm_config.parallel_config
     if afd_config.connector != "CAMP2pAFDConnector":
         raise RuntimeError("DeepSeek-V4 AFD supports only CAMP2pAFDConnector")
@@ -165,7 +165,19 @@ def _fail_if_unsupported_deepseek_v4_features(
     if afd_config.compute_gate_on_attention:
         raise RuntimeError("DeepSeek-V4 AFD requires FFN-side gate computation")
     if not vllm_config.model_config.enforce_eager:
-        raise RuntimeError("DeepSeek-V4 AFD supports only eager execution yet")
+        cudagraph_mode = getattr(
+            getattr(vllm_config, "compilation_config", None),
+            "cudagraph_mode",
+            None,
+        )
+        mode_name = getattr(cudagraph_mode, "name", None)
+        if not isinstance(mode_name, str):
+            mode_name = str(cudagraph_mode).rsplit(".", 1)[-1]
+        if mode_name != "FULL_DECODE_ONLY":
+            raise RuntimeError(
+                "DeepSeek-V4 AFD graph execution supports only "
+                "FULL_DECODE_ONLY with DBO/ubatching disabled"
+            )
     if vllm_config.speculative_config is not None:
         raise RuntimeError("DeepSeek-V4 AFD does not support MTP/speculative decoding")
     if getattr(vllm_config, "kv_transfer_config", None) is not None:

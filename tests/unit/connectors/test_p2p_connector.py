@@ -281,6 +281,24 @@ def test_p2p_dp_metadata_serialization_uses_json_payload():
     assert _tolist(decoded[7].cu_tokens_across_sp(1)) == [3, 8]
     assert decoded_payload.is_graph_capturing is True
     assert decoded_payload.is_warmup is False
+    assert decoded_payload.shutdown is False
+
+
+def test_p2p_shutdown_control_payload_round_trip():
+    module = importlib.import_module("afd_plugin.connectors.metadata")
+
+    encoded = module.encode_control_payload(
+        AFDControlPayload(
+            dp_metadata_list={},
+            is_graph_capturing=False,
+            is_warmup=False,
+            shutdown=True,
+        )
+    )
+    decoded = module.decode_control_payload(encoded)
+
+    assert decoded.dp_metadata_list == {}
+    assert decoded.shutdown is True
 
 
 def test_p2p_custom_ops_register_send_recv_with_fake_impls(monkeypatch):

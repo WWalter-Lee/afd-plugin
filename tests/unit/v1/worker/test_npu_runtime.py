@@ -99,7 +99,15 @@ class _AsyncRecordingConnector(_RecordingConnector):
 
 
 class _FakeFFNConnector:
-    def __init__(self, *, attn_size=1, ffn_size=1, role_rank=0, world_rank=0):
+    def __init__(
+        self,
+        *,
+        attn_size=1,
+        ffn_size=1,
+        role_rank=0,
+        world_rank=0,
+        requires_input_ids=False,
+    ):
         self.dp_metadata_list = {}
         self.attn_outputs = deque()
         self.ffn_outputs = []
@@ -107,6 +115,8 @@ class _FakeFFNConnector:
         self.attn_size = attn_size
         self.ffn_size = ffn_size
         self.world_rank = world_rank
+        self.requires_input_ids = requires_input_ids
+        self.received_input_ids = []
         self.topology = SimpleNamespace(role_rank=role_rank)
         # The runners reach the control plane through connector.control_plane;
         # the fake serves as both.
@@ -134,8 +144,21 @@ class _FakeFFNConnector:
             )
             if payload.context.metadata.stage_idx == ubatch_idx:
                 self.attn_outputs.remove(item)
+                preloaded_input_ids = kwargs.get("input_ids")
+                if preloaded_input_ids is not None and payload.input_ids is None:
+                    payload = _ffn_payload(
+                        payload.hidden_states,
+                        payload.context.metadata,
+                        states=payload.context.states,
+                        input_ids=preloaded_input_ids,
+                    )
                 return payload
         raise IndexError(ubatch_idx)
+
+    def recv_input_ids(self, num_tokens, *, ubatch_idx):
+        input_ids = torch.arange(num_tokens, dtype=torch.int32) + ubatch_idx * 10
+        self.received_input_ids.append((num_tokens, ubatch_idx, input_ids))
+        return input_ids
 
     def send_ffn_output(self, ffn_output, context, **kwargs):
         self.ffn_outputs.append((ffn_output, context.metadata, kwargs))
@@ -437,6 +460,57 @@ def test_npu_attention_runner_skips_outer_update_only_for_owned_graph(
     assert len(updates) == expected_updates
 
 
+def test_npu_attention_runner_pretransfers_dsv4_ids_outside_model(monkeypatch):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    events = []
+    forward_context = SimpleNamespace(
+        dbo_enabled=False,
+        flash_comm_v1_enabled=False,
+    )
+
+    class FakeModel:
+        def __call__(self, **_model_inputs):
+            events.append(
+                (
+                    "model",
+                    forward_context.afd_input_ids_pretransferred,
+                )
+            )
+            return "hidden_states"
+
+    class FakeConnector:
+        requires_input_ids = True
+
+        def send_input_ids(self, input_ids, *, ubatch_idx):
+            events.append(("ids", input_ids.clone(), ubatch_idx))
+
+    monkeypatch.setattr(
+        attention_model_runner,
+        "get_forward_context",
+        lambda: forward_context,
+    )
+    runner = object.__new__(attention_model_runner.AFDNPUAttentionModelRunner)
+    runner.enable_enpu = False
+    runner.model = FakeModel()
+    runner.connector = FakeConnector()
+    runner.ubatch_slices = None
+    runner._install_afd_metadata_on_forward_context = lambda _context: None
+    runner._install_async_moe_ubatch_metadata_on_forward_context = lambda _context: None
+    runner._update_full_graph_params_if_needed = lambda *_args: None
+    input_ids = torch.tensor([-1, 7], dtype=torch.int32)
+
+    result = runner._model_forward(2, input_ids=input_ids)
+
+    assert result == "hidden_states"
+    assert events[0][0] == "ids"
+    assert events[0][1].tolist() == [-1, 7]
+    assert events[0][2] == 0
+    assert events[1] == ("model", True)
+    assert forward_context.afd_input_ids_pretransferred is False
+
+
 def test_npu_attention_runner_installs_mla_graph_wrapper(monkeypatch):
     _require_npu_runtime()
     from afd_plugin.v1.worker.npu import attention_model_runner
@@ -649,7 +723,7 @@ def test_npu_attention_capture_microbatch_also_captures_single_stage():
         allow_microbatching=True,
     )
 
-    assert result is True
+    assert result is None
     assert [call[1]["allow_microbatching"] for call in dummy_calls] == [
         False,
         False,
@@ -1046,6 +1120,59 @@ def test_dsv4_ffn_runner_reuses_ids_per_stage_and_clears_each_step(monkeypatch):
     assert second_calls[0][2]["input_ids"].tolist() == [7]
     assert second_calls[1][2]["input_ids"].tolist() == [8, 9, 10, 11]
     assert runner._ffn_input_ids_cache == {}
+
+
+def test_dsv4_ffn_runner_prefetches_ids_before_graph_capture(monkeypatch):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(role="ffn")
+    runner.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(num_hash_layers=3),
+    )
+    runner.connector = _FakeFFNConnector(requires_input_ids=True)
+    runner.model = _RecordingFakeModel()
+    runner.num_layers = 1
+    runner.max_num_tokens = 8
+    runner.use_aclgraph = True
+    runner._acl_graphs = {}
+    runner.graph_pool = None
+    monkeypatch.setattr(
+        ffn_model_runner,
+        "ascend_forward_context",
+        _fake_ffn_ascend_forward_context,
+    )
+    monkeypatch.setattr(ffn_model_runner, "graph_capture", lambda device: nullcontext())
+    monkeypatch.setattr(
+        ffn_model_runner.torch.npu,
+        "graph",
+        lambda graph, pool: nullcontext(),
+    )
+    monkeypatch.setattr(ffn_model_runner.torch.npu, "NPUGraph", _FakeGraph)
+    monkeypatch.setattr(
+        ffn_model_runner,
+        "set_cudagraph_capturing_enabled",
+        lambda enabled: None,
+    )
+    monkeypatch.setattr(ffn_model_runner.torch.npu, "mem_get_info", lambda: (0, 0))
+    metadata = AFDTransferMetadata.create_attention_metadata(
+        layer_idx=0,
+        stage_idx=0,
+        seq_len=3,
+    )
+    runner.connector.attn_outputs.append(("hidden", metadata))
+
+    runner.execute_ffn_step(
+        dp_metadata_list={0: _FakeDPMetadata([3])},
+        is_graph_capturing=True,
+    )
+
+    assert [
+        (count, stage)
+        for count, stage, _ids in runner.connector.received_input_ids
+    ] == [(3, 0)]
+    assert runner.model.calls[0][2]["input_ids"].tolist() == [0, 1, 2]
 
 
 def test_dsv4_ffn_runner_clears_ids_cache_after_exception(monkeypatch):
@@ -1501,6 +1628,32 @@ def test_npu_ffn_worker_reports_zero_compilation_times():
     assert compilation_times.encoder == 0.0
 
 
+def test_npu_ffn_worker_stops_on_attention_shutdown_payload(monkeypatch):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_worker as ffn_worker_module
+
+    event = threading.Event()
+    worker = _new_ffn_worker()
+    worker._ffn_shutdown_event = event
+    worker.device = SimpleNamespace(type="npu")
+    control_plane = SimpleNamespace(
+        recv_dp_metadata_list=lambda: AFDControlPayload(
+            dp_metadata_list={},
+            is_graph_capturing=False,
+            is_warmup=False,
+            shutdown=True,
+        )
+    )
+    worker.model_runner = SimpleNamespace(
+        connector=SimpleNamespace(control_plane=control_plane),
+    )
+    monkeypatch.setattr(ffn_worker_module.torch.npu, "set_device", lambda _device: None)
+
+    worker._run_ffn_server_loop()
+
+    assert event.is_set()
+
+
 def test_npu_ffn_worker_loop_error_is_propagated(caplog):
     worker = _new_ffn_worker()
     worker._ffn_thread = None
@@ -1555,6 +1708,36 @@ def test_npu_ffn_worker_ignores_receive_error_during_shutdown(caplog):
         assert worker._ffn_thread is not None
         worker._ffn_thread.join(timeout=5)
 
+    worker.raise_ffn_loop_error_if_any()
+    assert "AFD NPU FFN worker loop failed" not in caplog.text
+
+
+def test_npu_ffn_worker_treats_attention_gloo_eof_as_shutdown(caplog):
+    worker = _new_ffn_worker()
+    worker._ffn_thread = None
+    worker._ffn_shutdown_event = None
+    worker._ffn_loop_error = None
+    worker.model_runner = SimpleNamespace(
+        connector=SimpleNamespace(is_initialized=True),
+    )
+
+    def attention_closed_control_plane():
+        raise RuntimeError(
+            "[/pytorch/third_party/gloo/gloo/transport/tcp/pair.cc:547] "
+            "Connection closed by peer"
+        )
+
+    worker._run_ffn_server_loop = attention_closed_control_plane
+
+    with caplog.at_level(
+        logging.ERROR,
+        logger="afd_plugin.v1.worker.npu.ffn_worker",
+    ):
+        worker.start_ffn_server_loop()
+        assert worker._ffn_thread is not None
+        worker._ffn_thread.join(timeout=5)
+
+    assert worker._ffn_shutdown_event.is_set()
     worker.raise_ffn_loop_error_if_any()
     assert "AFD NPU FFN worker loop failed" not in caplog.text
 
@@ -1705,8 +1888,15 @@ def _dsv4_config(**kwargs):
     return config
 
 
-def test_dsv4_feature_validation_accepts_only_eager_u1_camp2p():
+def test_dsv4_feature_validation_accepts_eager_u1_camp2p():
     fail_if_unsupported_npu_afd_features(_dsv4_config())
+
+
+def test_dsv4_feature_validation_accepts_full_decode_only_u1_camp2p():
+    config = _dsv4_config(cudagraph_mode="FULL_DECODE_ONLY")
+    config.model_config.enforce_eager = False
+
+    fail_if_unsupported_npu_afd_features(config)
 
 
 @pytest.mark.parametrize(
@@ -1741,7 +1931,7 @@ def test_dsv4_feature_validation_accepts_only_eager_u1_camp2p():
         ), "FFN-side gate"),
         (lambda config: setattr(
             config.model_config, "enforce_eager", False
-        ), "only eager"),
+        ), "FULL_DECODE_ONLY"),
         (lambda config: setattr(
             config, "speculative_config", object()
         ), "MTP/speculative"),
@@ -1755,6 +1945,15 @@ def test_dsv4_feature_validation_rejects_unvalidated_modes(mutation, message):
     mutation(config)
 
     with pytest.raises(RuntimeError, match=message):
+        fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize("cudagraph_mode", ["NONE", "FULL", "PIECEWISE"])
+def test_dsv4_feature_validation_rejects_other_graph_modes(cudagraph_mode):
+    config = _dsv4_config(cudagraph_mode=cudagraph_mode)
+    config.model_config.enforce_eager = False
+
+    with pytest.raises(RuntimeError, match="FULL_DECODE_ONLY"):
         fail_if_unsupported_npu_afd_features(config)
 
 

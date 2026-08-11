@@ -16,6 +16,9 @@ ATTENTION_RANKS="${ATTENTION_RANKS:-8}"
 FFN_RANKS="${FFN_RANKS:-8}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-1024}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
+EXECUTION_MODE="${EXECUTION_MODE:-eager}"
+MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-8}"
+CUDAGRAPH_CAPTURE_SIZES="${CUDAGRAPH_CAPTURE_SIZES:-1 2 4 8}"
 
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-8,9,10,11,12,13,14,15}"
 export HCCL_IF_IP="${HCCL_IF_IP:-192.169.91.106}"
@@ -34,7 +37,37 @@ unset VLLM_ASCEND_ENABLE_FLASHCOMM1
 
 ADDITIONAL_CONFIG="$(printf '{"afd":{"role":"ffn","connector":"CAMP2pAFDConnector","host":"%s","port":%s,"num_attention_ranks":%s,"num_ffn_ranks":%s}}' "$AFD_HOST" "$AFD_PORT" "$ATTENTION_RANKS" "$FFN_RANKS")"
 
-exec vllm serve "$MODEL_PATH" \
+case "$EXECUTION_MODE" in
+  eager)
+    EXECUTION_ARGS=(--enforce-eager)
+    ;;
+  full-decode-only)
+    read -r -a CAPTURE_SIZE_ARGS <<<"$CUDAGRAPH_CAPTURE_SIZES"
+    EXECUTION_ARGS=(
+      --max-cudagraph-capture-size "$MAX_CUDAGRAPH_CAPTURE_SIZE"
+      --cudagraph-capture-sizes "${CAPTURE_SIZE_ARGS[@]}"
+      --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
+    )
+    ;;
+  *)
+    echo "Unsupported EXECUTION_MODE=$EXECUTION_MODE" >&2
+    exit 2
+    ;;
+esac
+
+shutdown_requested=0
+vllm_pid=""
+
+forward_shutdown() {
+  shutdown_requested=1
+  if [[ -n "$vllm_pid" ]]; then
+    kill -TERM "$vllm_pid" 2>/dev/null || true
+  fi
+}
+
+trap forward_shutdown TERM INT
+set +e
+vllm serve "$MODEL_PATH" \
   --host "$API_HOST" \
   --port "$API_PORT" \
   --api-server-count 1 \
@@ -45,7 +78,6 @@ exec vllm serve "$MODEL_PATH" \
   --data-parallel-size "$FFN_RANKS" \
   --tensor-parallel-size 1 \
   --enable-expert-parallel \
-  --enforce-eager \
   --seed 1024 \
   --gpu-memory-utilization 0.90 \
   --tokenizer-mode deepseek_v4 \
@@ -53,4 +85,18 @@ exec vllm serve "$MODEL_PATH" \
   --safetensors-load-strategy lazy \
   --quantization ascend \
   --block-size 128 \
-  --additional-config "$ADDITIONAL_CONFIG"
+  --additional-config "$ADDITIONAL_CONFIG" \
+  "${EXECUTION_ARGS[@]}" &
+vllm_pid=$!
+wait "$vllm_pid"
+vllm_status=$?
+while kill -0 "$vllm_pid" 2>/dev/null; do
+  wait "$vllm_pid"
+  vllm_status=$?
+done
+set -e
+
+if ((shutdown_requested)); then
+  exit 0
+fi
+exit "$vllm_status"

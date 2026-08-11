@@ -485,10 +485,14 @@ class CAMP2pAFDConnector(AFDConnectorBase):
 
         if self.requires_input_ids:
             input_ids = kwargs.get("input_ids")
+            input_ids_pretransferred = bool(
+                getattr(forward_context, "afd_input_ids_pretransferred", False)
+            )
             if metadata.layer_idx == 0:
                 if input_ids is None:
                     raise RuntimeError("DSV4 CAMP2P layer 0 requires input_ids")
-                self._send_input_ids(input_ids, ubatch_idx=ubatch_idx)
+                if not input_ids_pretransferred:
+                    self.send_input_ids(input_ids, ubatch_idx=ubatch_idx)
             elif input_ids is not None:
                 raise RuntimeError("DSV4 CAMP2P sends input_ids only at layer 0")
 
@@ -598,11 +602,14 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             metadata=metadata,
             states=custom_states,
         )
-        input_ids = (
-            self._recv_input_ids(batch_size, ubatch_idx=ubatch_idx)
-            if self.requires_input_ids and layer_idx == 0
-            else None
-        )
+        input_ids = None
+        if self.requires_input_ids and layer_idx == 0:
+            input_ids = kwargs.get("input_ids")
+            if input_ids is None:
+                input_ids = self.recv_input_ids(
+                    batch_size,
+                    ubatch_idx=ubatch_idx,
+                )
 
         group_ep = _get_group_ep(
             ubatch_idx,
@@ -633,12 +640,13 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             input_ids=input_ids,
         )
 
-    def _send_input_ids(
+    def send_input_ids(
         self,
         input_ids: torch.Tensor,
         *,
         ubatch_idx: int,
     ) -> None:
+        """Send DSV4 IDs outside the compiled model when possible."""
         buffer, group = self._input_ids_buffer_and_group(ubatch_idx)
         flat_ids = input_ids.reshape(-1)
         num_tokens = int(flat_ids.numel())
@@ -649,13 +657,17 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             )
         if num_tokens == 0:
             raise ValueError("DSV4 input_ids cannot be empty")
-        min_id = int(flat_ids.min().item())
-        max_id = int(flat_ids.max().item())
-        if min_id < -1 or max_id >= self.vocab_size:
-            raise ValueError(
-                "DSV4 input_ids must contain -1 padding or IDs in "
-                f"[0, {self.vocab_size}); got [{min_id}, {max_id}]"
-            )
+        # FULL_DECODE_ONLY capture cannot guard on tensor values. Live eager
+        # sends retain the diagnostic; graph inputs are scheduler-owned and
+        # use the same static buffer that is updated before replay.
+        if not torch.compiler.is_compiling():
+            min_id = int(flat_ids.min().item())
+            max_id = int(flat_ids.max().item())
+            if min_id < -1 or max_id >= self.vocab_size:
+                raise ValueError(
+                    "DSV4 input_ids must contain -1 padding or IDs in "
+                    f"[0, {self.vocab_size}); got [{min_id}, {max_id}]"
+                )
         buffer[:num_tokens].copy_(flat_ids, non_blocking=False)
         dist.send(
             buffer[:num_tokens],
@@ -663,12 +675,13 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             group=group,
         )
 
-    def _recv_input_ids(
+    def recv_input_ids(
         self,
         num_tokens: int,
         *,
         ubatch_idx: int,
     ) -> torch.Tensor:
+        """Receive DSV4 IDs into the stable buffer used by graph replay."""
         buffer, group = self._input_ids_buffer_and_group(ubatch_idx)
         if num_tokens > self.max_num_batched_tokens:
             raise ValueError(
