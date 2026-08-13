@@ -12,7 +12,7 @@
 - 两次独立冷启动、Attention 先停、FFN 后停、两侧返回码 0 和 fatal marker 为空均通过；
 - Attention DP0 和 FFN DP0 的原始 profiler 数据均成功采集，并由固定 venv/CANN 9.0.1 重新解析。
 
-30 分钟空闲恢复门禁已通过。本报告完成后可创建 eager/U2 冻结 tag。
+30 分钟空闲恢复和提交态 smoke 均已通过，冻结 tag 为 `dsv4-afd-a3-eager-u2-v1`。
 
 本阶段不声称“AFD 已获得性能收益”。现有 profile 只用于建立 U2 调优起点；公平性能结论必须在下一阶段加入非 AFD 和 U1 同资源、同请求、同统计窗口对照后给出。
 
@@ -222,11 +222,19 @@ batch 请求的 `token_exact_count` 是额外诊断项，不是 golden 门禁。
 | fatal marker | 两侧均为空 |
 | NPU 清理 | 第一次查询通过，PID 列表为空 |
 
-验证器在本次长测启动后又增加了“Process 表必须存在”的防截断检查，因此该运行中的旧进程结果尚无 `process_table_present` 字段；实际保存的 `npu_after_cleanup.txt` 包含完整 Process 表和各 NPU 的 `No running processes`。新增分支已由截断输出单测覆盖，并将在提交后的短 smoke 中再次实测。
+验证器在本次长测启动后又增加了“Process 表必须存在”的防截断检查，因此该运行中的旧进程结果尚无 `process_table_present` 字段；实际保存的 `npu_after_cleanup.txt` 包含完整 Process 表和各 NPU 的 `No running processes`。新增分支已由截断输出单测和提交态 smoke 实测覆盖。
+
+提交态 smoke：
+
+```text
+/mnt/workspace/validation/dsv4_afd_a3_eager_u2_e65b31d_smoke_20260813_1457
+```
+
+该产物记录 `afd-plugin=e65b31d2c31b45a68757f78e2a7f28c4837ce5c0`、tracked worktree clean、batch 32 合法、双 stage 实际执行、两侧返回码 0、fatal marker 为空，并且 `process_table_present=true`、PID 列表为空。
 
 ## 9. 当前边界和下一步
 
-30 分钟空闲恢复已经通过。完成最终代码回归、独立提交和 clean-worktree 短 smoke 后创建 eager/U2 tag。之后进入 A3-P3 profiling/调优，而不是立即解除 Graph/U2：
+eager/U2 已冻结为 `dsv4-afd-a3-eager-u2-v1`。下一阶段进入 A3-P3 profiling/调优，而不是立即解除 Graph/U2：
 
 1. 固定非 AFD、eager/U1 和 eager/U2 的同口径请求矩阵；
 2. 分离 prefill、decode 和稳态窗口；

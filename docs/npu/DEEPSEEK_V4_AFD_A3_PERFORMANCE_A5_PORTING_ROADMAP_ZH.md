@@ -4,7 +4,7 @@
 
 本文用于固化 DeepSeek-V4 AFD 在完成 eager/U1 与 Graph/U1 正确性基线后的目标、开发顺序和验收门禁，供后续开发、验证、性能分析和 A5 迁移时直接使用。
 
-文档状态：`2026-08-13`，eager/U2 已实现，A8F8 正确性、30 分钟空闲恢复和清理门禁已通过，等待提交与 tag 冻结。
+文档状态：`2026-08-13`，eager/U2 已实现并冻结为 `dsv4-afd-a3-eager-u2-v1`；当前进入 A3-P3 公平 profiling 与调优。
 
 本文不替代以下两份文档：
 
@@ -39,8 +39,7 @@
 ```text
 A3 当前阶段
   U1 correctness 已完成
-  -> eager U2（实现、30/30 golden、batch、二次启动、空闲恢复和 profile 已通过）
-  -> 独立提交和冻结 tag
+  -> eager U2（实现、30/30 golden、batch、二次启动、空闲恢复、profile 和 tag 已完成）
   -> eager U2 profiling/tuning
   -> U2 + FULL_DECODE_ONLY
   -> A3 公平性能验收
@@ -64,6 +63,7 @@ A3 验收通过只说明实现语义和 A3 性能成立，不等于 A5 已支持
 |---|---|---|
 | `dsv4-afd-eager-u1-v1` | `40981475a9270c9b79ebf5cfe46d375472ee0a06` | A8F8、eager、U1 正确性基线 |
 | `dsv4-afd-graph-u1-v1` | `2ed98442351d4be96edbb315a6b6c8d00805bbc4` | A8F8、`FULL_DECODE_ONLY`、U1 Graph 与生命周期基线 |
+| `dsv4-afd-a3-eager-u2-v1` | 当前 tag 指向的验收收尾提交 | A8F8、eager、U2 正确性、生命周期与提交态 smoke 基线 |
 
 后续阶段从 `dsv4-afd-graph-u1-v1` 开新分支，不改写以上 tag。每个阶段通过全部门禁后再打新 tag，失败阶段不打 tag。
 
@@ -139,9 +139,8 @@ num_attention_ranks == num_ffn_ranks
 
 ### 4.3 当前未验证能力
 
-以下能力仍不属于已冻结基线：
+eager DBO/U2 已属于冻结基线。以下能力仍不属于已冻结基线：
 
-- eager DBO/U2（实现与全部正确性门禁已通过，尚未完成 tag 冻结）；
 - U2 + `FULL_DECODE_ONLY`；
 - Attention 侧 gate；
 - MTP/speculative decoding；
@@ -594,8 +593,8 @@ Mooncake PD 不进入当前 A3 standalone AF 性能开发的关键路径。
 1. 确认当前分支、HEAD、两个已冻结 tag 和 worktree 状态；
 2. 激活 A3 固定运行栈并运行 `tools/dsv4/check_runtime.sh`；
 3. 确认最近一个已通过阶段及其 `validation_summary.json`；
-4. 当前下一项是提交 eager/U2 并冻结 tag；
-5. 随后固定非 AFD/U1/U2 的公平请求矩阵和性能门禁；
+4. 当前下一项是固定非 AFD/U1/U2 的公平请求矩阵和性能门禁；
+5. 采集同口径 A3 稳态 profile，扫描 U2 threshold 和 `aiv_num`；
 6. 先完成同口径 profiling 与 threshold 扫描，再判断是否进入 Graph/U2；
 7. 正式性能跑数前锁定公平对照和门禁；
 8. A3 性能 tag 冻结后再进入 PD 或 A5 硬件差异开发；
