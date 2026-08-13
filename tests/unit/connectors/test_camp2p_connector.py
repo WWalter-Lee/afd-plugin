@@ -356,6 +356,11 @@ def test_dsv4_camp2p_sends_ids_before_hidden(monkeypatch):
 
     monkeypatch.setattr(camp2p_module.dist, "send", send_ids)
     monkeypatch.setattr(
+        camp2p_module,
+        "maybe_apply_dbo_yield",
+        lambda tensor, **_kwargs: events.append(("yield",)) or tensor,
+    )
+    monkeypatch.setattr(
         torch.ops.vllm,
         "afd_camp2p_send_attn_output",
         send_hidden,
@@ -373,7 +378,7 @@ def test_dsv4_camp2p_sends_ids_before_hidden(monkeypatch):
 
     connector.send_attn_output(hidden_states, context, input_ids=input_ids)
 
-    assert [event[0] for event in events] == ["ids", "hidden"]
+    assert [event[0] for event in events] == ["ids", "yield", "hidden"]
     assert events[0][1].dtype == torch.int32
     assert events[0][1].tolist() == [-1, 0, 31]
     assert events[0][2:] == (0, connector.ids_pg_list[0])
@@ -402,6 +407,11 @@ def test_dsv4_camp2p_skips_duplicate_ids_after_runner_pretransfer(monkeypatch):
         camp2p_module.dist,
         "send",
         lambda *_args, **_kwargs: events.append("ids"),
+    )
+    monkeypatch.setattr(
+        camp2p_module,
+        "maybe_apply_dbo_yield",
+        lambda tensor, **_kwargs: events.append("yield") or tensor,
     )
     monkeypatch.setattr(
         torch.ops.vllm,
@@ -485,6 +495,11 @@ def test_dsv4_camp2p_skips_value_guard_while_graph_compiling(monkeypatch):
         lambda tensor, **_kwargs: sent_ids.append(tensor.clone()),
     )
     monkeypatch.setattr(
+        camp2p_module,
+        "maybe_apply_dbo_yield",
+        lambda tensor, **_kwargs: tensor,
+    )
+    monkeypatch.setattr(
         torch.ops.vllm,
         "afd_camp2p_send_attn_output",
         lambda hidden_states, *_args: hidden_states,
@@ -538,7 +553,11 @@ def test_dsv4_camp2p_receives_ids_before_hidden(monkeypatch):
     layer0 = connector.recv_attn_output(ubatch_idx=0, layer_idx=0)
     layer1 = connector.recv_attn_output(ubatch_idx=0, layer_idx=1)
 
-    assert [event[0] for event in events] == ["ids", "hidden", "hidden"]
+    assert [event[0] for event in events] == [
+        "ids",
+        "hidden",
+        "hidden",
+    ]
     assert events[0][1:] == (1, connector.ids_pg_list[0])
     assert layer0.input_ids.tolist() == [-1, 0, 31]
     assert layer1.input_ids is None

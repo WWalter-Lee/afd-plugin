@@ -51,6 +51,7 @@ from afd_plugin.connectors.metadata import (
     send_control_payload,
 )
 from afd_plugin.distributed import init_afd_process_group, topology_from_config
+from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -287,8 +288,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         self.num_routed_experts = hf_config.n_routed_experts
         architectures = getattr(hf_config, "architectures", None) or []
         self.requires_input_ids = any(
-            architecture
-            in {"DeepseekV4ForCausalLM", "AFDDeepseekV4ForCausalLM"}
+            architecture in {"DeepseekV4ForCausalLM", "AFDDeepseekV4ForCausalLM"}
             for architecture in architectures
         )
         self.vocab_size = int(getattr(hf_config, "vocab_size", 0))
@@ -493,6 +493,10 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                     raise RuntimeError("DSV4 CAMP2P layer 0 requires input_ids")
                 if not input_ids_pretransferred:
                     self.send_input_ids(input_ids, ubatch_idx=ubatch_idx)
+                    # Let the peer ubatch send its IDs before either stage
+                    # enters CAMP2P hidden-state communication. FFN can then
+                    # receive both ID tensors on its single worker thread.
+                    maybe_apply_dbo_yield(input_ids, role="attention")
             elif input_ids is not None:
                 raise RuntimeError("DSV4 CAMP2P sends input_ids only at layer 0")
 
@@ -689,12 +693,13 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 f"buffer: {num_tokens} > {self.max_num_batched_tokens}"
             )
         source_rank = self.ffn_size + self.role_rank
+        input_ids = buffer[:num_tokens]
         dist.recv(
-            buffer[:num_tokens],
+            input_ids,
             src=source_rank,
             group=group,
         )
-        return buffer[:num_tokens]
+        return input_ids
 
     def _input_ids_buffer_and_group(
         self,

@@ -17,6 +17,9 @@ FFN_RANKS="${FFN_RANKS:-8}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-1024}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 EXECUTION_MODE="${EXECUTION_MODE:-eager}"
+U_BATCHES="${U_BATCHES:-1}"
+DBO_DECODE_TOKEN_THRESHOLD="${DBO_DECODE_TOKEN_THRESHOLD:-2}"
+DBO_PREFILL_TOKEN_THRESHOLD="${DBO_PREFILL_TOKEN_THRESHOLD:-12}"
 MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-8}"
 CUDAGRAPH_CAPTURE_SIZES="${CUDAGRAPH_CAPTURE_SIZES:-1 2 4 8}"
 
@@ -55,6 +58,27 @@ case "$EXECUTION_MODE" in
     ;;
 esac
 
+case "$U_BATCHES" in
+  1)
+    UBATCH_ARGS=()
+    ;;
+  2)
+    if [[ "$EXECUTION_MODE" != "eager" ]]; then
+      echo "DeepSeek-V4 U2 currently supports only EXECUTION_MODE=eager" >&2
+      exit 2
+    fi
+    UBATCH_ARGS=(
+      --enable-dbo
+      --dbo-decode-token-threshold "$DBO_DECODE_TOKEN_THRESHOLD"
+      --dbo-prefill-token-threshold "$DBO_PREFILL_TOKEN_THRESHOLD"
+    )
+    ;;
+  *)
+    echo "DeepSeek-V4 AFD supports U_BATCHES=1 or 2, got $U_BATCHES" >&2
+    exit 2
+    ;;
+esac
+
 exec vllm serve "$MODEL_PATH" \
   --host "$API_HOST" \
   --port "$API_PORT" \
@@ -74,4 +98,5 @@ exec vllm serve "$MODEL_PATH" \
   --quantization ascend \
   --block-size 128 \
   --additional-config "$ADDITIONAL_CONFIG" \
+  "${UBATCH_ARGS[@]}" \
   "${EXECUTION_ARGS[@]}"

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -21,6 +23,7 @@ FATAL_LOG_MARKERS = (
     "AFD NPU FFN worker loop failed",
     "EngineCore encountered a fatal error",
     "RuntimeError: Worker failed with error",
+    "Exception in thread",
 )
 
 
@@ -43,6 +46,9 @@ def _start_role(
     api_port: int,
     afd_port: int,
     execution_mode: str,
+    u_batches: int,
+    dbo_decode_token_threshold: int,
+    dbo_prefill_token_threshold: int,
     profile_dir: Path | None,
 ) -> tuple[subprocess.Popen[bytes], Any]:
     log_handle = (output_dir / f"{role}.log").open("wb")
@@ -55,6 +61,9 @@ def _start_role(
             "HCCL_IF_IP": env.get("HCCL_IF_IP", "192.169.91.106"),
             "PYTHONUNBUFFERED": "1",
             "EXECUTION_MODE": execution_mode,
+            "U_BATCHES": str(u_batches),
+            "DBO_DECODE_TOKEN_THRESHOLD": str(dbo_decode_token_threshold),
+            "DBO_PREFILL_TOKEN_THRESHOLD": str(dbo_prefill_token_threshold),
         }
     )
     if profile_dir is not None:
@@ -145,9 +154,7 @@ def _run_validator(
         *(str(size) for size in batch_sizes),
     ]
     if prompt_indices is not None:
-        command.extend(
-            ["--prompt-indices", *(str(index) for index in prompt_indices)]
-        )
+        command.extend(["--prompt-indices", *(str(index) for index in prompt_indices)])
     subprocess.run(command, cwd=REPO_ROOT, check=True)
 
 
@@ -210,12 +217,37 @@ def _role_log_gate(log_dir: Path) -> dict[str, Any]:
     roles: dict[str, Any] = {}
     for role in ("attention", "ffn"):
         log_path = log_dir / f"{role}.log"
+        if not log_path.is_file():
+            roles[role] = {
+                "passed": False,
+                "fatal_markers": ["<log missing>"],
+            }
+            continue
         text = log_path.read_text(encoding="utf-8", errors="replace")
         markers = [marker for marker in FATAL_LOG_MARKERS if marker in text]
         roles[role] = {"passed": not markers, "fatal_markers": markers}
     return {
         "roles": roles,
         "passed": all(result["passed"] for result in roles.values()),
+    }
+
+
+def _ubatch_execution_gate(log_dir: Path, u_batches: int) -> dict[str, Any]:
+    """Require runtime evidence that both requested U2 stages executed."""
+    required = u_batches == 2
+    log_path = log_dir / "attention.log"
+    text = (
+        log_path.read_text(encoding="utf-8", errors="replace")
+        if log_path.is_file()
+        else ""
+    )
+    observed = any(
+        "key=((0," in line and "), (1," in line for line in text.splitlines()
+    )
+    return {
+        "required": required,
+        "observed_two_stages": observed,
+        "passed": not required or observed,
     }
 
 
@@ -265,12 +297,98 @@ def _capture_command(command: list[str], output: Path) -> None:
         subprocess.run(command, stdout=handle, stderr=subprocess.STDOUT, check=False)
 
 
-def _runtime_manifest(*, execution_mode: str, profile: bool) -> dict[str, Any]:
+def _npu_process_ids(output: str) -> list[int]:
+    """Return process IDs from the process table in ``npu-smi info`` output."""
+    in_process_table = False
+    process_ids: list[int] = []
+    for line in output.splitlines():
+        if "| NPU" in line and "| Process id" in line:
+            in_process_table = True
+            continue
+        if not in_process_table:
+            continue
+        match = re.match(r"^\|\s*\d+\s+\d+\s*\|\s*(\d+)\s*\|", line)
+        if match is not None:
+            process_ids.append(int(match.group(1)))
+    return sorted(set(process_ids))
+
+
+def _has_npu_process_table(output: str) -> bool:
+    return any(
+        "| NPU" in line and "| Process id" in line for line in output.splitlines()
+    )
+
+
+def _wait_for_npu_cleanup(
+    output: Path,
+    *,
+    timeout: float = 60,
+    poll_interval: float = 2,
+) -> dict[str, Any]:
+    """Wait for role processes to leave the NPUs without killing other workloads."""
+    started = time.monotonic()
+    attempts = 0
+    returncode = -1
+    process_ids: list[int] = []
+    process_table_present = False
+    while True:
+        attempts += 1
+        result = subprocess.run(
+            ["npu-smi", "info"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        returncode = result.returncode
+        combined_output = result.stdout
+        if result.stderr:
+            combined_output += result.stderr
+        output.write_text(combined_output, encoding="utf-8")
+        process_table_present = _has_npu_process_table(result.stdout)
+        process_ids = _npu_process_ids(result.stdout)
+        if returncode == 0 and process_table_present and not process_ids:
+            break
+        elapsed = time.monotonic() - started
+        if elapsed >= timeout:
+            break
+        time.sleep(min(poll_interval, timeout - elapsed))
+    return {
+        "passed": returncode == 0 and process_table_present and not process_ids,
+        "process_ids": process_ids,
+        "process_table_present": process_table_present,
+        "npu_smi_returncode": returncode,
+        "attempts": attempts,
+        "waited_seconds": round(time.monotonic() - started, 3),
+    }
+
+
+def _runtime_manifest(
+    *,
+    execution_mode: str,
+    u_batches: int,
+    dbo_decode_token_threshold: int,
+    dbo_prefill_token_threshold: int,
+    profile: bool,
+) -> dict[str, Any]:
     def git_head(path: str) -> str:
         return subprocess.check_output(
             ["git", "-C", path, "rev-parse", "HEAD"], text=True
         ).strip()
 
+    afd_status = subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(REPO_ROOT),
+            "status",
+            "--short",
+            "--untracked-files=no",
+        ],
+        text=True,
+    ).splitlines()
+    afd_diff = subprocess.check_output(
+        ["git", "-C", str(REPO_ROOT), "diff", "--binary", "HEAD"],
+    )
     return {
         "python": sys.version,
         "plugins": "ascend,ascend_model,ascend_model_loader,ascend_kv_connector,afd",
@@ -278,16 +396,21 @@ def _runtime_manifest(*, execution_mode: str, profile: bool) -> dict[str, Any]:
         "venv": "/mnt/workspace/code/.venvs/afd-v026",
         "model": "/mnt/workspace/models/DeepSeek-V4-Flash-w8a8-mtp",
         "execution_mode": execution_mode,
-        "u_batches": 1,
+        "u_batches": u_batches,
+        "dbo_decode_token_threshold": dbo_decode_token_threshold,
+        "dbo_prefill_token_threshold": dbo_prefill_token_threshold,
         "profile": profile,
         "profile_role_ranks": [0] if profile else [],
         "torch_profiler_with_stack": False,
         "commits": {
             "afd_plugin": git_head(str(REPO_ROOT)),
             "vllm": git_head("/mnt/workspace/code/vllm-afd-v0.26.0"),
-            "vllm_ascend": git_head(
-                "/mnt/workspace/code/vllm-ascend-afd-80d8c194f"
-            ),
+            "vllm_ascend": git_head("/mnt/workspace/code/vllm-ascend-afd-80d8c194f"),
+        },
+        "afd_plugin_worktree": {
+            "tracked_dirty": bool(afd_status),
+            "tracked_status": afd_status,
+            "tracked_diff_sha256": hashlib.sha256(afd_diff).hexdigest(),
         },
     }
 
@@ -299,8 +422,7 @@ def main() -> None:
         "--golden",
         type=Path,
         default=Path(
-            "/mnt/workspace/validation/dsv4_milestone0_20260810/"
-            "golden_results.json"
+            "/mnt/workspace/validation/dsv4_milestone0_20260810/golden_results.json"
         ),
     )
     parser.add_argument("--attention-port", type=int, default=8910)
@@ -317,12 +439,22 @@ def main() -> None:
         choices=("eager", "full-decode-only"),
         default="eager",
     )
+    parser.add_argument("--u-batches", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--dbo-decode-token-threshold", type=int, default=2)
+    parser.add_argument("--dbo-prefill-token-threshold", type=int, default=12)
     parser.add_argument(
         "--profile",
         action="store_true",
         help="Collect plugin-owned Attention and FFN torch-npu traces.",
     )
     args = parser.parse_args()
+
+    if args.u_batches == 2 and args.execution_mode != "eager":
+        parser.error("DeepSeek-V4 U2 currently supports only eager execution")
+    if args.dbo_decode_token_threshold < 0:
+        parser.error("--dbo-decode-token-threshold must be non-negative")
+    if args.dbo_prefill_token_threshold < 0:
+        parser.error("--dbo-prefill-token-threshold must be non-negative")
 
     for port in (args.attention_port, args.ffn_port, args.afd_port):
         if not _port_is_free(port):
@@ -332,6 +464,9 @@ def main() -> None:
         json.dumps(
             _runtime_manifest(
                 execution_mode=args.execution_mode,
+                u_batches=args.u_batches,
+                dbo_decode_token_threshold=args.dbo_decode_token_threshold,
+                dbo_prefill_token_threshold=args.dbo_prefill_token_threshold,
                 profile=args.profile,
             ),
             indent=2,
@@ -371,6 +506,9 @@ def main() -> None:
                     api_port=args.ffn_port,
                     afd_port=args.afd_port,
                     execution_mode=args.execution_mode,
+                    u_batches=args.u_batches,
+                    dbo_decode_token_threshold=args.dbo_decode_token_threshold,
+                    dbo_prefill_token_threshold=args.dbo_prefill_token_threshold,
                     profile_dir=profile_dir,
                 )
                 processes["ffn"] = ffn_process
@@ -382,6 +520,9 @@ def main() -> None:
                     api_port=args.attention_port,
                     afd_port=args.afd_port,
                     execution_mode=args.execution_mode,
+                    u_batches=args.u_batches,
+                    dbo_decode_token_threshold=args.dbo_decode_token_threshold,
+                    dbo_prefill_token_threshold=args.dbo_prefill_token_threshold,
                     profile_dir=profile_dir,
                 )
                 processes["attention"] = attention_process
@@ -421,6 +562,10 @@ def main() -> None:
                 for handle in handles:
                     handle.close()
                 cycle_result["log_gate"] = _role_log_gate(cycle_dir)
+                cycle_result["ubatch_gate"] = _ubatch_execution_gate(
+                    cycle_dir,
+                    args.u_batches,
+                )
                 profile_passed = True
                 if profile_dir is not None:
                     profile_gate = _profile_output_gate(profile_dir)
@@ -430,14 +575,17 @@ def main() -> None:
                     cycle_result.get("passed", False)
                     and cycle_result["shutdown"]["passed"]
                     and cycle_result["log_gate"]["passed"]
+                    and cycle_result["ubatch_gate"]["passed"]
                     and profile_passed
                 )
-                _capture_command(
-                    ["npu-smi", "info"], cycle_dir / "npu_after_cleanup.txt"
+                cycle_result["npu_cleanup_gate"] = _wait_for_npu_cleanup(
+                    cycle_dir / "npu_after_cleanup.txt"
                 )
-                cycle_result["finished_at"] = time.strftime(
-                    "%Y-%m-%dT%H:%M:%S%z"
+                cycle_result["passed"] = bool(
+                    cycle_result["passed"]
+                    and cycle_result["npu_cleanup_gate"]["passed"]
                 )
+                cycle_result["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
                 cycles.append(cycle_result)
                 (cycle_dir / "cycle_summary.json").write_text(
                     json.dumps(cycle_result, indent=2, sort_keys=True) + "\n"
@@ -449,7 +597,9 @@ def main() -> None:
             "cycles": cycles,
             "golden": str(args.golden),
             "execution_mode": args.execution_mode,
-            "u_batches": 1,
+            "u_batches": args.u_batches,
+            "dbo_decode_token_threshold": args.dbo_decode_token_threshold,
+            "dbo_prefill_token_threshold": args.dbo_prefill_token_threshold,
             "profile": args.profile,
         }
         (args.output_dir / "validation_summary.json").write_text(

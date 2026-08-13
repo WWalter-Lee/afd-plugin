@@ -114,8 +114,10 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
     ) -> None:
         if dp_metadata_list is None:
             raise RuntimeError("AFD NPU FFN requires dp_metadata_list")
-        input_ids_by_stage = self._receive_input_ids_before_model(dp_metadata_list)
         if bool(self.use_aclgraph) and (is_graph_capturing or is_warmup):
+            input_ids_by_stage = self._receive_input_ids_before_model(
+                dp_metadata_list,
+            )
             logger.debug(
                 "AFD NPU FFN execute_ffn_step enters capture_model; "
                 "key=%s is_graph_capturing=%s is_warmup=%s",
@@ -130,6 +132,9 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 input_ids_by_stage=input_ids_by_stage,
             )
             return None
+        input_ids_by_stage = self._receive_input_ids_before_model(
+            dp_metadata_list,
+        )
         self.execute_model(
             dp_metadata_list=dp_metadata_list,
             input_ids_by_stage=input_ids_by_stage,
@@ -175,10 +180,8 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 is_graph_capturing=is_graph_capturing,
                 is_warmup=is_warmup,
             )
-        if input_ids_by_stage is None:
-            input_ids_by_stage = self._receive_input_ids_before_model(
-                dp_metadata_list
-            )
+        if input_ids_by_stage is None and run_mode is AFDGraphRunMode.REPLAY:
+            input_ids_by_stage = self._receive_input_ids_before_model(dp_metadata_list)
         if run_mode is AFDGraphRunMode.REPLAY:
             logger.debug(
                 "AFD NPU FFN replaying ACL graph; key=%s cached_graphs=%d",
@@ -286,15 +289,16 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                             self.vllm_config.parallel_config.data_parallel_size
                         ),
                     )
+                    stage_input_ids = (
+                        input_ids_by_stage.get(stage_idx)
+                        if input_ids_by_stage is not None and layer_idx == 0
+                        else None
+                    )
                     payload = self.connector.recv_attn_output(
                         ubatch_idx=stage_idx,
                         layer_idx=layer_idx,
                         max_num_tokens=self.max_num_tokens,
-                        input_ids=(
-                            input_ids_by_stage.get(stage_idx)
-                            if input_ids_by_stage is not None and layer_idx == 0
-                            else None
-                        ),
+                        input_ids=stage_input_ids,
                     )
                     if layer_idx == 0 and num_hash_layers > 0:
                         if payload.input_ids is None:
@@ -303,9 +307,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                             )
                         input_ids_cache[stage_idx] = payload.input_ids
                     elif payload.input_ids is not None:
-                        raise RuntimeError(
-                            "DSV4 FFN received input_ids after layer 0"
-                        )
+                        raise RuntimeError("DSV4 FFN received input_ids after layer 0")
                     hash_input_ids = (
                         input_ids_cache.get(stage_idx)
                         if layer_idx < num_hash_layers
@@ -416,9 +418,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         if dp_metadata_list is None:
             raise RuntimeError("AFD NPU FFN capture requires dp_metadata_list")
         if input_ids_by_stage is None:
-            input_ids_by_stage = self._receive_input_ids_before_model(
-                dp_metadata_list
-            )
+            input_ids_by_stage = self._receive_input_ids_before_model(dp_metadata_list)
 
         logger.debug(
             "AFD NPU FFN capture_model start; key=%s is_warmup=%s "

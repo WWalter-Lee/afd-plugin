@@ -87,6 +87,9 @@ def create_ascend_forward_context(
     new_forward_context.num_tokens = num_tokens
     new_forward_context.ubatch_idx = int(ubatch_num)
     new_forward_context.num_ubatches = len(ubatch_slices)
+    new_forward_context.afd_input_ids_pretransferred = bool(
+        getattr(cur_forward_context, "afd_input_ids_pretransferred", False)
+    )
     new_forward_context.flash_comm_v1_enabled = (
         cur_forward_context.flash_comm_v1_enabled
     )
@@ -109,7 +112,12 @@ def create_ascend_forward_context(
         cur_forward_context.max_tokens_across_pcp
     )
     new_forward_context.sinks = cur_forward_context.sinks
-    new_forward_context.input_ids = cur_forward_context.input_ids
+    parent_input_ids = cur_forward_context.input_ids
+    new_forward_context.input_ids = (
+        parent_input_ids[ubatch_slice.token_slice]
+        if parent_input_ids is not None
+        else None
+    )
     new_forward_context.eplb_heat_collection_status = (
         cur_forward_context.eplb_heat_collection_status
     )

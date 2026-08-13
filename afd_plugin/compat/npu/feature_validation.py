@@ -140,7 +140,7 @@ def _fail_if_unsupported_deepseek_v4_features(
     vllm_config: VllmConfig,
     afd_config: AFDConfig,
 ) -> None:
-    """Keep DSV4 AFD inside its validated eager/U1 and graph/U1 boxes."""
+    """Keep DSV4 AFD inside its validated eager/U2 and graph/U1 boxes."""
     parallel_config = vllm_config.parallel_config
     if afd_config.connector != "CAMP2pAFDConnector":
         raise RuntimeError("DeepSeek-V4 AFD supports only CAMP2pAFDConnector")
@@ -160,8 +160,6 @@ def _fail_if_unsupported_deepseek_v4_features(
         )
     if parallel_config.use_sequence_parallel_moe:
         raise RuntimeError("DeepSeek-V4 AFD does not support sequence-parallel MoE")
-    if parallel_config.use_ubatching:
-        raise RuntimeError("DeepSeek-V4 AFD does not support DBO/ubatching yet")
     if afd_config.compute_gate_on_attention:
         raise RuntimeError("DeepSeek-V4 AFD requires FFN-side gate computation")
     if not vllm_config.model_config.enforce_eager:
@@ -175,8 +173,11 @@ def _fail_if_unsupported_deepseek_v4_features(
             mode_name = str(cudagraph_mode).rsplit(".", 1)[-1]
         if mode_name != "FULL_DECODE_ONLY":
             raise RuntimeError(
-                "DeepSeek-V4 AFD graph execution supports only "
-                "FULL_DECODE_ONLY with DBO/ubatching disabled"
+                "DeepSeek-V4 AFD graph execution supports only FULL_DECODE_ONLY"
+            )
+        if parallel_config.use_ubatching:
+            raise RuntimeError(
+                "DeepSeek-V4 AFD DBO/ubatching currently supports only eager execution"
             )
     if vllm_config.speculative_config is not None:
         raise RuntimeError("DeepSeek-V4 AFD does not support MTP/speculative decoding")

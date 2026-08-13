@@ -62,6 +62,21 @@ python recipe/npu/CAMP2pAFDConnector/deepseek_v4/run_validation.py \
   --cycles 1 --idle-seconds 0 --rounds 1 --batch-sizes 1
 ```
 
+After the eager/U1 and graph/U1 tags are frozen, run the eager/U2 correctness
+gate with:
+
+```bash
+python recipe/npu/CAMP2pAFDConnector/deepseek_v4/run_validation.py \
+  --execution-mode eager --u-batches 2 \
+  --dbo-decode-token-threshold 2 --dbo-prefill-token-threshold 12 \
+  --output-dir /mnt/workspace/validation/dsv4_afd_eager_u2_$(date +%Y%m%d_%H%M%S)
+```
+
+Single-request golden traffic remains on the U1 fallback path. Batch 32 gives
+each Attention DP rank enough work to exercise U2 with these correctness-first
+thresholds. The runtime manifest records both thresholds. Graph/U2 remains a
+separate, explicitly rejected gate until eager/U2 is correct and profiled.
+
 The role launchers can also be run directly. Start `afd_ffn.sh` first, then
 `afd_attention.sh`. Override `API_PORT`, `AFD_PORT`, `HCCL_IF_IP`, or visible
 devices through environment variables when the defaults conflict with another
