@@ -143,10 +143,11 @@ class RemoteFFNProxy(nn.Module):
             context,
             **send_kwargs,
         )
-        hidden_states = maybe_apply_dbo_yield(
-            hidden_states,
-            role="attention",
-        )
+        if afd_metadata.connector.yield_after_attn_send:
+            hidden_states = maybe_apply_dbo_yield(
+                hidden_states,
+                role="attention",
+            )
         return afd_metadata.connector.recv_ffn_output(
             ref_tensor=hidden_states,
             ubatch_idx=stage_idx,

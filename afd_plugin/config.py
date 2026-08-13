@@ -22,6 +22,7 @@ AFDRole = Literal["attention", "ffn"]
 SUPPORTED_AFD_ROLES: Final[tuple[str, ...]] = ("attention", "ffn")
 SUPPORTED_AFD_CONNECTORS: Final[tuple[str, ...]] = (
     "P2pNcclAFDConnector",
+    "P2pHcclAFDConnector",
     "CAMP2pAFDConnector",
     AFD_ASYNC_CONNECTOR,
 )
@@ -315,6 +316,13 @@ def validate_afd_config(
         from afd_plugin.distributed import validate_p2p_topology
 
         validate_p2p_topology(config)
+    if (
+        config.connector == "P2pHcclAFDConnector"
+        and config.num_attention_ranks != config.num_ffn_ranks
+    ):
+        raise ValueError(
+            "P2pHcclAFDConnector currently requires equal Attention and FFN ranks",
+        )
     if not config.host:
         raise ValueError("AFD host must be non-empty")
     if not 0 < config.port < 65536:

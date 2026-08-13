@@ -11,6 +11,7 @@ RUNNER_PATH = REPO_ROOT / "recipe/npu/CAMP2pAFDConnector/deepseek_v4/run_validat
 VALIDATOR_PATH = (
     REPO_ROOT / "recipe/npu/CAMP2pAFDConnector/deepseek_v4/validate_golden.py"
 )
+HCCL_RECIPE_DIR = REPO_ROOT / "recipe/npu/P2pHcclAFDConnector/deepseek_v4"
 
 
 def _load_validator():
@@ -70,6 +71,17 @@ def test_dsv4_role_scripts_offer_u1_graph_and_eager_u2():
     assert "if ((shutdown_requested)); then" in ffn_script
 
 
+def test_dsv4_hccl_recipe_selects_hccl_connector_without_copying_validator():
+    for role in ("attention", "ffn"):
+        script = (HCCL_RECIPE_DIR / f"afd_{role}.sh").read_text(encoding="utf-8")
+        assert "export AFD_CONNECTOR=P2pHcclAFDConnector" in script
+        assert "CAMP2pAFDConnector/deepseek_v4" in script
+
+    runner = (HCCL_RECIPE_DIR / "run_validation.py").read_text(encoding="utf-8")
+    assert 'sys.argv.extend(["--connector", "P2pHcclAFDConnector"])' in runner
+    assert "runpy.run_path" in runner
+
+
 def test_dsv4_runtime_manifest_records_graph_u1(monkeypatch):
     runner = _load_runner()
 
@@ -83,6 +95,7 @@ def test_dsv4_runtime_manifest_records_graph_u1(monkeypatch):
     monkeypatch.setattr(runner.subprocess, "check_output", check_output)
 
     manifest = runner._runtime_manifest(
+        connector="CAMP2pAFDConnector",
         execution_mode="full-decode-only",
         u_batches=1,
         dbo_decode_token_threshold=2,
@@ -113,6 +126,7 @@ def test_dsv4_runtime_manifest_records_eager_u2(monkeypatch):
     monkeypatch.setattr(runner.subprocess, "check_output", check_output)
 
     manifest = runner._runtime_manifest(
+        connector="P2pHcclAFDConnector",
         execution_mode="eager",
         u_batches=2,
         dbo_decode_token_threshold=2,
@@ -121,6 +135,7 @@ def test_dsv4_runtime_manifest_records_eager_u2(monkeypatch):
     )
 
     assert manifest["execution_mode"] == "eager"
+    assert manifest["connector"] == "P2pHcclAFDConnector"
     assert manifest["u_batches"] == 2
     assert manifest["dbo_decode_token_threshold"] == 2
     assert manifest["dbo_prefill_token_threshold"] == 12

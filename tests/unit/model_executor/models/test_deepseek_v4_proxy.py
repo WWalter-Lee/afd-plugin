@@ -35,6 +35,8 @@ class _FakeMoE(nn.Module):
 
 
 class _LoopbackConnector:
+    yield_after_attn_send = True
+
     def __init__(self, ffn_layer) -> None:
         self.ffn_layer = ffn_layer
         self.sent = []

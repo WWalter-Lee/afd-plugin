@@ -4,7 +4,7 @@
 
 本文用于固化 DeepSeek-V4 AFD 在完成 eager/U1 与 Graph/U1 正确性基线后的目标、开发顺序和验收门禁，供后续开发、验证、性能分析和 A5 迁移时直接使用。
 
-文档状态：`2026-08-13`，eager/U2 已实现并冻结为 `dsv4-afd-a3-eager-u2-v1`；当前进入 A3-P3 公平 profiling 与调优。
+文档状态：`2026-08-13`，CAMP2P eager/U2 已冻结为 `dsv4-afd-a3-eager-u2-v1`；标准 HCCL send/recv connector 已完成 A3 eager/U1、U2 正确性闭环，当前进入 HCCL 路径的公平 profiling 与性能验收。
 
 本文不替代以下两份文档：
 
@@ -38,18 +38,16 @@
 
 ```text
 A3 当前阶段
-  U1 correctness 已完成
-  -> eager U2（实现、30/30 golden、batch、二次启动、空闲恢复、profile 和 tag 已完成）
-  -> eager U2 profiling/tuning
-  -> U2 + FULL_DECODE_ONLY
+  CAMP2P U1/U2 correctness 已完成并冻结
+  -> 标准 HCCL P2P connector U1/U2 correctness 已完成
+  -> HCCL P2P eager U1/U2 profiling/tuning
   -> A3 公平性能验收
   -> 冻结 A3 性能基线
 
 A5 硬件到位后
   平台审计和独立运行栈
-  -> A2E/E2A 自定义算子适配
-  -> 组件/单层验证
-  -> U1/U2、eager/Graph 回归
+  -> 标准 HCCL send/recv 组件验证
+  -> U1/U2 eager 回归
   -> A5 重新调优和独立性能验收
 ```
 
@@ -108,17 +106,25 @@ FFN 的 `free` 最大值为 50.261 ms，属于需要在后续稳定采集中确�
 
 ### 4.1 Connector 决策
 
-DeepSeek-V4 当前复用已有的 `CAMP2pAFDConnector`，没有新增 DSV4 专用 connector。
+DeepSeek-V4 现在有两条明确分开的 NPU 数据通路：
 
-DSV4 的改动是在现有 connector 中扩展：
+- `CAMP2pAFDConnector`：已有 A3 基线，hidden 路径使用 afd-plugin 自定义 A2E/E2A 算子；
+- `P2pHcclAFDConnector`：当前性能主线，hidden、FFN output 和 DSV4 input IDs 全部使用 `torch.distributed.send/recv` 的 HCCL process group。
+
+新增 connector 的原因不是模型语义不同，而是通信实现和调度约束不同。标准 HCCL 路径不加载、不调用 `torch.ops.vllm.afd_camp2p_send_attn_output()` 或 afd-plugin A2E/E2A 自定义算子，因而更贴近 A5 目标接口，也可以独立衡量 HCCL send/recv 下的 AFD 收益。
+
+`P2pHcclAFDConnector` 的关键边界为：
 
 - `AFDA2FTransferPayload.input_ids`；
 - 每个 stage 独立的 `afd_ids` HCCL group；
+- 每个 stage 独立的 hidden/output HCCL group；
 - 预分配的 NPU `int32` IDs buffer；
 - Attention 到 FFN 的一次性 IDs side channel；
-- FFN hash layer 的 stage 级 IDs cache 生命周期。
+- FFN hash layer 的 stage 级 IDs cache 生命周期；
+- Gloo 控制面先传 DP token count，FFN 再按精确 shape 投递 HCCL receive；
+- 阻塞式 send/recv 的 DBO 调度在 FFN output receive 后切换 stage，和 FFN 的 layer-major 顺序保持一致，避免两个 stage 交叉阻塞。
 
-后续 U2 仍应扩展这条路径，不应为了 U2 再复制一套 connector。
+后续性能开发以 `P2pHcclAFDConnector` 为主线。CAMP2P 保留为已冻结回归基线，不把两条数据面实现在同一个 connector 内用条件分支混合。
 
 ### 4.2 A/F 数量相等的含义
 
@@ -128,27 +134,27 @@ DSV4 的改动是在现有 connector 中扩展：
 num_attention_ranks == num_ffn_ranks
 ```
 
-这个门禁位于 `afd_plugin/compat/npu/feature_validation.py`。原因是当前 IDs side channel 和 CAMP2P 数据面采用 Attention rank `i` 与 FFN rank `i` 一一配对，并按对应 stage 使用相同消息顺序。
+这个门禁位于 `afd_plugin/compat/npu/feature_validation.py`。原因是当前 IDs side channel、CAMP2P 数据面和 HCCL P2P 数据面都采用 Attention rank `i` 与 FFN rank `i` 一一配对，并按对应 stage 使用相同消息顺序。
 
 因此：
 
 - A/F 等量是当前 DSV4 实现和已验证拓扑的要求；
-- 它不是 CAMP2P 的抽象定义，也不是 A3/A5 硬件的永久要求；
+- 它不是 CAMP2P/HCCL 的底层协议要求，也不是 A3/A5 硬件的永久要求；
 - 若将来支持 A/F 非等量，必须先定义 IDs 的 fan-out/gather 映射、消息计数、buffer 所有权和 Graph 稳定地址，再单独验收；
 - 当前性能路线不并行引入非等量拓扑，避免把正确性、U2 和拓扑变化混在一个阶段。
 
 ### 4.3 当前未验证能力
 
-eager DBO/U2 已属于冻结基线。以下能力仍不属于已冻结基线：
+标准 HCCL P2P eager/U1、U2 已完成当前正确性门禁，但还没有形成性能 tag。以下能力仍不属于 HCCL 主线基线：
 
-- U2 + `FULL_DECODE_ONLY`；
+- Graph/`FULL_DECODE_ONLY`；
 - Attention 侧 gate；
 - MTP/speculative decoding；
 - Mooncake PD；
 - sequence parallel；
 - A/F 非等量；
 - TP、PP、CP 或 DCP 大于 1；
-- A5 自定义 A2E/E2A 算子。
+- A5 实机 HCCL P2P 验证与调优。
 
 ## 5. A3 后续开发阶段
 
@@ -159,10 +165,10 @@ eager DBO/U2 已属于冻结基线。以下能力仍不属于已冻结基线：
 | A3-P0 | 固定非 AFD、AFD eager/U1、AFD Graph/U1 的性能实验协议 | 三种部署使用同一模型、请求和统计口径；结果可重复 |
 | A3-P1 | DSV4 eager/U2 的 stage IDs 与执行语义 | 已通过：相关回归 116 项，真实双 stage 执行通过 |
 | A3-P2 | eager/U2 A8F8 E2E | 已通过：golden、batch、双冷启动、30 分钟空闲恢复、profile 和清理通过 |
-| A3-P3 | eager/U2 profiling 与调优 | 形成 threshold、`aiv_num` 和热点结论；收益超过波动 |
-| A3-P4 | U2 + `FULL_DECODE_ONLY` | U1 fallback、U2 capture/replay、动态 IDs 和生命周期通过 |
+| A3-P3 | 新增标准 HCCL P2P connector | 已通过：A1F1/U2 组件 round-trip，A8F8 U1/U2 各 30/30 golden，batch 1/8/32、退出和清理通过 |
+| A3-P4 | HCCL P2P eager/U1、U2 profiling 与调优 | 形成 threshold、通信/计算 overlap 和热点结论；U2 收益超过波动 |
 | A3-P5 | A3 公平性能验收 | 正确性硬门禁通过；性能和资源效率达到预先锁定阈值 |
-| A3-P6 | 冻结 A3 性能基线 | tag、报告、原始日志、trace 和清理证据齐全 |
+| A3-P6 | 冻结 A3 HCCL 性能基线 | tag、报告、原始日志、trace 和清理证据齐全 |
 
 ### 5.1 A3-P0：固定性能实验协议
 
@@ -173,7 +179,7 @@ eager DBO/U2 已属于冻结基线。以下能力仍不属于已冻结基线：
 - 请求到达方式和预热请求数；
 - seed、temperature 和最大输出 token 数；
 - HBM 利用率、最大序列数和最大 batched tokens；
-- U2 threshold、`aiv_num` 和 Graph capture size；
+- U2 threshold、HCCL buffer 和调度参数；
 - 每个点至少 3 轮稳定运行；
 - 冷启动数据与稳态数据分开报告；
 - 服务端吞吐、客户端延迟和 NPU 资源指标使用相同测量窗口。
@@ -184,7 +190,7 @@ eager DBO/U2 已属于冻结基线。以下能力仍不属于已冻结基线：
 2. AFD eager/U1；
 3. AFD Graph/U1。
 
-后续只逐项加入 eager/U2 和 Graph/U2，避免一次改变多个变量。
+后续只逐项加入 HCCL P2P eager/U1 和 U2，避免一次改变多个变量。
 
 ### 5.2 A3-P1：实现 eager/U2
 
@@ -209,7 +215,7 @@ feat/dsv4-afd-eager-u2
 7. 请求不足以触发 U2 时保留 U1 fallback；
 8. U1 原有路径和两个已冻结 tag 的行为不得回退。
 
-实现时不硬编码 NPU 0-15 或 A8F8。角色数、rank、stage 数、token slice 和 `aiv_num` 继续来自配置或运行上下文，为 A5 不同卡数保留空间。
+实现时不硬编码 NPU 0-15 或 A8F8。角色数、rank、stage 数和 token slice 继续来自配置或运行上下文，为 A5 不同卡数保留空间。
 
 ### 5.3 A3-P1 测试门禁
 
@@ -225,7 +231,7 @@ CPU/Mock 测试至少覆盖：
 - 未触发 U2 时 U1 fallback 行为不变；
 - DSV4 以外模型和 connector 的配置验证不回退。
 
-CAMP2P 组件测试至少覆盖：
+connector 组件测试至少覆盖：
 
 - A1F1 的 stage 0/1 `int32` IDs round-trip；
 - 两个 stage 使用不同 token count；
@@ -257,7 +263,7 @@ CAMP2P 组件测试至少覆盖：
 dsv4-afd-a3-eager-u2-v1
 ```
 
-### 5.5 A3-P3：profiling 和调优
+### 5.5 A3-P4：HCCL P2P profiling 和调优
 
 部署、采集、解析必须分开执行：
 
@@ -294,14 +300,14 @@ export TORCH_PROFILER_WITH_STACK=0
 
 ```text
 U2 threshold: 16, 32, 48, 64, 96, 128
-aiv_num:      结合 A3 有效核数做小范围扫描
+HCCL_BUFFSIZE: 在固定请求矩阵下做小范围扫描
 ```
 
 性能热路径中的高频 warning、tensor `.tolist()` 和仅用于调试的 key 构造应降到 debug 或显式开关下。任何日志调整都必须保留错误和生命周期门禁所需信息。
 
-### 5.6 A3-P4：U2 + FULL_DECODE_ONLY
+### 5.6 Graph 后续门禁
 
-只有 eager/U2 正确且 profile 已解释后，才进入 Graph/U2。
+`P2pHcclAFDConnector` 首版显式只支持 eager。只有 HCCL eager/U2 的正确性、稳定性和性能收益已经解释清楚后，才评估 Graph；Graph 不是当前性能验收的前置条件。
 
 本阶段重点：
 
@@ -313,11 +319,7 @@ aiv_num:      结合 A3 有效核数做小范围扫描
 - graph capture 失败、replay 异常和 shutdown 均能清理；
 - 冷启动、二次启动和空闲恢复继续通过。
 
-通过后建议冻结：
-
-```text
-dsv4-afd-a3-graph-u2-v1
-```
+若未来进入 Graph，必须作为独立里程碑重新实现和验收，不能沿用 CAMP2P Graph 的结论。
 
 ## 6. A3 性能验收方法
 
@@ -330,9 +332,9 @@ dsv4-afd-a3-graph-u2-v1
 | 非 AFD eager | 基础执行对照 |
 | 非 AFD Graph | 非 AFD 最佳稳态对照 |
 | AFD eager/U1 | 分离本身的成本和收益 |
-| AFD Graph/U1 | 当前已冻结执行基线 |
-| AFD eager/U2 | 双阶段重叠收益 |
-| AFD Graph/U2 | A3 当前候选交付形态 |
+| CAMP2P AFD eager/U1、U2 | 已冻结功能对照，不代表 HCCL 主线性能 |
+| HCCL P2P AFD eager/U1 | 分离通信成本与 U2 对照 |
+| HCCL P2P AFD eager/U2 | 当前候选交付形态，验证双阶段重叠收益 |
 
 ### 6.2 公平资源口径
 
@@ -359,7 +361,7 @@ A8F8 使用 16 个 NPU。只把它与一个 8-NPU 非 AFD 实例比较，会把�
 以下是开始正式实验前应确认的建议门禁，不是适用于所有产品场景的永久阈值：
 
 1. 正确性、生命周期和清理门禁必须 100% 通过；
-2. Graph/U2 相对 Graph/U1 的 output tokens/s 提升不低于 10%；
+2. HCCL P2P eager/U2 相对同参数 HCCL P2P eager/U1 的 output tokens/s 提升不低于 10%；
 3. p99 TPOT 相对选定基线的回退不超过 5%；
 4. AFD 相对同总 NPU 预算非 AFD 的收益必须大于 3 轮稳定运行的波动区间；
 5. 不允许通过减少输出 token、改变 batch、降低 golden 覆盖或放宽错误检查获得收益；
@@ -382,7 +384,7 @@ A3 性能阶段只有在以下材料齐全时才完成：
 通过后建议冻结：
 
 ```text
-dsv4-afd-a3-graph-u2-perf-v1
+dsv4-afd-a3-hccl-p2p-perf-v1
 ```
 
 ## 7. 面向 A5：现在就要保持的设计边界
@@ -397,7 +399,7 @@ dsv4-afd-a3-graph-u2-perf-v1
 - `SOC_VERSION` 以 `ascend950` 开头时的构建识别；
 - 多个 Attention/MoE 算子的 `ascend950` 注册。
 
-但这只说明固定上游存在 A5 基础，不说明 afd-plugin 已支持 A5。当前 AFD 自定义 A2E/E2A 仍是 A3/910C 专用：
+但这只说明固定上游存在 A5 基础，不说明 afd-plugin 已支持 A5。当前主线选择标准 HCCL send/recv，A5 不再以前置移植 afd-plugin 自定义 A2E/E2A kernel 为目标；这减少了以下 A3 专用实现对 A5 的阻塞：
 
 - `csrc/npu/build_aclnn.sh` 只接受 `910c`/`ascend910_93*`；
 - `a2e_def.cpp` 和 `e2a_def.cpp` 只注册 `ascend910_93`；
@@ -405,27 +407,27 @@ dsv4-afd-a3-graph-u2-perf-v1
 - kernel 中存在 192 KB UB、48 core、window offset 等 A3 假设；
 - ACLNN host 侧 HCCL server type 对 910B 和其他 SoC 走不同分支，A5 行为尚未实测。
 
-因此不能仅增加一个 `ascend950` 字符串就宣称 A5 支持。
+这些限制仍适用于 CAMP2P 备选路径，但不进入 HCCL P2P 主线。另一方面，也不能因为代码只调用公共 `torch.distributed.send/recv` 就宣称 A5 已支持；A5 的驱动、固件、CANN、torch-npu、HCCL P2P 能力和目标拓扑仍必须实机验证。
 
 ### 7.2 A3 开发期间必须做到
 
 - U2 stage、rank 和 token slice 逻辑保持硬件无关；
 - 不在模型/connector 核心路径硬编码 A8F8、NPU 0-15 或单机卡数；
-- `aiv_num`、role 数、buffer token 上限和 capture size 可配置；
-- SoC 不支持时显式 fail-fast，不能静默跳过自定义算子后继续启动；
+- role 数、buffer token 上限、U2 threshold 和 HCCL 配置保持可配置；
+- HCCL backend、P2P send/recv 或目标拓扑不支持时显式 fail-fast；
 - A3/A5 使用独立 venv、CANN 根目录、构建输出、启动 recipe 和验证目录；
 - CPU/Mock 测试不依赖 A3 核数或物理 device ordinal；
 - performance manifest 记录 SoC、驱动、固件、CANN、torch-npu、拓扑和 NUMA；
+- connector 核心只依赖 PyTorch distributed HCCL 公共接口，不引用 CAMP2P 自定义 op；
 - 上游 patch 继续标注固定 commit 和 AFD patch marker，便于 A5 栈变化时重放差异。
 
 ### 7.3 当前不要提前做的 A5 修改
 
 没有 A5 硬件和匹配工具链时，不应凭 A3 结果猜测并提交以下变更：
 
-- A2E/E2A kernel 的 UB 分配和核数；
-- HCCL server type 和通信 window 选择；
-- A5 特定 IPC/SDMA 路径；
-- `aiv_num`、U2 threshold、Graph capture size；
+- CAMP2P A2E/E2A kernel 的 UB 分配、核数和通信 window；
+- A5 特定私有 IPC/SDMA 路径；
+- U2 threshold、HCCL buffer 和 Graph capture size；
 - CPU/NUMA 绑核和物理 rank 映射。
 
 这些修改需要在 A5 上通过最小组件测试和 profile 驱动。
@@ -457,22 +459,24 @@ uname -m
 
 A5 使用独立运行栈，并按目标产品支持矩阵固定版本。不要直接把 A3 的 CANN 根目录、venv 或已编译 `ascend910_93` 产物复制过去。
 
-### 8.2 A5-H1：自定义算子构建和注册
+### 8.2 A5-H1：标准 HCCL P2P 运行栈门禁
 
 需要完成：
 
-1. 在 `build_aclnn.sh` 增加精确的 `ascend950*` 识别和构建目标；
-2. 为 A2E/E2A host definition 增加正确的 `ascend950` 配置；
-3. 使用 A5 工具链重新编译，禁止复用 A3 二进制；
-4. `ensure_afd_ascend_ops_loaded()` 在 A5 venv 中通过；
-5. unsupported SoC、缺少 ops 包或产物架构不匹配时明确失败。
+1. 按 A5 产品支持矩阵建立独立 CANN、torch-npu、vLLM 和 vLLM-Ascend 环境；
+2. 验证 `torch.distributed` HCCL process group 可创建、销毁和二次创建；
+3. 验证 `send/recv` 支持 BF16 hidden/output 和 int32 input IDs；
+4. 确认单机或跨机目标拓扑的 rank、NIC、NUMA 与链路能力；
+5. unsupported backend、dtype、拓扑或栈版本明确失败。
+
+只有产品决定重新启用 CAMP2P 备选路径时，才单独建立 A5 自定义算子移植里程碑；它不阻塞 HCCL P2P 主线。
 
 ### 8.3 A5-H2：kernel 和通信最小验证
 
 按由小到大的顺序验证：
 
 1. A1F1 IDs `int32` round-trip；
-2. A1F1 hidden A2E/E2A round-trip；
+2. A1F1 hidden HCCL send/recv round-trip；
 3. 不同 token count、`-1` padding 和 buffer 边界；
 4. 连续两个 step 和两个 stage；
 5. 多 rank 单机；
@@ -481,11 +485,10 @@ A5 使用独立运行栈，并按目标产品支持矩阵固定版本。不要�
 
 本阶段重点实测：
 
-- UB 大小和对齐；
-- 可用 AIV/core 数；
-- HCCL server type；
-- 通信 window/offset；
-- IPC/SDMA/MTE 行为；
+- BF16/int32 send/recv 正确性和消息顺序；
+- HCCL group 创建、销毁和错误恢复；
+- 单链路带宽、时延与多 stage 并发行为；
+- HCCL buffer、超时和网络接口选择；
 - rank 到物理 NPU/NIC 的映射。
 
 ### 8.4 A5-H3：模型正确性回归
@@ -495,10 +498,9 @@ A5 必须先生成同平台非 AFD golden，不能只拿 A3 token 文件代替 A
 1. Attention/FFN 角色构造和权重所有权；
 2. layer 0、2、3、42 的单层/loopback 等价；
 3. eager/U1；
-4. `FULL_DECODE_ONLY`/U1；
-5. eager/U2；
-6. `FULL_DECODE_ONLY`/U2；
-7. 冷启动、二次启动、batch、空闲恢复和严格关闭。
+4. eager/U2；
+5. 冷启动、二次启动、batch、空闲恢复和严格关闭；
+6. Graph 仅在另立里程碑并实现后回归。
 
 若 A5 单机有 16 个 NPU，可以验证 A8F8；若只有 8 个 NPU，当前等量门禁下的起始拓扑是 A4F4。实际角色映射必须根据 `npu-smi` 拓扑和 NUMA/NIC 关系决定，不能只按 device ordinal 对半切分。
 
@@ -506,9 +508,7 @@ A5 必须先生成同平台非 AFD golden，不能只拿 A3 token 文件代替 A
 
 A5 需要重新扫描：
 
-- `aiv_num`；
 - U2 threshold；
-- Graph capture size；
 - HCCL buffer；
 - Attention/FFN 角色数；
 - CPU/NUMA 绑核；
@@ -524,7 +524,7 @@ Mooncake PD 不进入当前 A3 standalone AF 性能开发的关键路径。
 
 进入 PD 的门禁：
 
-- A3 或目标 A5 上 standalone AF 的 U2 + Graph 正确性通过；
+- A3 或目标 A5 上 standalone AF 的 HCCL P2P eager/U2 正确性和性能门禁通过；
 - AFD 相对非 AFD 的性能收益已经按公平资源口径得到解释；
 - A2F/F2A、FFN wait 和 bubble 的主要瓶颈已有 profile 证据；
 - 生命周期和自动清理稳定。
@@ -539,8 +539,8 @@ Mooncake PD 不进入当前 A3 standalone AF 性能开发的关键路径。
 |---|---|
 | eager/U2 开发 | `feat/dsv4-afd-eager-u2` |
 | A3 eager/U2 基线 | `dsv4-afd-a3-eager-u2-v1` |
-| A3 Graph/U2 基线 | `dsv4-afd-a3-graph-u2-v1` |
-| A3 性能验收 | `dsv4-afd-a3-graph-u2-perf-v1` |
+| HCCL P2P connector 开发 | `feat/dsv4-afd-hccl-p2p` |
+| A3 HCCL P2P 性能验收 | `dsv4-afd-a3-hccl-p2p-perf-v1` |
 | A5 基线 | 在实际硬件和版本确认后使用 `dsv4-afd-a5-*` 命名 |
 
 每个 tag 应为 annotated tag，tag message 至少包含：
@@ -549,7 +549,7 @@ Mooncake PD 不进入当前 A3 standalone AF 性能开发的关键路径。
 - 精确 commit；
 - SoC/拓扑；
 - CANN、vLLM、vLLM-Ascend；
-- U1/U2、eager/Graph；
+- U1/U2、eager/Graph 和 connector；
 - 主验证产物路径。
 
 ### 10.2 验证产物目录
@@ -579,14 +579,14 @@ Mooncake PD 不进入当前 A3 standalone AF 性能开发的关键路径。
 
 - token 与 golden 不一致；
 - IDs/hidden 消息计数或 stage 对应关系不确定；
-- Graph replay 使用旧 IDs；
+- 当前 eager 路径跨 step 使用旧 IDs；
 - 出现 NaN/Inf、shape 或 dtype 不一致；
 - Attention/FFN 任一侧非 0 退出；
 - 冷启动后存在残留进程、端口或 NPU 占用；
 - CANN 路径混入其他版本；
 - profiler 采集栈和 parser 版本不匹配；
 - 性能收益只在单轮出现，或小于稳定运行波动；
-- A5 上只完成编译，没有完成算子、模型和 E2E 验证。
+- A5 上只完成 HCCL 组件验证，没有完成模型和 E2E 验证。
 
 ## 12. 后续恢复工作时的最短检查清单
 
@@ -594,8 +594,8 @@ Mooncake PD 不进入当前 A3 standalone AF 性能开发的关键路径。
 2. 激活 A3 固定运行栈并运行 `tools/dsv4/check_runtime.sh`；
 3. 确认最近一个已通过阶段及其 `validation_summary.json`；
 4. 当前下一项是固定非 AFD/U1/U2 的公平请求矩阵和性能门禁；
-5. 采集同口径 A3 稳态 profile，扫描 U2 threshold 和 `aiv_num`；
-6. 先完成同口径 profiling 与 threshold 扫描，再判断是否进入 Graph/U2；
+5. 采集同口径 A3 稳态 profile，扫描 U2 threshold 和 HCCL buffer；
+6. 先完成同口径 profiling 与 threshold 扫描，再判断是否需要独立进入 Graph；
 7. 正式性能跑数前锁定公平对照和门禁；
 8. A3 性能 tag 冻结后再进入 PD 或 A5 硬件差异开发；
 9. A5 到位后从硬件审计和独立工具链开始，不复用 A3 二进制；
@@ -603,4 +603,4 @@ Mooncake PD 不进入当前 A3 standalone AF 性能开发的关键路径。
 
 ## 13. 一句话路线
 
-先在 A3 上把 U2、Graph 和公平性能收益做实，同时保持拓扑与硬件参数可配置；再在 A5 上重新构建通信算子、验证硬件假设、重跑全部正确性和性能门禁，最终形成独立的 A5 交付基线。
+先在 A3 上用标准 HCCL send/recv 把 eager U1/U2 和公平性能收益做实，同时保持拓扑与调度参数可配置；再在 A5 上验证独立运行栈、HCCL P2P 与硬件拓扑，重跑全部正确性和性能门禁，最终形成独立的 A5 交付基线。

@@ -45,6 +45,7 @@ def _start_role(
     output_dir: Path,
     api_port: int,
     afd_port: int,
+    connector: str,
     execution_mode: str,
     u_batches: int,
     dbo_decode_token_threshold: int,
@@ -58,6 +59,7 @@ def _start_role(
             "API_PORT": str(api_port),
             "AFD_PORT": str(afd_port),
             "AFD_HOST": "127.0.0.1",
+            "AFD_CONNECTOR": connector,
             "HCCL_IF_IP": env.get("HCCL_IF_IP", "192.169.91.106"),
             "PYTHONUNBUFFERED": "1",
             "EXECUTION_MODE": execution_mode,
@@ -364,6 +366,7 @@ def _wait_for_npu_cleanup(
 
 def _runtime_manifest(
     *,
+    connector: str,
     execution_mode: str,
     u_batches: int,
     dbo_decode_token_threshold: int,
@@ -395,6 +398,7 @@ def _runtime_manifest(
         "cann": "/mnt/workspace/code/.ascend/cann-9.0.1/cann-9.0.1",
         "venv": "/mnt/workspace/code/.venvs/afd-v026",
         "model": "/mnt/workspace/models/DeepSeek-V4-Flash-w8a8-mtp",
+        "connector": connector,
         "execution_mode": execution_mode,
         "u_batches": u_batches,
         "dbo_decode_token_threshold": dbo_decode_token_threshold,
@@ -428,6 +432,11 @@ def main() -> None:
     parser.add_argument("--attention-port", type=int, default=8910)
     parser.add_argument("--ffn-port", type=int, default=8911)
     parser.add_argument("--afd-port", type=int, default=29761)
+    parser.add_argument(
+        "--connector",
+        choices=("CAMP2pAFDConnector", "P2pHcclAFDConnector"),
+        default="CAMP2pAFDConnector",
+    )
     parser.add_argument("--startup-timeout", type=float, default=3600)
     parser.add_argument("--cycles", type=int, default=2)
     parser.add_argument("--idle-seconds", type=int, default=1800)
@@ -451,6 +460,11 @@ def main() -> None:
 
     if args.u_batches == 2 and args.execution_mode != "eager":
         parser.error("DeepSeek-V4 U2 currently supports only eager execution")
+    if (
+        args.connector == "P2pHcclAFDConnector"
+        and args.execution_mode != "eager"
+    ):
+        parser.error("P2pHcclAFDConnector currently supports only eager execution")
     if args.dbo_decode_token_threshold < 0:
         parser.error("--dbo-decode-token-threshold must be non-negative")
     if args.dbo_prefill_token_threshold < 0:
@@ -463,6 +477,7 @@ def main() -> None:
     (args.output_dir / "runtime.json").write_text(
         json.dumps(
             _runtime_manifest(
+                connector=args.connector,
                 execution_mode=args.execution_mode,
                 u_batches=args.u_batches,
                 dbo_decode_token_threshold=args.dbo_decode_token_threshold,
@@ -505,6 +520,7 @@ def main() -> None:
                     output_dir=cycle_dir,
                     api_port=args.ffn_port,
                     afd_port=args.afd_port,
+                    connector=args.connector,
                     execution_mode=args.execution_mode,
                     u_batches=args.u_batches,
                     dbo_decode_token_threshold=args.dbo_decode_token_threshold,
@@ -519,6 +535,7 @@ def main() -> None:
                     output_dir=cycle_dir,
                     api_port=args.attention_port,
                     afd_port=args.afd_port,
+                    connector=args.connector,
                     execution_mode=args.execution_mode,
                     u_batches=args.u_batches,
                     dbo_decode_token_threshold=args.dbo_decode_token_threshold,
@@ -597,6 +614,7 @@ def main() -> None:
             "cycles": cycles,
             "golden": str(args.golden),
             "execution_mode": args.execution_mode,
+            "connector": args.connector,
             "u_batches": args.u_batches,
             "dbo_decode_token_threshold": args.dbo_decode_token_threshold,
             "dbo_prefill_token_threshold": args.dbo_prefill_token_threshold,

@@ -4,7 +4,6 @@ set -eo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 source "${ROOT_DIR}/tools/dsv4/activate_runtime.sh"
 source /mnt/workspace/code/vllm-ascend-afd-80d8c194f/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/bin/set_env.bash
-source "${ROOT_DIR}/afd_plugin/_cann_ops_custom/vendors/afd-plugin/bin/set_env.bash"
 set -u
 
 MODEL_PATH="${MODEL_PATH:-/mnt/workspace/models/DeepSeek-V4-Flash-w8a8-mtp}"
@@ -12,6 +11,7 @@ API_HOST="${API_HOST:-127.0.0.1}"
 API_PORT="${API_PORT:-8910}"
 AFD_HOST="${AFD_HOST:-127.0.0.1}"
 AFD_PORT="${AFD_PORT:-29761}"
+AFD_CONNECTOR="${AFD_CONNECTOR:-CAMP2pAFDConnector}"
 ATTENTION_RANKS="${ATTENTION_RANKS:-8}"
 FFN_RANKS="${FFN_RANKS:-8}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-1024}"
@@ -38,13 +38,29 @@ export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-18000}"
 export VLLM_PLUGINS=ascend,ascend_model,ascend_model_loader,ascend_kv_connector,afd
 unset VLLM_ASCEND_ENABLE_FLASHCOMM1
 
-ADDITIONAL_CONFIG="$(printf '{"afd":{"role":"attention","connector":"CAMP2pAFDConnector","host":"%s","port":%s,"num_attention_ranks":%s,"num_ffn_ranks":%s}}' "$AFD_HOST" "$AFD_PORT" "$ATTENTION_RANKS" "$FFN_RANKS")"
+case "$AFD_CONNECTOR" in
+  CAMP2pAFDConnector)
+    source "${ROOT_DIR}/afd_plugin/_cann_ops_custom/vendors/afd-plugin/bin/set_env.bash"
+    ;;
+  P2pHcclAFDConnector)
+    ;;
+  *)
+    echo "Unsupported DeepSeek-V4 NPU connector: $AFD_CONNECTOR" >&2
+    exit 2
+    ;;
+esac
+
+ADDITIONAL_CONFIG="$(printf '{"afd":{"role":"attention","connector":"%s","host":"%s","port":%s,"num_attention_ranks":%s,"num_ffn_ranks":%s}}' "$AFD_CONNECTOR" "$AFD_HOST" "$AFD_PORT" "$ATTENTION_RANKS" "$FFN_RANKS")"
 
 case "$EXECUTION_MODE" in
   eager)
     EXECUTION_ARGS=(--enforce-eager)
     ;;
   full-decode-only)
+    if [[ "$AFD_CONNECTOR" == "P2pHcclAFDConnector" ]]; then
+      echo "P2pHcclAFDConnector currently supports only EXECUTION_MODE=eager" >&2
+      exit 2
+    fi
     read -r -a CAPTURE_SIZE_ARGS <<<"$CUDAGRAPH_CAPTURE_SIZES"
     EXECUTION_ARGS=(
       --max-cudagraph-capture-size "$MAX_CUDAGRAPH_CAPTURE_SIZE"

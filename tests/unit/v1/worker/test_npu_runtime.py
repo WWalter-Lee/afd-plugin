@@ -2156,6 +2156,28 @@ def test_dsv4_feature_validation_accepts_eager_u2_camp2p():
     )
 
 
+@pytest.mark.parametrize("use_ubatching", [False, True])
+def test_dsv4_feature_validation_accepts_eager_hccl_p2p(use_ubatching):
+    config = _dsv4_config(
+        enable_dbo=use_ubatching,
+        use_ubatching=use_ubatching,
+        num_ubatches=2 if use_ubatching else 1,
+        ubatch_size=2,
+    )
+    config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
+def test_dsv4_feature_validation_rejects_hccl_p2p_graph():
+    config = _dsv4_config(cudagraph_mode="FULL_DECODE_ONLY")
+    config.model_config.enforce_eager = False
+    config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
+
+    with pytest.raises(RuntimeError, match="P2pHccl.*only eager"):
+        fail_if_unsupported_npu_afd_features(config)
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -2163,7 +2185,7 @@ def test_dsv4_feature_validation_accepts_eager_u2_camp2p():
             lambda config: config.additional_config["afd"].update(
                 connector="P2pNcclAFDConnector"
             ),
-            "only CAMP2pAFDConnector",
+            "only CAMP2pAFDConnector or P2pHcclAFDConnector",
         ),
         (
             lambda config: config.additional_config["afd"].update(num_ffn_ranks=2),
