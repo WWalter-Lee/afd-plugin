@@ -212,6 +212,97 @@ def _parallel_config(**overrides):
     return SimpleNamespace(**values)
 
 
+@pytest.mark.parametrize(
+    ("runner", "expected"),
+    [
+        (SimpleNamespace(use_dcp=True), True),
+        (SimpleNamespace(use_dcp=False), False),
+        (SimpleNamespace(use_cp=False), False),
+        (SimpleNamespace(), False),
+    ],
+)
+def test_npu_attention_legacy_dcp_manager_compatibility(runner, expected):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    assert attention_model_runner._uses_legacy_dcp_manager(runner) is expected
+
+
+def test_npu_attention_common_metadata_abi_is_supported():
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    fields = attention_model_runner._ASCEND_COMMON_METADATA_FIELDS
+    legacy_fields = {
+        "context_parallel_metadata",
+        "group_len",
+        "group_key_idx",
+        "group_key_cache_idx",
+    }
+    vllm_cann_fields = {
+        "prefill_context_parallel_metadata",
+        "slot_mapping_cpu",
+    }
+
+    assert legacy_fields <= fields or vllm_cann_fields <= fields
+
+
+def test_npu_ubatch_metadata_split_supports_runtime_abi():
+    _require_npu_runtime()
+    from vllm.v1.worker.ubatch_utils import UBatchSlice
+    from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
+
+    from afd_plugin.v1.worker.npu import ubatch_utils
+
+    fields = ubatch_utils._ASCEND_COMMON_METADATA_FIELDS
+    metadata_kwargs = {
+        "query_start_loc": torch.tensor([0, 2, 4], dtype=torch.int32),
+        "query_start_loc_cpu": torch.tensor([0, 2, 4], dtype=torch.int32),
+        "seq_lens": torch.tensor([2, 2], dtype=torch.int32),
+        "seq_lens_cpu": torch.tensor([2, 2], dtype=torch.int32),
+        "num_computed_tokens_cpu": torch.tensor([0, 0], dtype=torch.int32),
+        "num_reqs": 2,
+        "num_actual_tokens": 4,
+        "max_query_len": 2,
+        "max_seq_len": 2,
+        "block_table_tensor": torch.zeros((2, 1), dtype=torch.int32),
+        "slot_mapping": torch.arange(4, dtype=torch.int32),
+        "actual_seq_lengths_q": [1, 2, 3, 4],
+        "positions": torch.arange(4, dtype=torch.int64),
+        "positions_cpu": torch.arange(4, dtype=torch.int64),
+        "num_input_tokens": 4,
+    }
+    if "slot_mapping_cpu" in fields:
+        metadata_kwargs["slot_mapping_cpu"] = torch.arange(4, dtype=torch.int32)
+    if "prefill_context_parallel_metadata" in fields:
+        metadata_kwargs["prefill_context_parallel_metadata"] = None
+    if "context_parallel_metadata" in fields:
+        metadata_kwargs["context_parallel_metadata"] = None
+    if "kvcomp_metadata" in fields:
+        metadata_kwargs["kvcomp_metadata"] = None
+    for field_name in (
+        "mm_req_doc_ranges",
+        "rswa_prefix_lens",
+        "group_len",
+        "group_key_idx",
+        "group_key_cache_idx",
+    ):
+        if field_name in fields:
+            metadata_kwargs[field_name] = None
+
+    metadata = AscendCommonAttentionMetadata(**metadata_kwargs)
+    result = ubatch_utils._make_metadata_with_slice(
+        UBatchSlice(slice(0, 1), slice(0, 2)),
+        metadata,
+    )
+
+    assert result.num_reqs == 1
+    assert result.num_actual_tokens == 2
+    assert result.slot_mapping.tolist() == [0, 1]
+    if "slot_mapping_cpu" in fields:
+        assert result.slot_mapping_cpu.tolist() == [0, 1]
+
+
 def _vllm_config(
     *,
     role="attention",
@@ -564,16 +655,19 @@ def test_npu_attention_runner_skips_outer_update_only_for_owned_graph(
     updates = []
     runner._update_full_graph_params_if_needed = lambda *args: updates.append(args)
 
+    positions = object()
     result = runner._model_forward(
         8,
         input_ids=None,
-        positions=object(),
+        positions=positions,
         intermediate_tensors=None,
         inputs_embeds=None,
     )
 
     assert result == "hidden_states"
     assert len(updates) == expected_updates
+    if updates:
+        assert updates[0][2] is positions
 
 
 def test_npu_attention_runner_pretransfers_dsv4_ids_outside_model(monkeypatch):

@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import logging
 from contextlib import AbstractContextManager, nullcontext
+from dataclasses import fields as dataclass_fields
 from functools import partial
 from typing import Any
 
@@ -38,9 +39,16 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import (
     AscendDSACPMetadataBuilder,
 )
-from vllm_ascend.attention.context_parallel.sfa_cp import (
-    AscendSFADCPMetadataBuilder,
-)
+
+try:
+    from vllm_ascend.attention.context_parallel.sfa_cp import (
+        AscendSFADCPMetadataBuilder,
+    )
+except ImportError:
+    # vllm-ascend rfc/vllm_cann folds PCP and DCP into one SFA-CP builder.
+    from vllm_ascend.attention.context_parallel.sfa_cp import (
+        AscendSFACPMetadataBuilder as AscendSFADCPMetadataBuilder,
+    )
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -103,12 +111,29 @@ from afd_plugin.v1.worker.npu.ubatch_utils import (
 
 logger = init_logger(__name__)
 
+_ASCEND_COMMON_METADATA_FIELDS = frozenset(
+    field.name for field in dataclass_fields(AscendCommonAttentionMetadata)
+)
+
 
 def _new_ubatch_dsa_ratio_metadata(
     num_ubatches: int,
 ) -> list[tuple[dict[Any, Any], dict[Any, Any], dict[Any, Any]]]:
     """Allocate DSA ratio caches that are isolated by execution stage."""
     return [({}, {}, {}) for _ in range(num_ubatches)]
+
+
+def _uses_legacy_dcp_manager(model_runner: Any) -> bool:
+    """Return whether the runner owns the pre-vllm_cann DCP manager.
+
+    vllm-ascend 80d8c194f exposes ``use_dcp`` and ``dcp_manager``. The
+    rfc/vllm_cann branch folds PCP and DCP into ``use_cp``/``pcp_manager`` and
+    therefore has no ``use_dcp`` attribute. DeepSeek-V4 AFD rejects context
+    parallel sizes above one, so an absent legacy field means this branch is
+    disabled.
+    """
+
+    return bool(getattr(model_runner, "use_dcp", False))
 
 
 def _num_actual_requests_for_ubatch(
@@ -285,6 +310,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             self._update_full_graph_params_if_needed(
                 forward_context,
                 num_tokens_padded,
+                positions,
             )
         # ### PATCH START: DSV4 graph-safe IDs side channel
         # torch_npu lowers dist.send inside a compiled model to an op whose
@@ -316,6 +342,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             self._update_full_graph_params_if_needed(
                 forward_context,
                 num_tokens_padded,
+                positions,
             )
 
         # ### PATCH START: AFD defers FlashComm gather to the ubatch wrapper
@@ -543,7 +570,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
 
         def _get_dcp_metadata(block_table_tensor: torch.Tensor):
-            if not self.use_dcp:
+            if not _uses_legacy_dcp_manager(self):
                 return None, block_table_tensor
 
             fixed_decode_seq_lens_cpu = None
@@ -567,6 +594,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         def _get_block_table_and_slot_mapping(kv_cache_gid: int):
             assert num_reqs_padded is not None and num_tokens_padded is not None
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
+            slot_mapping_cpu = None
             if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
                 blk_table_tensor = torch.zeros(
                     (num_reqs_padded, 1),
@@ -581,6 +609,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             else:
                 blk_table = self.input_batch.block_table[kv_cache_gid]
                 slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_padded]
+                slot_mapping_cpu = blk_table.slot_mapping.cpu[:num_tokens_padded]
                 blk_table_tensor = blk_table.get_device_tensor()[:num_reqs_padded]
                 slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
                 blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
@@ -593,9 +622,13 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 self.routed_experts_slot_mapping_device[:num_slots].copy_(
                     slot_mapping,
                 )
-            return blk_table_tensor, slot_mapping
+            return blk_table_tensor, slot_mapping, slot_mapping_cpu
 
-        block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
+        (
+            block_table_gid_0,
+            slot_mapping_gid_0,
+            slot_mapping_cpu_gid_0,
+        ) = _get_block_table_and_slot_mapping(0)
         self.long_seq_metadata, block_table_gid_0 = _get_dcp_metadata(
             block_table_gid_0,
         )
@@ -612,7 +645,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             seq_lens_cpu = None
             num_computed_tokens_cpu = None
 
-        cm_base = AscendCommonAttentionMetadata(
+        common_metadata_kwargs: dict[str, Any] = dict(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
             seq_lens=self.seq_lens[:num_reqs_padded],
@@ -634,11 +667,24 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             positions_cpu=self._dsa_positions_cpu_buf if self.use_compress else None,
             attn_state=self.attn_state,
             decode_token_per_req=self.decode_token_per_req,
-            context_parallel_metadata=self.long_seq_metadata,
-            group_len=self.group_len.gpu[:num_reqs_padded],
-            group_key_idx=self.group_key_idx.gpu[:num_reqs_padded],
-            group_key_cache_idx=self.group_key_cache_idx.gpu[:num_reqs_padded],
         )
+        # ### PATCH START: vllm_cann attention metadata ABI
+        if "slot_mapping_cpu" in _ASCEND_COMMON_METADATA_FIELDS:
+            common_metadata_kwargs["slot_mapping_cpu"] = slot_mapping_cpu_gid_0
+        if "prefill_context_parallel_metadata" in _ASCEND_COMMON_METADATA_FIELDS:
+            common_metadata_kwargs["prefill_context_parallel_metadata"] = (
+                self.long_seq_metadata
+            )
+        elif "context_parallel_metadata" in _ASCEND_COMMON_METADATA_FIELDS:
+            common_metadata_kwargs["context_parallel_metadata"] = self.long_seq_metadata
+        if "group_len" in _ASCEND_COMMON_METADATA_FIELDS:
+            common_metadata_kwargs.update(
+                group_len=self.group_len.gpu[:num_reqs_padded],
+                group_key_idx=self.group_key_idx.gpu[:num_reqs_padded],
+                group_key_cache_idx=self.group_key_cache_idx.gpu[:num_reqs_padded],
+            )
+        # ### PATCH END: vllm_cann attention metadata ABI
+        cm_base = AscendCommonAttentionMetadata(**common_metadata_kwargs)
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
             cm_base.num_logits_indices = logits_indices.size(0)
@@ -755,11 +801,15 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                         : num_reqs_padded + 1
                     ]
             if kv_cache_gid > 0:
-                cm.block_table_tensor, cm.slot_mapping = (
-                    _get_block_table_and_slot_mapping(
-                        kv_cache_gid,
-                    )
+                (
+                    cm.block_table_tensor,
+                    cm.slot_mapping,
+                    slot_mapping_cpu,
+                ) = _get_block_table_and_slot_mapping(
+                    kv_cache_gid,
                 )
+                if "slot_mapping_cpu" in _ASCEND_COMMON_METADATA_FIELDS:
+                    cm.slot_mapping_cpu = slot_mapping_cpu
             if self.speculative_config and isinstance(
                 self.drafter,
                 AscendStep3p5MTPProposer | AscendDSparkProposer,
@@ -1142,7 +1192,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             force_num_active_loras=num_active_loras,
         )
         # ### PATCH END: AFD dummy ubatch decision
-        if self.use_dcp:
+        if _uses_legacy_dcp_manager(self):
             self.dcp_manager.init_batch_info(
                 num_scheduled_tokens,
                 num_reqs,
@@ -1589,8 +1639,15 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             return self.model.unwrap()
         return super().get_model()
 
-    def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:
-        super().initialize_attn_backend(kv_cache_config)
+    def initialize_attn_backend(
+        self,
+        kv_cache_config: KVCacheConfig,
+        is_profiling: bool = False,
+    ) -> None:
+        super().initialize_attn_backend(
+            kv_cache_config,
+            is_profiling=is_profiling,
+        )
         if (
             bool(
                 self.vllm_config.parallel_config.use_ubatching,

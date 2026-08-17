@@ -10,6 +10,10 @@ A3-P5 的 `A = k x F` 非等量协议和 A2F1/A4F2 NPU 组件验证已经完成�
 
 当前性能阶段明确不引入异步 HCCL：不使用 `isend/irecv`、后台通信线程或自定义异步传输 op，保留标准阻塞式 `torch.distributed.send/recv` 和现有 NPU 同步边界。第一轮同步优化已经减少重复 host 解析、device-to-host 标量读取和每层 forward-context 构造；A8F8/U1/C32 正式三轮均值达到 57.724 output token/s，相对 P4 均值提升 17.521%，CV 为 0.689%。该结果是 C32 候选收益，不代表 C1/C8、非 AFD 公平对照或整个 P7 已冻结。
 
+旧栈的非等量 HCCL 与同步优化已经在提交 `0d2d52ae4a0e927c23db6762b0016555fcfd1baa`、tag `dsv4-afd-a3-sync-hccl-pre-v023-v1` 固化。后续开发已切换到 vLLM `releases/v0.23.0` 与 vLLM-Ascend `rfc/vllm_cann`；旧栈的 +17.521% 结论继续作为该优化在原固定栈上的有效证据，但不能直接当作目标栈性能数字。
+
+目标栈功能迁移已经完成：同栈原生模型的 10 条 prompt 连续 3 轮稳定，AFD eager/U2 对同栈 golden 达到 30/30 逐 token 一致，并通过 batch 1/8/32 结构、真实双 stage、Attention 先停、FFN 后退、fatal 日志和 NPU 清理门禁。目标栈同参数 C32 性能复测也已完成：U1 三轮均值为 17.082 output token/s，U2 为 12.582 output token/s，U2 回退 26.342%。因此本阶段只冻结功能兼容性，不创建目标栈性能 tag。
+
 本文不替代以下文档：
 
 - `DEEPSEEK_V4_AFD_ADAPTATION_GUIDE_ZH.md`：完整适配背景和早期里程碑；
@@ -70,6 +74,7 @@ A3 验收通过只说明实现语义和 A3 性能成立，不等于 A5 已支持
 | `dsv4-afd-eager-u1-v1` | `40981475a9270c9b79ebf5cfe46d375472ee0a06` | A8F8、eager、U1 正确性基线 |
 | `dsv4-afd-graph-u1-v1` | `2ed98442351d4be96edbb315a6b6c8d00805bbc4` | A8F8、`FULL_DECODE_ONLY`、U1 Graph 与生命周期基线 |
 | `dsv4-afd-a3-eager-u2-v1` | `1b5d011c830d66a2516ed647064fa571667761a3` | A8F8、eager、U2 正确性、生命周期与提交态 smoke 基线 |
+| `dsv4-afd-a3-sync-hccl-pre-v023-v1` | `0d2d52ae4a0e927c23db6762b0016555fcfd1baa` | 旧固定栈的非等量 HCCL、同步热路径优化与迁移前 checkpoint |
 
 以上 tag 均不改写。HCCL 后续阶段以提交 `9578dd2` 为开发起点，每个阶段独立提交并通过全部门禁后再打新 tag，失败阶段不打 tag。
 
@@ -98,7 +103,58 @@ A3 后续开发继续遵守：
 - 每次验证前运行 `tools/dsv4/check_runtime.sh`；
 - 每次验证后保存清理完成后的 `npu-smi info`。
 
-### 3.3 当前 profiling 观察基线
+### 3.3 目标开发运行栈
+
+从 tag `dsv4-afd-a3-sync-hccl-pre-v023-v1` 之后，功能和性能验证使用以下目标栈。旧栈不删除，只用于回归和解释历史性能数据；两个栈的绝对性能不可混合计算收益。
+
+| 项目 | 目标值 |
+|---|---|
+| CANN | `/mnt/workspace/code/.ascend/cann-9.0.1/cann-9.0.1` |
+| Python venv | `/mnt/workspace/code/.venvs/afd-v023-vllm-cann` |
+| vLLM 源码 | `/mnt/workspace/code/vllm-release-v0.23.0` |
+| vLLM branch/commit | `releases/v0.23.0` / `0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665` |
+| vLLM-Ascend 源码 | `/mnt/workspace/code/vllm-ascend-rfc-vllm-cann` |
+| vLLM-Ascend branch/commit | `rfc/vllm_cann` / `3da28f9414583d2d0b672a8f06d1fae142404bda` |
+| 激活脚本 | `source tools/dsv4/activate_v023_vllm_cann_runtime.sh` |
+| 环境门禁 | `tools/dsv4/check_v023_vllm_cann_runtime.sh` |
+
+迁移只修改 `afd-plugin`，目标 vLLM 和 vLLM-Ascend 工作树保持干净。兼容层同时保留 0.23.0 和冻结的 0.26.0 路径，涉及 EngineCore、MoE loader、DSV4 构造、Ascend attention metadata 和 U2 ubatch metadata 的版本差异必须由测试覆盖，不能在上游源码中打临时 patch。
+
+主要功能证据：
+
+```text
+/mnt/workspace/validation/dsv4_v023_vllm_cann_native_baseline/golden_results.json
+/mnt/workspace/validation/dsv4_afd_v023_vllm_cann_e2e_u1_smoke_backend_fix/validation_summary.json
+/mnt/workspace/validation/dsv4_afd_v023_vllm_cann_e2e_u2_full_final/validation_summary.json
+```
+
+#### 3.3.1 目标栈功能与性能结论
+
+目标栈原生模型先生成同栈 golden，再由 AFD 做严格对照，避免把上游版本造成的 token 差异误判为 AFD 错误。原生 10 条 prompt 连续 3 轮稳定；AFD eager/U2 的串行请求 30/30 token IDs 完全一致，真实双 stage、batch 1/8/32 请求结构、启动、退出和清理均通过。
+
+性能复测固定 A8F8、C32、输入 1024 token、输出 128 token、每轮 128 请求、3 轮、temperature 0、seed 1024，U1/U2 只改变 ubatch 数：
+
+| 指标 | 目标栈 U1 | 目标栈 U2 | U2 相对 U1 |
+|---|---:|---:|---:|
+| output throughput | 17.082 token/s | 12.582 token/s | -26.342% |
+| output throughput CV | 4.273% | 9.640% | 均通过 10% 重复性门禁 |
+| output token/s/NPU | 1.068 | 0.786 | -26.342% |
+| p50 TTFT | 12159.339 ms | 14883.743 ms | +22.406% |
+| p50 TPOT | 1778.871 ms | 2558.760 ms | +43.842% |
+| p99 TPOT | 2001.907 ms | 2854.412 ms | +42.585% |
+
+U1 三轮原始吞吐为 17.004、16.229、18.012 token/s；U2 为 10.892、13.682、13.171 token/s。两组均为每轮 128/128 成功，U2 日志确认 `stage_count=2`，shutdown、fatal 和 NPU cleanup 门禁通过。
+
+```text
+/mnt/workspace/validation/dsv4_afd_v023_vllm_cann_perf_u1_c32_1k128_r3/performance_summary.json
+/mnt/workspace/validation/dsv4_afd_v023_vllm_cann_perf_u2_c32_1k128_r3/performance_summary.json
+```
+
+目标栈 U1 比旧栈同参数、同同步优化的 57.724 token/s 低 70.408%。这说明切换上游栈后必须重新建立绝对性能基线，不能继承旧数字；它不推翻同步优化在旧栈 P4/P7 A/B 中已证明的 +17.521% 收益。若要量化该优化在目标栈上的独立贡献，仍需在目标栈做一次开启/关闭优化的同提交 A/B。
+
+当前性能结论是“功能迁移通过、U2 收益失败、目标栈 eager 绝对性能需要定位”。下一步先采集目标栈 U1/U2 的 Attention DP0 与 FFN DP0 profile，拆分 stage wait、host 发射、FFN free/bubble 和上游 DP coordinator/异步调度开销；仍不引入异步 HCCL，也不进入 Graph、PD 或 A5 性能外推。
+
+### 3.4 当前 profiling 观察基线
 
 现有 Graph/U1 profile：
 
@@ -196,7 +252,8 @@ AFD world        -> [F0 ... F(F-1), A0 ... A(A-1)]
 | A3-P5 | HCCL P2P `A = k x F` 非等量实现 | 已通过：A2F1/A4F2 真实 NPU 组件、两 stage/两 step、不同 peer token count、聚合/切分和 close 均通过 |
 | A3-P6 | A8F4 eager/U1、U2 E2E 正确性 | A3 停止：EP4 模型构造 HBM 不足；A10F5 被固定栈 EP5 专家放置拒绝；A8F4 E2E 转 A5 |
 | A3-P7 | A8F8 同步 HCCL profiling、调优和公平性能验收 | 进行中：C32 三轮均值 57.724 token/s、CV 0.689%，较 P4 +17.521%；待补 C1/C8、冷服务重复与非 AFD 公平对照 |
-| A3-P8 | 冻结 A3 HCCL 性能基线 | tag、报告、原始日志、trace、配置与清理证据齐全 |
+| A3-P7T | 迁移 vLLM 0.23 + `rfc/vllm_cann` | 功能已通过；U1/U2 三轮稳定，但 U2 回退 26.342%，只冻结功能兼容性 |
+| A3-P8 | 冻结目标栈 A3 HCCL 基线 | 功能 tag 与性能 tag 分开；报告、原始日志、trace、配置与清理证据齐全 |
 
 ### 5.1 A3-P0：固定性能实验协议
 
@@ -799,6 +856,7 @@ Mooncake PD 不进入当前 A3 standalone AF 性能开发的关键路径。
 | HCCL P2P 非等量开发 | `feat/dsv4-afd-hccl-p2p-unequal` |
 | A3 HCCL P2P 非等量正确性基线 | `dsv4-afd-a3-hccl-p2p-unequal-v1` |
 | A3 HCCL P2P 性能验收 | `dsv4-afd-a3-hccl-p2p-perf-v1` |
+| vLLM 0.23 + `rfc/vllm_cann` 功能兼容基线 | `dsv4-afd-v023-vllm-cann-eager-u2-functional-v1` |
 | A5 基线 | 在实际硬件和版本确认后使用 `dsv4-afd-a5-*` 命名 |
 
 每个 tag 应为 annotated tag，tag message 至少包含：
@@ -850,18 +908,18 @@ Mooncake PD 不进入当前 A3 standalone AF 性能开发的关键路径。
 
 ## 12. 后续恢复工作时的最短检查清单
 
-1. 确认当前分支、HEAD、已冻结 tag 和 worktree 状态；HCCL 开发起点应为 `9578dd2`；
-2. 激活 A3 固定运行栈并运行 `tools/dsv4/check_runtime.sh`；
-3. 确认最近一个已通过阶段及其 `validation_summary.json`；
+1. 确认当前分支、HEAD、已冻结 tag 和 worktree 状态；迁移前 checkpoint 为 `dsv4-afd-a3-sync-hccl-pre-v023-v1`；
+2. 激活目标运行栈并运行 `tools/dsv4/check_v023_vllm_cann_runtime.sh`，同时确认两个目标上游工作树干净；
+3. 确认同栈原生 golden 和最近一个 AFD `validation_summary.json`，不要再用旧栈 token IDs 判断目标栈正确性；
 4. A3-P4 已完成；先阅读 `DEEPSEEK_V4_AFD_HCCL_P2P_A3_P4_PERFORMANCE_REPORT_ZH.md`，不要把当前 U2 当作性能基线；
 5. A3-P5 已完成；恢复时先核对 A2F1/A4F2 `summary.json` 和相关回归，不重复改写 topology 协议；
 6. A3-P6 的 A8F4 已确认受 EP4 HBM 阻塞，A10F5 受固定栈 EP5 放置阻塞；不要通过超卖或 EPLB 改变语义绕过；
-7. 当前执行 A3-P7 的 A8F8 同步 HCCL profile 和优化，明确禁止把异步 HCCL 混入本阶段；
-8. C32 同步优化三轮已通过；下一步补 C1/C8、冷服务重复和非 AFD 公平对照，不把 C32 结果外推到全部负载；Graph 不与本阶段同时开发；
+7. 旧栈 C32 同步优化和 A3-P7T 目标栈 U1/U2 复测均已完成；目标栈 U2 回退 26.342%，明确禁止打性能 tag；
+8. 下一步先做目标栈 U1/U2 双侧 profile 和同提交优化开关 A/B，再补 C1/C8、冷服务重复与同总 NPU 预算的非 AFD 公平对照；Graph 不与本阶段同时开发；
 9. A3 性能 tag 冻结后再进入 PD 或 A5 硬件差异开发；
 10. A5 到位后从硬件审计和独立工具链开始，不复用 A3 二进制；
 11. 每次阶段完成都保存日志、原始数据、解析结果和清理证据。
 
 ## 13. 一句话路线
 
-先在 A3 上完成标准 HCCL send/recv 的 A8F8 基线、`A = k x F` 组件语义和阻塞式同步优化；A8F4 因 A3 EP4 HBM 不足转到高 HBM A5 完成 E2E、资源效率和公平性能验收。当前阶段不引入异步 HCCL，任何未来异步方案都必须作为独立里程碑重新验收。
+先在旧固定栈固化标准 HCCL send/recv 的 `A = k x F` 语义和阻塞式同步优化，再在 vLLM 0.23 + `rfc/vllm_cann` 目标栈重新完成 U1/U2 功能与性能门禁；A8F4 因 A3 EP4 HBM 不足转到高 HBM A5 完成 E2E、资源效率和公平性能验收。当前阶段不引入异步 HCCL，任何未来异步方案都必须作为独立里程碑重新验收。

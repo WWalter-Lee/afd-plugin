@@ -121,9 +121,20 @@ def test_pinned_constructor_signatures_match_native_model():
             return_annotation=inspect.Signature.empty,
         )
 
-    assert without_annotations(
+    afd_layer_signature = without_annotations(
         adapter.AFDDeepseekV4DecoderLayer.__init__
-    ) == without_annotations(adapter.native.DeepseekV2DecoderLayer.__init__)
+    )
+    native_layer_signature = without_annotations(
+        adapter.native.DeepseekV2DecoderLayer.__init__
+    )
+    if "attn_cls" not in native_layer_signature.parameters:
+        native_layer_signature = native_layer_signature.replace(
+            parameters=[
+                *native_layer_signature.parameters.values(),
+                afd_layer_signature.parameters["attn_cls"],
+            ]
+        )
+    assert afd_layer_signature == native_layer_signature
     assert without_annotations(
         adapter.AFDDeepseekV4Model.__init__
     ) == without_annotations(adapter.native.DeepseekV4Model.__init__)
@@ -196,6 +207,7 @@ def test_model_constructor_enforces_role_ownership(
 
     assert ("embed_tokens.weight" in names) is expected_embedding
     assert (model.topk_indices_buffer is not None) is expected_topk_buffer
+    assert model.aux_hidden_state_layers == ()
     assert ("hc_head_fn" in names) is (role == "attention")
     if role == "attention":
         assert not any(".mlp.weight" in name for name in names)

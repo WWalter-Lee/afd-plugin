@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import inspect
+from pathlib import Path
 
 import pytest
 
@@ -168,7 +170,18 @@ def test_gpu_v1_overrides_match_native_call_contract(
     afd_method = getattr(getattr(afd_module, afd_class_name), method_name)
     native_method = getattr(getattr(native_module, native_class_name), method_name)
 
-    assert _call_contract(afd_method) == _call_contract(native_method)
+    afd_contract = _call_contract(afd_method)
+    native_contract = _call_contract(native_method)
+    if method_name == "_warmup_and_capture" and len(afd_contract) == len(
+        native_contract
+    ) + 1:
+        # vLLM 0.26 added an optional profiler argument. Keep it in the plugin
+        # signature so one implementation remains callable on 0.23 and 0.26.
+        assert afd_contract[:-1] == native_contract
+        assert afd_contract[-1][0] == "profiler"
+        assert afd_contract[-1][2] is None
+    else:
+        assert afd_contract == native_contract
 
 
 @pytest.mark.vllm_runtime
@@ -182,3 +195,37 @@ def test_npu_runtime_class_paths_resolve_when_vllm_ascend_is_available(qualname)
 
     assert isinstance(cls, type)
     assert cls.__module__.startswith("afd_plugin.v1.worker.npu")
+
+
+def test_npu_attention_backend_override_matches_native_call_contract():
+    source_path = (
+        Path(__file__).parents[4]
+        / "afd_plugin/v1/worker/npu/attention_model_runner.py"
+    )
+    module = ast.parse(source_path.read_text(encoding="utf-8"))
+    runner_class = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "AFDNPUAttentionModelRunner"
+    )
+    method = next(
+        node
+        for node in runner_class.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "initialize_attn_backend"
+    )
+    assert [argument.arg for argument in method.args.args][-2:] == [
+        "kv_cache_config",
+        "is_profiling",
+    ]
+    assert isinstance(method.args.defaults[-1], ast.Constant)
+    assert method.args.defaults[-1].value is False
+    assert any(
+        keyword.arg == "is_profiling"
+        and isinstance(keyword.value, ast.Name)
+        and keyword.value.id == "is_profiling"
+        for call in ast.walk(method)
+        if isinstance(call, ast.Call)
+        for keyword in call.keywords
+    )

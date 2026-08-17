@@ -38,6 +38,20 @@ _DeepseekAdapterConfig: TypeAlias = (
 )
 
 
+def _get_moe_router_dtype(config: _DeepseekAdapterConfig) -> torch.dtype | None:
+    """Use the native v0.26 helper, with its behavior for v0.23 runtimes."""
+
+    native_helper = getattr(native, "_get_moe_router_dtype", None)
+    if native_helper is not None:
+        return native_helper(config)
+    if (
+        getattr(config, "model_type", None) == "glm_moe_dsa"
+        or getattr(config, "moe_router_dtype", None) == "float32"
+    ):
+        return torch.float32
+    return None
+
+
 def _is_moe_layer(config: _DeepseekAdapterConfig, layer_idx: int) -> bool:
     moe_layer_freq = getattr(config, "moe_layer_freq", 1)
     return (
@@ -259,7 +273,7 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
         nn.Module.__init__(self)
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
-        router_dtype = native._get_moe_router_dtype(config)
+        router_dtype = _get_moe_router_dtype(config)
         if compute_gate_on_attention:
             self.gate = native.GateLinear(
                 config.hidden_size,

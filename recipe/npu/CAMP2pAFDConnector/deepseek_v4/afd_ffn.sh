@@ -2,8 +2,10 @@
 set -eo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
+export DSV4_VLLM_VENV="${DSV4_RUNTIME_VENV:-/mnt/workspace/code/.venvs/afd-v026}"
 source "${ROOT_DIR}/tools/dsv4/activate_runtime.sh"
-source /mnt/workspace/code/vllm-ascend-afd-80d8c194f/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/bin/set_env.bash
+DSV4_VLLM_ASCEND_ROOT="${DSV4_VLLM_ASCEND_ROOT:-/mnt/workspace/code/vllm-ascend-afd-80d8c194f}"
+source "${DSV4_VLLM_ASCEND_ROOT}/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/bin/set_env.bash"
 set -u
 
 MODEL_PATH="${MODEL_PATH:-/mnt/workspace/models/DeepSeek-V4-Flash-w8a8-mtp}"

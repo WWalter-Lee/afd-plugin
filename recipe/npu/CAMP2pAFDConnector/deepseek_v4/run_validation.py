@@ -178,9 +178,11 @@ def _run_validator(
 
 
 def _signal_group(process: subprocess.Popen[bytes], sig: signal.Signals) -> None:
-    if process.poll() is None:
-        with suppress(ProcessLookupError):
-            os.killpg(process.pid, sig)
+    # The group can outlive its leader when a vLLM worker is reparented to PID 1.
+    # Always address the group that this runner created, even if Popen.poll()
+    # already reports that the role's shell or API parent has exited.
+    with suppress(ProcessLookupError):
+        os.killpg(process.pid, sig)
 
 
 def _signal_process(process: subprocess.Popen[bytes], sig: signal.Signals) -> None:
@@ -204,6 +206,10 @@ def _stop_process(
     except subprocess.TimeoutExpired:
         _signal_group(process, signal.SIGKILL)
         process.wait(timeout=30)
+    finally:
+        # A clean role-parent exit does not prove that every NPU worker in its
+        # process group has exited. Drain any remaining owned descendants.
+        _signal_group(process, signal.SIGKILL)
 
 
 def _shutdown_roles(processes: dict[str, subprocess.Popen[bytes]]) -> dict[str, Any]:
@@ -391,6 +397,19 @@ def _runtime_manifest(
     profile: bool,
     topology: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    venv_path = os.environ.get(
+        "DSV4_RUNTIME_VENV",
+        "/mnt/workspace/code/.venvs/afd-v026",
+    )
+    vllm_root = os.environ.get(
+        "DSV4_VLLM_ROOT",
+        "/mnt/workspace/code/vllm-afd-v0.26.0",
+    )
+    vllm_ascend_root = os.environ.get(
+        "DSV4_VLLM_ASCEND_ROOT",
+        "/mnt/workspace/code/vllm-ascend-afd-80d8c194f",
+    )
+
     def git_head(path: str) -> str:
         return subprocess.check_output(
             ["git", "-C", path, "rev-parse", "HEAD"], text=True
@@ -414,7 +433,7 @@ def _runtime_manifest(
         "python": sys.version,
         "plugins": "ascend,ascend_model,ascend_model_loader,ascend_kv_connector,afd",
         "cann": "/mnt/workspace/code/.ascend/cann-9.0.1/cann-9.0.1",
-        "venv": "/mnt/workspace/code/.venvs/afd-v026",
+        "venv": venv_path,
         "model": "/mnt/workspace/models/DeepSeek-V4-Flash-w8a8-mtp",
         "connector": connector,
         "execution_mode": execution_mode,
@@ -426,8 +445,8 @@ def _runtime_manifest(
         "torch_profiler_with_stack": False,
         "commits": {
             "afd_plugin": git_head(str(REPO_ROOT)),
-            "vllm": git_head("/mnt/workspace/code/vllm-afd-v0.26.0"),
-            "vllm_ascend": git_head("/mnt/workspace/code/vllm-ascend-afd-80d8c194f"),
+            "vllm": git_head(vllm_root),
+            "vllm_ascend": git_head(vllm_ascend_root),
         },
         "afd_plugin_worktree": {
             "tracked_dirty": bool(afd_status),

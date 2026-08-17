@@ -456,6 +456,57 @@ def test_dsv4_shutdown_gate_requires_both_roles_to_exit_cleanly(monkeypatch):
     ]
 
 
+def test_dsv4_signal_group_reaps_descendants_after_leader_exit(monkeypatch):
+    runner = _load_runner()
+    signals = []
+
+    class ExitedProcess:
+        pid = 1234
+
+        @staticmethod
+        def poll():
+            return 0
+
+    monkeypatch.setattr(
+        runner.os,
+        "killpg",
+        lambda pid, sig: signals.append((pid, sig)),
+    )
+
+    runner._signal_group(ExitedProcess(), runner.signal.SIGKILL)
+
+    assert signals == [(1234, runner.signal.SIGKILL)]
+
+
+def test_dsv4_stop_process_drains_owned_group_after_clean_exit(monkeypatch):
+    runner = _load_runner()
+    signals = []
+
+    class RunningProcess:
+        pid = 1234
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout):
+            self.returncode = 0
+            return self.returncode
+
+    monkeypatch.setattr(
+        runner.os,
+        "killpg",
+        lambda pid, sig: signals.append((pid, sig)),
+    )
+
+    runner._stop_process(RunningProcess())
+
+    assert signals == [
+        (1234, runner.signal.SIGTERM),
+        (1234, runner.signal.SIGKILL),
+    ]
+
+
 @pytest.mark.parametrize(
     "fatal_marker",
     ["AFD NPU FFN worker loop failed", "Exception in thread"],

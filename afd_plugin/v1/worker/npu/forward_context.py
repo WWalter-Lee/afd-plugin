@@ -52,9 +52,10 @@ def create_ascend_forward_context(
         parent_kwargs[AFD_MLA_GRAPH_PARAMS_KEY] = mla_graph_params
 
     ubatch_slice = ubatch_slices[ubatch_num]
+    parent_is_padding = getattr(cur_forward_context, "is_padding", None)
     is_padding = (
-        cur_forward_context.is_padding[ubatch_slice.token_slice]
-        if cur_forward_context.is_padding is not None
+        parent_is_padding[ubatch_slice.token_slice]
+        if parent_is_padding is not None
         else None
     )
     new_forward_context = ForwardContext(
@@ -68,8 +69,9 @@ def create_ascend_forward_context(
         ubatch_slices=ubatch_slices,
         skip_compiled=skip_compiled,
         additional_kwargs=parent_kwargs,
-        is_padding=is_padding,
     )
+    # vLLM 0.23 has no constructor field for this Ascend extension yet.
+    new_forward_context.is_padding = is_padding
 
     num_tokens = ubatch_slice.num_tokens
     tp_world_size = get_tensor_model_parallel_world_size()

@@ -113,9 +113,12 @@ def _load_forward_context_module(monkeypatch):
         **kwargs,
         "afd_metadata": metadata,
     }
-    fake_afd_ubatch.build_ubatch_afd_metadata = lambda metadata, _slices, _index: (
-        metadata
-    )
+    def build_ubatch_afd_metadata(metadata, _slices, index):
+        clone = metadata.clone()
+        clone.stage_idx = index
+        return clone
+
+    fake_afd_ubatch.build_ubatch_afd_metadata = build_ubatch_afd_metadata
 
     modules = {
         "vllm": fake_vllm,
@@ -274,6 +277,9 @@ def _parent_forward_context():
         is_draft_model_prefill=False,
         draft_attn_metadatas=None,
         max_tokens_across_pcp=None,
+        sinks=None,
+        input_ids=None,
+        eplb_heat_collection_status=False,
         mc2_mask=None,
     )
 

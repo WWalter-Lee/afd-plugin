@@ -74,6 +74,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
         config: native.DeepseekV2Config | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
         is_draft_layer: bool = False,
+        attn_cls: type[nn.Module] | None = None,
     ) -> None:
         # ### PATCH START: role-selective DSV4 construction.
         nn.Module.__init__(self)
@@ -96,7 +97,8 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
             max_position_embeddings = config.rope_parameters[
                 "original_max_position_embeddings"
             ]
-            self.self_attn = native.DeepseekV4Attention(
+            attention_class = attn_cls or native.DeepseekV4Attention
+            self.self_attn = attention_class(
                 vllm_config=vllm_config,
                 config=config,
                 max_position_embeddings=max_position_embeddings,
@@ -262,6 +264,9 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         self.device = native.current_platform.device_type
         self.vocab_size = config.vocab_size
         self.is_v32 = hasattr(config, "index_topk")
+        # vLLM 0.23 does not initialize this field for the Ascend DSV4 model,
+        # while the newer forward path checks it even when Eagle/MTP is off.
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
 
         # ### PATCH START: DSA scratch data belongs only to Attention.
         if self.is_v32 and self.afd_role == "attention":
