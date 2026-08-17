@@ -24,6 +24,8 @@ FATAL_LOG_MARKERS = (
     "EngineCore encountered a fatal error",
     "RuntimeError: Worker failed with error",
     "Exception in thread",
+    "Communication_Error_Bind_IP_Port",
+    "error code is 507015",
 )
 
 
@@ -74,12 +76,27 @@ def _start_role(
         role_dir.mkdir(parents=True, exist_ok=True)
         env.update(
             {
-                f"{role_prefix}_ENABLE": "1",
-                f"{role_prefix}_WAIT": "2",
-                f"{role_prefix}_WARMUP": "1",
-                f"{role_prefix}_ACTIVE": "10",
-                f"{role_prefix}_REPEAT": "1",
-                f"{role_prefix}_SKIP_FIRST": "0",
+                f"{role_prefix}_ENABLE": env.get(
+                    f"{role_prefix}_ENABLE",
+                    "1",
+                ),
+                f"{role_prefix}_WAIT": env.get(f"{role_prefix}_WAIT", "2"),
+                f"{role_prefix}_WARMUP": env.get(
+                    f"{role_prefix}_WARMUP",
+                    "1",
+                ),
+                f"{role_prefix}_ACTIVE": env.get(
+                    f"{role_prefix}_ACTIVE",
+                    "10",
+                ),
+                f"{role_prefix}_REPEAT": env.get(
+                    f"{role_prefix}_REPEAT",
+                    "1",
+                ),
+                f"{role_prefix}_SKIP_FIRST": env.get(
+                    f"{role_prefix}_SKIP_FIRST",
+                    "0",
+                ),
                 f"{role_prefix}_DIR": str(role_dir),
                 f"{role_prefix}_WITH_STACK": "0",
                 "TORCH_PROFILER_WITH_STACK": "0",
@@ -372,6 +389,7 @@ def _runtime_manifest(
     dbo_decode_token_threshold: int,
     dbo_prefill_token_threshold: int,
     profile: bool,
+    topology: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     def git_head(path: str) -> str:
         return subprocess.check_output(
@@ -392,7 +410,7 @@ def _runtime_manifest(
     afd_diff = subprocess.check_output(
         ["git", "-C", str(REPO_ROOT), "diff", "--binary", "HEAD"],
     )
-    return {
+    manifest = {
         "python": sys.version,
         "plugins": "ascend,ascend_model,ascend_model_loader,ascend_kv_connector,afd",
         "cann": "/mnt/workspace/code/.ascend/cann-9.0.1/cann-9.0.1",
@@ -417,6 +435,90 @@ def _runtime_manifest(
             "tracked_diff_sha256": hashlib.sha256(afd_diff).hexdigest(),
         },
     }
+    if topology is not None:
+        manifest["topology"] = topology
+    return manifest
+
+
+def _parse_device_list(raw: str) -> list[int]:
+    try:
+        devices = [int(value) for value in raw.split(",") if value.strip()]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "devices must be a comma-separated integer list",
+        ) from exc
+    if not devices:
+        raise argparse.ArgumentTypeError("device list cannot be empty")
+    return devices
+
+
+def _resolve_topology(
+    *,
+    connector: str,
+    attention_devices: list[int],
+    ffn_devices: list[int],
+    attention_max_num_batched_tokens: int,
+    ffn_max_num_batched_tokens: int | None,
+) -> dict[str, Any]:
+    attention_ranks = len(attention_devices)
+    ffn_ranks = len(ffn_devices)
+    all_devices = [*attention_devices, *ffn_devices]
+    if any(device < 0 or device >= 16 for device in all_devices):
+        raise ValueError("DeepSeek-V4 recipe devices must be in [0, 15]")
+    if len(set(all_devices)) != len(all_devices):
+        raise ValueError("Attention and FFN device lists must not overlap")
+    if connector == "CAMP2pAFDConnector" and attention_ranks != ffn_ranks:
+        raise ValueError("CAMP2pAFDConnector requires equal Attention and FFN ranks")
+    if attention_ranks < ffn_ranks or attention_ranks % ffn_ranks != 0:
+        raise ValueError(
+            "P2pHcclAFDConnector requires Attention ranks to be an integer "
+            "multiple of FFN ranks",
+        )
+    if attention_max_num_batched_tokens <= 0:
+        raise ValueError("Attention max_num_batched_tokens must be positive")
+
+    ratio = attention_ranks // ffn_ranks
+    required_ffn_tokens = attention_max_num_batched_tokens * ratio
+    resolved_ffn_tokens = (
+        required_ffn_tokens
+        if ffn_max_num_batched_tokens is None
+        else ffn_max_num_batched_tokens
+    )
+    if resolved_ffn_tokens < required_ffn_tokens:
+        raise ValueError(
+            "FFN max_num_batched_tokens must cover one Attention subgroup: "
+            f"required at least {required_ffn_tokens}, got {resolved_ffn_tokens}",
+        )
+
+    return {
+        "attention_ranks": attention_ranks,
+        "ffn_ranks": ffn_ranks,
+        "ratio": ratio,
+        "attention_devices": attention_devices,
+        "ffn_devices": ffn_devices,
+        "unused_devices": sorted(set(range(16)) - set(all_devices)),
+        "attention_max_num_batched_tokens": attention_max_num_batched_tokens,
+        "ffn_max_num_batched_tokens": resolved_ffn_tokens,
+    }
+
+
+def _set_topology_environment(topology: dict[str, Any]) -> None:
+    os.environ.update(
+        {
+            "ATTENTION_RANKS": str(topology["attention_ranks"]),
+            "FFN_RANKS": str(topology["ffn_ranks"]),
+            "ATTENTION_DEVICES": ",".join(
+                str(device) for device in topology["attention_devices"]
+            ),
+            "FFN_DEVICES": ",".join(str(device) for device in topology["ffn_devices"]),
+            "ATTENTION_MAX_NUM_BATCHED_TOKENS": str(
+                topology["attention_max_num_batched_tokens"],
+            ),
+            "FFN_MAX_NUM_BATCHED_TOKENS": str(
+                topology["ffn_max_num_batched_tokens"],
+            ),
+        },
+    )
 
 
 def main() -> None:
@@ -452,6 +554,22 @@ def main() -> None:
     parser.add_argument("--dbo-decode-token-threshold", type=int, default=2)
     parser.add_argument("--dbo-prefill-token-threshold", type=int, default=12)
     parser.add_argument(
+        "--attention-devices",
+        type=_parse_device_list,
+        default=list(range(8)),
+    )
+    parser.add_argument(
+        "--ffn-devices",
+        type=_parse_device_list,
+        default=list(range(8, 16)),
+    )
+    parser.add_argument(
+        "--attention-max-num-batched-tokens",
+        type=int,
+        default=1024,
+    )
+    parser.add_argument("--ffn-max-num-batched-tokens", type=int)
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="Collect plugin-owned Attention and FFN torch-npu traces.",
@@ -460,15 +578,23 @@ def main() -> None:
 
     if args.u_batches == 2 and args.execution_mode != "eager":
         parser.error("DeepSeek-V4 U2 currently supports only eager execution")
-    if (
-        args.connector == "P2pHcclAFDConnector"
-        and args.execution_mode != "eager"
-    ):
+    if args.connector == "P2pHcclAFDConnector" and args.execution_mode != "eager":
         parser.error("P2pHcclAFDConnector currently supports only eager execution")
     if args.dbo_decode_token_threshold < 0:
         parser.error("--dbo-decode-token-threshold must be non-negative")
     if args.dbo_prefill_token_threshold < 0:
         parser.error("--dbo-prefill-token-threshold must be non-negative")
+    try:
+        topology = _resolve_topology(
+            connector=args.connector,
+            attention_devices=args.attention_devices,
+            ffn_devices=args.ffn_devices,
+            attention_max_num_batched_tokens=(args.attention_max_num_batched_tokens),
+            ffn_max_num_batched_tokens=args.ffn_max_num_batched_tokens,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    _set_topology_environment(topology)
 
     for port in (args.attention_port, args.ffn_port, args.afd_port):
         if not _port_is_free(port):
@@ -483,6 +609,7 @@ def main() -> None:
                 dbo_decode_token_threshold=args.dbo_decode_token_threshold,
                 dbo_prefill_token_threshold=args.dbo_prefill_token_threshold,
                 profile=args.profile,
+                topology=topology,
             ),
             indent=2,
             sort_keys=True,
@@ -619,6 +746,7 @@ def main() -> None:
             "dbo_decode_token_threshold": args.dbo_decode_token_threshold,
             "dbo_prefill_token_threshold": args.dbo_prefill_token_threshold,
             "profile": args.profile,
+            "topology": topology,
         }
         (args.output_dir / "validation_summary.json").write_text(
             json.dumps(summary, indent=2, sort_keys=True) + "\n"

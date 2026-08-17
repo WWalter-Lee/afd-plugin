@@ -312,17 +312,13 @@ def validate_afd_config(
         raise ValueError(
             "AFD async mode requires connector='CAMAsyncAFDConnector'",
         )
-    if config.connector == "P2pNcclAFDConnector":
+    if config.connector in {
+        "P2pNcclAFDConnector",
+        "P2pHcclAFDConnector",
+    }:
         from afd_plugin.distributed import validate_p2p_topology
 
         validate_p2p_topology(config)
-    if (
-        config.connector == "P2pHcclAFDConnector"
-        and config.num_attention_ranks != config.num_ffn_ranks
-    ):
-        raise ValueError(
-            "P2pHcclAFDConnector currently requires equal Attention and FFN ranks",
-        )
     if not config.host:
         raise ValueError("AFD host must be non-empty")
     if not 0 < config.port < 65536:

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 from contextlib import AbstractContextManager, nullcontext
 from functools import partial
 from typing import Any
@@ -215,6 +216,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         self._afd_live_execution = False
         self.ubatch_slices = None
         self._afd_unpadded_tokens_across_dp: torch.Tensor | None = None
+        self._afd_logged_metadata_stage_counts: set[int] = set()
         self.prof = create_afd_npu_profiler("attention", role_rank=rank)
 
     @staticmethod
@@ -1502,14 +1504,37 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             is_warmup=is_warmup,
         )
         self.connector.control_plane.update_state_from_dp_metadata(payload)
-        logger.warning(
-            "AFD NPU Attention send_dp_metadata decision; world_rank=%d "
-            "key=%s is_graph_capturing=%s is_warmup=%s",
-            self.connector.world_rank,
-            _dp_metadata_debug_key(dp_metadata_list),
-            is_graph_capturing,
-            is_warmup,
+        stage_count = len(dp_metadata_list)
+        logged_stage_counts = getattr(
+            self,
+            "_afd_logged_metadata_stage_counts",
+            set(),
         )
+        debug_key = None
+        if stage_count not in logged_stage_counts:
+            debug_key = _dp_metadata_debug_key(dp_metadata_list)
+            logger.warning(
+                "AFD NPU Attention send_dp_metadata decision; world_rank=%d "
+                "stage_count=%d key=%s is_graph_capturing=%s is_warmup=%s",
+                self.connector.world_rank,
+                stage_count,
+                debug_key,
+                is_graph_capturing,
+                is_warmup,
+            )
+            logged_stage_counts.add(stage_count)
+            self._afd_logged_metadata_stage_counts = logged_stage_counts
+        if logger.isEnabledFor(logging.DEBUG):
+            debug_key = debug_key or _dp_metadata_debug_key(dp_metadata_list)
+            logger.debug(
+                "AFD NPU Attention send_dp_metadata decision; world_rank=%d "
+                "stage_count=%d key=%s is_graph_capturing=%s is_warmup=%s",
+                self.connector.world_rank,
+                stage_count,
+                debug_key,
+                is_graph_capturing,
+                is_warmup,
+            )
         self.connector.control_plane.send_dp_metadata_list(payload)
 
     def _ensure_dp_metadata(
@@ -1667,10 +1692,13 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 num_tokens_after_padding,
                 cudagraph_mode,
             )
-        packed_tensor = torch.zeros(3, self.dp_size, device="cpu", dtype=torch.int32)
+        packed_tensor = torch.zeros(4, self.dp_size, device="cpu", dtype=torch.int32)
         packed_tensor[0][self.dp_rank] = num_tokens_unpadded
         packed_tensor[1][self.dp_rank] = num_tokens_padded
         packed_tensor[2][self.dp_rank] = cudagraph_mode.value
+        # A mixed prefill/decode rank must make every EP peer use the prefill
+        # threshold so all ranks execute the same number of FFN stages.
+        packed_tensor[3][self.dp_rank] = int(uniform_decode)
         dist.all_reduce(packed_tensor, group=get_dp_group().cpu_group)
 
         num_tokens_unpadded_across_dp = packed_tensor[0, :]
@@ -1680,12 +1708,13 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         num_tokens_padded_across_dp = packed_tensor[1, :]
         max_tokens_across_dp = int(num_tokens_padded_across_dp.max().item())
         min_tokens_across_dp = int(num_tokens_unpadded_across_dp.min().item())
-        synced_cudagraph_mode = CUDAGraphMode(int(packed_tensor[-1, :].min().item()))
+        synced_cudagraph_mode = CUDAGraphMode(int(packed_tensor[2, :].min().item()))
+        synced_uniform_decode = bool(packed_tensor[3, :].min().item())
 
         should_ubatch = check_enable_ubatch(
             min_tokens_across_dp,
             max_tokens_across_dp,
-            uniform_decode=uniform_decode,
+            uniform_decode=synced_uniform_decode,
             vllm_config=self.vllm_config,
         )
 

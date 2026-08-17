@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,7 @@ VALIDATOR_PATH = (
     REPO_ROOT / "recipe/npu/CAMP2pAFDConnector/deepseek_v4/validate_golden.py"
 )
 HCCL_RECIPE_DIR = REPO_ROOT / "recipe/npu/P2pHcclAFDConnector/deepseek_v4"
+PERFORMANCE_RUNNER_PATH = HCCL_RECIPE_DIR / "run_performance.py"
 
 
 def _load_validator():
@@ -27,6 +29,17 @@ def _load_validator():
 
 def _load_runner():
     spec = importlib.util.spec_from_file_location("dsv4_run_validation", RUNNER_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_performance_runner():
+    spec = importlib.util.spec_from_file_location(
+        "dsv4_run_performance",
+        PERFORMANCE_RUNNER_PATH,
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -59,14 +72,28 @@ def test_dsv4_role_scripts_offer_u1_graph_and_eager_u2():
         script = (recipe_dir / f"afd_{role}.sh").read_text(encoding="utf-8")
         assert 'EXECUTION_MODE="${EXECUTION_MODE:-eager}"' in script
         assert 'U_BATCHES="${U_BATCHES:-1}"' in script
+        assert 'MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"' in script
+        assert 'GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"' in script
         assert '"cudagraph_mode":"FULL_DECODE_ONLY"' in script
         assert '--cudagraph-capture-sizes "${CAPTURE_SIZE_ARGS[@]}"' in script
         assert "--enable-dbo" in script
         assert '--dbo-decode-token-threshold "$DBO_DECODE_TOKEN_THRESHOLD"' in script
         assert '--dbo-prefill-token-threshold "$DBO_PREFILL_TOKEN_THRESHOLD"' in script
         assert '"${UBATCH_ARGS[@]}"' in script
+        assert '--max-model-len "$MAX_MODEL_LEN"' in script
+        assert '--gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"' in script
+
+    attention_script = (recipe_dir / "afd_attention.sh").read_text(encoding="utf-8")
+    assert 'HCCL_IF_BASE_PORT="${ATTENTION_HCCL_IF_BASE_PORT:-51000}"' in (
+        attention_script
+    )
+    assert "ATTENTION_MAX_NUM_BATCHED_TOKENS" in attention_script
+    assert "ATTENTION_DEVICES" in attention_script
 
     ffn_script = (recipe_dir / "afd_ffn.sh").read_text(encoding="utf-8")
+    assert 'HCCL_IF_BASE_PORT="${FFN_HCCL_IF_BASE_PORT:-52000}"' in ffn_script
+    assert "FFN_MAX_NUM_BATCHED_TOKENS" in ffn_script
+    assert "FFN_DEVICES" in ffn_script
     assert "trap forward_shutdown TERM INT" in ffn_script
     assert "if ((shutdown_requested)); then" in ffn_script
 
@@ -80,6 +107,260 @@ def test_dsv4_hccl_recipe_selects_hccl_connector_without_copying_validator():
     runner = (HCCL_RECIPE_DIR / "run_validation.py").read_text(encoding="utf-8")
     assert 'sys.argv.extend(["--connector", "P2pHcclAFDConnector"])' in runner
     assert "runpy.run_path" in runner
+
+    performance_runner = PERFORMANCE_RUNNER_PATH.read_text(encoding="utf-8")
+    assert "P2pHcclAFDConnector" in performance_runner
+    assert '"bench",' in performance_runner
+    assert '"serve",' in performance_runner
+
+
+def test_dsv4_hccl_a8f4_topology_derives_ffn_capacity_and_unused_devices():
+    runner = _load_runner()
+
+    topology = runner._resolve_topology(
+        connector="P2pHcclAFDConnector",
+        attention_devices=list(range(8)),
+        ffn_devices=list(range(8, 12)),
+        attention_max_num_batched_tokens=1024,
+        ffn_max_num_batched_tokens=None,
+    )
+
+    assert topology == {
+        "attention_ranks": 8,
+        "ffn_ranks": 4,
+        "ratio": 2,
+        "attention_devices": list(range(8)),
+        "ffn_devices": list(range(8, 12)),
+        "unused_devices": [12, 13, 14, 15],
+        "attention_max_num_batched_tokens": 1024,
+        "ffn_max_num_batched_tokens": 2048,
+    }
+
+
+@pytest.mark.parametrize(
+    ("attention_devices", "ffn_devices", "ffn_tokens", "message"),
+    [
+        ([0, 1], [1], None, "must not overlap"),
+        ([0, 1, 2], [8, 9], None, "integer multiple"),
+        ([0, 1], [8], 1024, "cover one Attention subgroup"),
+    ],
+)
+def test_dsv4_hccl_topology_rejects_invalid_deployment(
+    attention_devices,
+    ffn_devices,
+    ffn_tokens,
+    message,
+):
+    runner = _load_runner()
+
+    with pytest.raises(ValueError, match=message):
+        runner._resolve_topology(
+            connector="P2pHcclAFDConnector",
+            attention_devices=attention_devices,
+            ffn_devices=ffn_devices,
+            attention_max_num_batched_tokens=1024,
+            ffn_max_num_batched_tokens=ffn_tokens,
+        )
+
+
+def test_dsv4_performance_command_locks_workload_and_fixed_python(tmp_path):
+    runner = _load_performance_runner()
+    result_path = tmp_path / "result.json"
+
+    command = runner._benchmark_command(
+        api_port=8910,
+        model_path=Path("/models/dsv4"),
+        result_path=result_path,
+        input_len=1024,
+        output_len=128,
+        num_prompts=32,
+        concurrency=8,
+        u_batches=2,
+        run_kind="measurement",
+        repeat=3,
+    )
+
+    assert command[:4] == [
+        runner.sys.executable,
+        "-m",
+        "vllm.entrypoints.cli.main",
+        "bench",
+    ]
+    assert command[command.index("--random-range-ratio") + 1] == "0.0"
+    assert command[command.index("--temperature") + 1] == "0"
+    assert command[command.index("--metric-percentiles") + 1] == "50,90,99"
+    assert "--ignore-eos" in command
+    assert "--save-detailed" in command
+    assert "u_batches=2" in command
+
+
+def test_dsv4_performance_reproducibility_files_are_hashed():
+    runner = _load_performance_runner()
+
+    for path in runner.REPRODUCIBILITY_FILES:
+        digest = runner._file_sha256(path)
+        assert len(digest) == 64
+        assert digest == runner.hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_dsv4_performance_detects_exited_service():
+    runner = _load_performance_runner()
+    running = SimpleNamespace(poll=lambda: None)
+    exited = SimpleNamespace(poll=lambda: 7)
+
+    assert runner._exited_services({"attention": running, "ffn": exited}) == {"ffn": 7}
+
+
+def test_dsv4_performance_detects_hidden_worker_fatal_incrementally(tmp_path):
+    runner = _load_performance_runner()
+    attention_log = tmp_path / "attention.log"
+    ffn_log = tmp_path / "ffn.log"
+    attention_log.write_text("service ready\n", encoding="utf-8")
+    ffn_log.write_text("worker ready\n", encoding="utf-8")
+    watcher = runner._FatalLogWatcher(tmp_path)
+
+    assert watcher.poll() == {}
+    with ffn_log.open("a", encoding="utf-8") as handle:
+        handle.write("AFD NPU FFN worker loop failed\n")
+
+    assert watcher.poll() == {"ffn": ["AFD NPU FFN worker loop failed"]}
+    assert watcher.poll() == {}
+
+
+def test_dsv4_performance_fatal_watcher_handles_split_marker(tmp_path):
+    runner = _load_performance_runner()
+    ffn_log = tmp_path / "ffn.log"
+    ffn_log.write_text("error code is 507", encoding="utf-8")
+    watcher = runner._FatalLogWatcher(tmp_path)
+
+    assert watcher.poll() == {}
+    with ffn_log.open("a", encoding="utf-8") as handle:
+        handle.write("015\n")
+
+    assert watcher.poll() == {"ffn": ["error code is 507015"]}
+
+
+def test_dsv4_performance_result_gate_requires_exact_tokens():
+    runner = _load_performance_runner()
+    result = {
+        "completed": 2,
+        "failed": 0,
+        "total_input_tokens": 8,
+        "total_output_tokens": 6,
+        "errors": ["", ""],
+    }
+
+    passed = runner._validate_benchmark_result(
+        result,
+        input_len=4,
+        output_len=3,
+        num_prompts=2,
+    )
+    result["total_output_tokens"] = 5
+    failed = runner._validate_benchmark_result(
+        result,
+        input_len=4,
+        output_len=3,
+        num_prompts=2,
+    )
+
+    assert passed["passed"] is True
+    assert failed["passed"] is False
+    assert failed["checks"]["output_tokens"] is False
+
+
+def test_dsv4_performance_aggregate_reports_variance_and_per_npu():
+    runner = _load_performance_runner()
+    metric_names = (
+        "request_throughput",
+        "output_throughput",
+        "p50_ttft_ms",
+        "p90_ttft_ms",
+        "p99_ttft_ms",
+        "p50_tpot_ms",
+        "p90_tpot_ms",
+        "p99_tpot_ms",
+    )
+    records = []
+    for repeat, throughput in enumerate((160.0, 176.0, 144.0), start=1):
+        result = {name: 1.0 for name in metric_names}
+        result["output_throughput"] = throughput
+        records.append(
+            {
+                "concurrency": 8,
+                "repeat": repeat,
+                "gate": {"passed": True},
+                "result": result,
+            }
+        )
+
+    aggregate = runner._aggregate_results(records, max_throughput_cv=0.10)
+    point = aggregate["points"]["8"]
+
+    assert aggregate["passed"] is True
+    assert point["runs"] == 3
+    assert point["metrics"]["output_throughput"]["mean"] == 160.0
+    assert point["metrics"]["output_throughput"]["cv"] > 0
+    assert point["output_tokens_per_second_per_npu"] == 10.0
+    assert point["stability_gate"]["passed"] is True
+
+
+def test_dsv4_performance_aggregate_rejects_unstable_throughput():
+    runner = _load_performance_runner()
+    metric_names = (
+        "request_throughput",
+        "output_throughput",
+        "p50_ttft_ms",
+        "p90_ttft_ms",
+        "p99_ttft_ms",
+        "p50_tpot_ms",
+        "p90_tpot_ms",
+        "p99_tpot_ms",
+    )
+    records = []
+    for value in (10.0, 20.0, 30.0):
+        result = {name: 1.0 for name in metric_names}
+        result["output_throughput"] = value
+        records.append(
+            {
+                "concurrency": 8,
+                "gate": {"passed": True},
+                "result": result,
+            }
+        )
+
+    point = runner._aggregate_results(
+        records,
+        max_throughput_cv=0.10,
+    )["points"]["8"]
+
+    assert point["passed"] is False
+    assert point["stability_gate"]["passed"] is False
+
+
+def test_dsv4_performance_npu_snapshot_parser_uses_bus_rows():
+    runner = _load_performance_runner()
+    output = """\
+| 0     Ascend910           | OK            | 169.9       43                |
+| 0     0                   | 0000:18:00.0  | 71          0 / 0  30114 / 65536 |
+| 0     Ascend910           | -             | -           43                |
+| 1     1                   | 0000:19:00.0  | 22          0 / 0  28840 / 65536 |
+"""
+
+    assert runner._parse_npu_snapshot(output) == [
+        {
+            "device": 0,
+            "aicore_percent": 71,
+            "hbm_used_mb": 30114,
+            "hbm_total_mb": 65536,
+        },
+        {
+            "device": 1,
+            "aicore_percent": 22,
+            "hbm_used_mb": 28840,
+            "hbm_total_mb": 65536,
+        },
+    ]
 
 
 def test_dsv4_runtime_manifest_records_graph_u1(monkeypatch):

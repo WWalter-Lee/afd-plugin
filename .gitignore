@@ -9,6 +9,12 @@ __pycache__/
 # C extensions
 *.so
 
+# Ascend custom-op build and runtime diagnostics
+afd_plugin/_cann_ops_custom/
+csrc/npu/output/
+extra-info/
+kernel_meta/
+
 # Distribution / packaging
 .Python
 build/

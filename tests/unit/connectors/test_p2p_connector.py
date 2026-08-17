@@ -358,6 +358,29 @@ def test_control_payload_unwritten_body_buffer_is_peer_shutdown(monkeypatch):
         )
 
 
+def test_control_payload_partial_body_is_peer_shutdown(monkeypatch):
+    module = importlib.import_module("afd_plugin.connectors.metadata")
+    recv_count = 0
+
+    def recv(tensor, *, src, group):
+        nonlocal recv_count
+        recv_count += 1
+        if recv_count == 1:
+            tensor.fill_(16)
+        else:
+            tensor[:5] = torch.tensor(list(b'{"dp_'), dtype=torch.uint8)
+        return src
+
+    monkeypatch.setattr(module.torch.distributed, "recv", recv)
+
+    with pytest.raises(AFDControlPlaneClosedError, match="payload body"):
+        module.recv_control_payload(
+            src=3,
+            group=object(),
+            device=torch.device("cpu"),
+        )
+
+
 def test_p2p_custom_ops_register_send_recv_with_fake_impls(monkeypatch):
     module = importlib.import_module("afd_plugin.connectors.gpu.p2p")
     calls = []

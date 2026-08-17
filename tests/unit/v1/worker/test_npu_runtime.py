@@ -424,6 +424,79 @@ def test_npu_attention_non_live_execution_disables_microbatching(monkeypatch):
     assert result[2] is True
 
 
+@pytest.mark.parametrize(
+    ("uniform_decode_across_dp", "expected"),
+    [
+        ([1, 1, 1, 1], True),
+        ([1, 1, 0, 1], False),
+    ],
+)
+def test_npu_attention_syncs_uniform_decode_before_ubatch_decision(
+    monkeypatch,
+    uniform_decode_across_dp,
+    expected,
+):
+    _require_npu_runtime()
+    from vllm.config import CUDAGraphMode
+
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    runner = _new_attention_runner()
+    runner.dp_size = 4
+    runner.dp_rank = 1
+    runner.connector = SimpleNamespace(control_plane=object())
+    runner.vllm_config = _vllm_config(
+        data_parallel_size=4,
+        data_parallel_rank=1,
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+        dbo_decode_token_threshold=2,
+        dbo_prefill_token_threshold=12,
+    )
+    observed = []
+
+    def all_reduce(packed_tensor, *, group):
+        assert group == "cpu-group"
+        assert tuple(packed_tensor.shape) == (4, 4)
+        packed_tensor[0, :] = torch.tensor([4, 4, 4, 4])
+        packed_tensor[1, :] = torch.tensor([4, 4, 4, 4])
+        packed_tensor[2, :] = CUDAGraphMode.NONE.value
+        packed_tensor[3, :] = torch.tensor(uniform_decode_across_dp)
+
+    def check_enable_ubatch(*_args, uniform_decode, **_kwargs):
+        observed.append(uniform_decode)
+        return bool(uniform_decode)
+
+    monkeypatch.setattr(
+        attention_model_runner,
+        "should_skip_allreduce_across_dp_group",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        attention_model_runner,
+        "get_dp_group",
+        lambda: SimpleNamespace(cpu_group="cpu-group"),
+    )
+    monkeypatch.setattr(attention_model_runner.dist, "all_reduce", all_reduce)
+    monkeypatch.setattr(
+        attention_model_runner,
+        "check_enable_ubatch",
+        check_enable_ubatch,
+    )
+
+    should_ubatch, _, _, synced_graph_mode = runner._sync_afd_metadata_across_dp(
+        num_tokens_unpadded=4,
+        num_tokens_padded=4,
+        uniform_decode=True,
+        cudagraph_mode=CUDAGraphMode.NONE,
+    )
+
+    assert should_ubatch is expected
+    assert observed == [expected]
+    assert synced_graph_mode is CUDAGraphMode.NONE
+
+
 def _new_ffn_runner():
     _require_npu_runtime()
     from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
@@ -803,6 +876,73 @@ def test_npu_attention_runner_sends_per_ubatch_dp_metadata():
     assert _tokens(sent_dp_metadata_list[1]) == [3]
 
 
+def test_npu_attention_runner_logs_each_metadata_stage_count_once(monkeypatch):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    runner = _new_attention_runner()
+    runner.vllm_config = _vllm_config(
+        role="attention",
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+        ubatch_size=4,
+    )
+    runner.connector = _RecordingConnector()
+    runner._is_warmup = False
+    runner._afd_is_graph_capturing = False
+    runner._afd_unpadded_tokens_across_dp = None
+    runner._afd_logged_metadata_stage_counts = set()
+    ubatch_slices = [
+        SimpleNamespace(
+            request_slice=slice(0, 2),
+            token_slice=slice(0, 4),
+            num_tokens=4,
+        ),
+        SimpleNamespace(
+            request_slice=slice(2, 3),
+            token_slice=slice(4, 7),
+            num_tokens=3,
+        ),
+    ]
+    warning_messages = []
+    key_calls = []
+    real_debug_key = attention_model_runner._dp_metadata_debug_key
+
+    def record_debug_key(dp_metadata_list):
+        key_calls.append(sorted(dp_metadata_list))
+        return real_debug_key(dp_metadata_list)
+
+    monkeypatch.setattr(
+        attention_model_runner.logger,
+        "warning",
+        lambda message, *args: warning_messages.append(message % args),
+    )
+    monkeypatch.setattr(
+        attention_model_runner.logger,
+        "isEnabledFor",
+        lambda _level: False,
+    )
+    monkeypatch.setattr(
+        attention_model_runner,
+        "_dp_metadata_debug_key",
+        record_debug_key,
+    )
+
+    for _ in range(2):
+        runner._send_dp_metadata(
+            SimpleNamespace(num_tokens_across_dp_cpu=[7]),
+            None,
+        )
+    for _ in range(2):
+        runner._send_dp_metadata(None, ubatch_slices)
+
+    assert len(warning_messages) == 2
+    assert "stage_count=1 key=((0, (7,)),)" in warning_messages[0]
+    assert "stage_count=2 key=((0, (4,)), (1, (3,)))" in warning_messages[1]
+    assert key_calls == [[0], [0, 1]]
+
+
 def test_npu_attention_runner_sends_global_nonuniform_ubatch_dp_metadata():
     runner = _new_attention_runner()
     runner.vllm_config = _vllm_config(
@@ -1179,17 +1319,20 @@ def test_npu_ffn_runner_builds_forward_context_for_each_dbo_stage(monkeypatch):
     runner.vllm_config = _vllm_config(role="ffn")
     runner.connector = _FakeFFNConnector(attn_size=2, ffn_size=2)
     runner.model = _FakeModel()
-    runner.num_layers = 1
+    runner.num_layers = 3
     runner.max_num_tokens = 16
     runner.use_aclgraph = False
     runner._acl_graphs = {}
-    for stage_idx, num_tokens in enumerate((6, 7)):
-        metadata = AFDTransferMetadata.create_attention_metadata(
-            layer_idx=0,
-            stage_idx=stage_idx,
-            seq_len=num_tokens,
-        )
-        runner.connector.attn_outputs.append((f"hidden-{stage_idx}", metadata))
+    for layer_idx in range(runner.num_layers):
+        for stage_idx, num_tokens in enumerate((6, 7)):
+            metadata = AFDTransferMetadata.create_attention_metadata(
+                layer_idx=layer_idx,
+                stage_idx=stage_idx,
+                seq_len=num_tokens,
+            )
+            runner.connector.attn_outputs.append(
+                (f"hidden-{layer_idx}-{stage_idx}", metadata),
+            )
 
     runner.execute_model(
         dp_metadata_list={
@@ -1203,6 +1346,105 @@ def test_npu_ffn_runner_builds_forward_context_for_each_dbo_stage(monkeypatch):
         [6],
         [7],
     ]
+    assert len(runner.connector.ffn_outputs) == 6
+
+
+def test_npu_ffn_runner_preserves_aggregated_forward_context_metadata(monkeypatch):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    aggregated_dp_metadata = object()
+    contexts = []
+
+    @contextmanager
+    def fake_ascend_forward_context(**kwargs):
+        context = SimpleNamespace(
+            additional_kwargs={},
+            dp_metadata=aggregated_dp_metadata,
+            all_moe_layers={},
+        )
+        contexts.append((kwargs, context))
+        yield context
+
+    monkeypatch.setattr(
+        ffn_model_runner,
+        "ascend_forward_context",
+        fake_ascend_forward_context,
+    )
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(role="ffn", data_parallel_size=2)
+    runner.connector = _FakeFFNConnector(
+        attn_size=4,
+        ffn_size=2,
+        role_rank=1,
+    )
+    runner.model = _FakeModel()
+    runner.num_layers = 1
+    runner.max_num_tokens = 16
+    runner.use_aclgraph = False
+    runner._acl_graphs = {}
+    metadata = AFDTransferMetadata.create_attention_metadata(
+        layer_idx=0,
+        stage_idx=0,
+        seq_len=9,
+    )
+    runner.connector.attn_outputs.append(("hidden", metadata))
+
+    runner.execute_model(
+        dp_metadata_list={0: _FakeDPMetadata([2, 3, 4, 5])},
+    )
+
+    assert contexts[0][0]["num_tokens"] == 9
+    assert contexts[0][0]["num_tokens_across_dp"].tolist() == [5, 9]
+    assert contexts[0][1].dp_metadata is aggregated_dp_metadata
+
+
+def test_npu_ffn_runner_computes_stage_token_layout_once_per_step(monkeypatch):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    _patch_ffn_forward_context(monkeypatch)
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(role="ffn")
+    runner.connector = _FakeFFNConnector(attn_size=2, ffn_size=2)
+    runner.model = _FakeModel()
+    runner.num_layers = 3
+    runner.max_num_tokens = 16
+    runner.use_aclgraph = False
+    runner._acl_graphs = {}
+    for layer_idx in range(3):
+        for stage_idx, num_tokens in enumerate((6, 7)):
+            metadata = AFDTransferMetadata.create_attention_metadata(
+                layer_idx=layer_idx,
+                stage_idx=stage_idx,
+                seq_len=num_tokens,
+            )
+            runner.connector.attn_outputs.append(
+                (f"hidden-{layer_idx}-{stage_idx}", metadata),
+            )
+
+    calls = []
+    original = ffn_model_runner._ffn_token_counts_across_ranks
+
+    def record_counts(*args, **kwargs):
+        calls.append((args[2], kwargs["fallback"]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        ffn_model_runner,
+        "_ffn_token_counts_across_ranks",
+        record_counts,
+    )
+
+    runner.execute_model(
+        dp_metadata_list={
+            0: _FakeDPMetadata([6]),
+            1: _FakeDPMetadata([7]),
+        },
+    )
+
+    assert calls == [(0, 16), (1, 16)]
+    assert len(runner.connector.ffn_outputs) == 6
 
 
 def test_dsv4_ffn_eager_receives_ids_and_hidden_stage_by_stage(monkeypatch):
@@ -1221,6 +1463,10 @@ def test_dsv4_ffn_eager_receives_ids_and_hidden_stage_by_stage(monkeypatch):
 
     class StageOrderedConnector(_FakeFFNConnector):
         requires_input_ids = True
+
+        def update_state_from_dp_metadata(self, payload):
+            events.append(("update", tuple(sorted(payload.dp_metadata_list))))
+            return super().update_state_from_dp_metadata(payload)
 
         def recv_input_ids(self, num_tokens, *, ubatch_idx):
             events.append(("ids", ubatch_idx))
@@ -1251,6 +1497,7 @@ def test_dsv4_ffn_eager_receives_ids_and_hidden_stage_by_stage(monkeypatch):
     )
 
     assert events == [
+        ("update", (0, 1)),
         ("ids", 0),
         ("ids", 1),
         ("hidden", 0),
@@ -1327,19 +1574,7 @@ def test_dsv4_ffn_runner_reuses_ids_per_stage_and_clears_each_step(monkeypatch):
             assert kwargs["input_ids"].tolist() == list(first_ids[stage_idx])
         else:
             assert kwargs == {}
-    assert [
-        None if call["input_ids"] is None else call["input_ids"].tolist()
-        for call in context_calls
-    ] == [
-        [-1, 0, 31],
-        [4, 5],
-        [-1, 0, 31],
-        [4, 5],
-        [-1, 0, 31],
-        [4, 5],
-        None,
-        None,
-    ]
+    assert len(context_calls) == 2
     assert runner._ffn_input_ids_cache == {}
 
     second_ids = ([7], [8, 9, 10, 11])
@@ -2165,6 +2400,17 @@ def test_dsv4_feature_validation_accepts_eager_hccl_p2p(use_ubatching):
         ubatch_size=2,
     )
     config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
+def test_dsv4_feature_validation_accepts_eager_hccl_p2p_a2f1():
+    config = _dsv4_config()
+    config.additional_config["afd"].update(
+        connector="P2pHcclAFDConnector",
+        num_attention_ranks=2,
+        num_ffn_ranks=1,
+    )
 
     fail_if_unsupported_npu_afd_features(config)
 

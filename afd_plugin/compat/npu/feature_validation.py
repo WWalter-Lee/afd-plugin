@@ -148,11 +148,15 @@ def _fail_if_unsupported_deepseek_v4_features(
     }
     if afd_config.connector not in supported_connectors:
         raise RuntimeError(
-            "DeepSeek-V4 AFD supports only CAMP2pAFDConnector or "
-            "P2pHcclAFDConnector"
+            "DeepSeek-V4 AFD supports only CAMP2pAFDConnector or P2pHcclAFDConnector"
         )
-    if afd_config.num_attention_ranks != afd_config.num_ffn_ranks:
-        raise RuntimeError("DeepSeek-V4 AFD requires equal Attention and FFN ranks")
+    if (
+        afd_config.connector == "CAMP2pAFDConnector"
+        and afd_config.num_attention_ranks != afd_config.num_ffn_ranks
+    ):
+        raise RuntimeError(
+            "DeepSeek-V4 CAMP2pAFDConnector requires equal Attention and FFN ranks"
+        )
     if parallel_config.tensor_parallel_size != 1:
         raise RuntimeError("DeepSeek-V4 AFD supports only tensor_parallel_size=1")
     if parallel_config.pipeline_parallel_size != 1:

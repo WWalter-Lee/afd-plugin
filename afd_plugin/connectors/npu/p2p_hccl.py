@@ -8,10 +8,11 @@ DeepSeek-V4 input IDs are transferred with ``torch.distributed.send`` and
 ``torch.distributed.recv`` over HCCL process groups. It does not load or call
 the CAMP2P A2E/E2A custom operators.
 
-The first implementation keeps a one-to-one Attention/FFN mapping. Each DBO
-stage owns an independent HCCL group so two stage threads cannot consume each
-other's messages. A Gloo control group carries stage token counts before the
-FFN side posts receives and prepares its receive buffers.
+The connector supports one or more consecutive Attention peers per FFN rank
+(``A = k * F``). Each DBO stage owns an independent HCCL group so two stage
+threads cannot consume each other's messages. A Gloo control group carries
+stage token counts before the FFN side posts receives and prepares its
+aggregate receive buffers.
 """
 
 from __future__ import annotations
@@ -55,6 +56,19 @@ class HCCLP2PTransferState(AFDTransferState):
 
     stage_idx: int
     num_tokens: int
+    peer_ranks: tuple[int, ...] = ()
+    seq_lens: tuple[int, ...] = ()
+    peer_slices: tuple[tuple[int, int, int], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class HCCLP2PStageLayout:
+    """Immutable peer layout parsed once from a stage control payload."""
+
+    peer_ranks: tuple[int, ...]
+    seq_lens: tuple[int, ...]
+    peer_slices: tuple[tuple[int, int, int], ...]
+    num_tokens: int
 
 
 class P2pHcclAFDConnector(AFDConnectorBase):
@@ -88,11 +102,6 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         # FFN token-count routing uses the connector topology contract shared
         # with CAMP2P. Here the generic rank mapping is the complete topology.
         self.topology = self.mapping
-        if self.mapping.attention_size != self.mapping.ffn_size:
-            raise ValueError(
-                "P2pHcclAFDConnector currently requires equal Attention and FFN "
-                "ranks",
-            )
 
         self._initialized = False
         self.world_rank = self.mapping.world_rank
@@ -120,6 +129,7 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         self.input_ids_buffers: list[torch.Tensor] = []
         self.hidden_recv_buffers: dict[int, torch.Tensor] = {}
         self.dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata] = {}
+        self.stage_layouts: dict[int, HCCLP2PStageLayout] = {}
         self.is_graph_capturing = False
         self.is_warmup = False
         self.control_plane = P2pHcclAFDControlPlane(self)
@@ -203,6 +213,7 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         self.input_ids_buffers = []
         self.hidden_recv_buffers = {}
         self.dp_metadata_list = {}
+        self.stage_layouts = {}
         self._initialized = False
 
     def send_attn_output(
@@ -240,7 +251,11 @@ class P2pHcclAFDConnector(AFDConnectorBase):
                 raise RuntimeError("DSV4 HCCL P2P sends input_ids only at layer 0")
 
         group = self._data_group(metadata.stage_idx)
-        self._send_tensor(hidden_states, dst=self.role_rank, group=group)
+        self._send_tensor(
+            hidden_states,
+            dst=self.mapping.subgroup_index,
+            group=group,
+        )
 
     def recv_ffn_output(
         self,
@@ -250,7 +265,7 @@ class P2pHcclAFDConnector(AFDConnectorBase):
     ) -> torch.Tensor:
         self._require_initialized()
         group = self._data_group(ubatch_idx)
-        dist.recv(ref_tensor, src=self.role_rank, group=group)
+        dist.recv(ref_tensor, src=self.mapping.subgroup_index, group=group)
         # FFN processes layers in layer-major order (stage 0, then stage 1),
         # while each Attention DBO thread would otherwise continue directly
         # to the next layer. Yield after the blocking receive so the peer
@@ -265,10 +280,11 @@ class P2pHcclAFDConnector(AFDConnectorBase):
     ) -> AFDA2FTransferPayload:
         self._require_initialized()
         layer_idx = int(kwargs.get("layer_idx", 0))
-        num_tokens = self._num_tokens_for_stage(
+        layout = self._stage_layout(
             ubatch_idx,
             fallback=int(kwargs.get("max_num_tokens", 1)),
         )
+        num_tokens = layout.num_tokens
         input_ids = None
         if self.requires_input_ids and layer_idx == 0:
             input_ids = kwargs.get("input_ids")
@@ -276,16 +292,14 @@ class P2pHcclAFDConnector(AFDConnectorBase):
                 input_ids = self.recv_input_ids(num_tokens, ubatch_idx=ubatch_idx)
 
         hidden_states = self._hidden_recv_buffer(ubatch_idx, num_tokens)
-        source_rank = self.ffn_size + self.role_rank
-        dist.recv(
-            hidden_states,
-            src=source_rank,
-            group=self._data_group(ubatch_idx),
-        )
+        group = self._data_group(ubatch_idx)
+        for source_rank, start, end in layout.peer_slices:
+            peer_slice = hidden_states[start:end]
+            dist.recv(peer_slice, src=source_rank, group=group)
         metadata = AFDTransferMetadata.create_ffn_metadata(
             layer_idx=layer_idx,
             stage_idx=ubatch_idx,
-            seq_lens=[num_tokens],
+            seq_lens=layout.seq_lens,
         )
         return AFDA2FTransferPayload(
             hidden_states=hidden_states,
@@ -294,6 +308,9 @@ class P2pHcclAFDConnector(AFDConnectorBase):
                 states=HCCLP2PTransferState(
                     stage_idx=ubatch_idx,
                     num_tokens=num_tokens,
+                    peer_ranks=layout.peer_ranks,
+                    seq_lens=layout.seq_lens,
+                    peer_slices=layout.peer_slices,
                 ),
             ),
             input_ids=input_ids,
@@ -315,12 +332,31 @@ class P2pHcclAFDConnector(AFDConnectorBase):
                 f"metadata token count {metadata.total_tokens}",
             )
         stage_idx = int(kwargs.get("ubatch_idx", metadata.stage_idx))
-        destination_rank = self.ffn_size + self.role_rank
-        self._send_tensor(
-            ffn_output,
-            dst=destination_rank,
-            group=self._data_group(stage_idx),
+        state = context.states
+        if not isinstance(state, HCCLP2PTransferState):
+            raise RuntimeError(
+                "HCCL P2P FFN output requires its matching receive state",
+            )
+        if state.stage_idx != stage_idx:
+            raise ValueError(
+                "HCCL P2P FFN output stage does not match receive state: "
+                f"{stage_idx} != {state.stage_idx}",
+            )
+        if tuple(metadata.seq_lens) != state.seq_lens:
+            raise ValueError(
+                "HCCL P2P FFN output sequence lengths do not match receive state",
+            )
+        if len(state.peer_ranks) != len(state.seq_lens):
+            raise RuntimeError("HCCL P2P receive state has an invalid peer layout")
+
+        group = self._data_group(stage_idx)
+        peer_slices = state.peer_slices or _make_peer_slices(
+            state.peer_ranks,
+            state.seq_lens,
         )
+        for destination_rank, start, end in peer_slices:
+            peer_slice = ffn_output[start:end]
+            self._send_tensor(peer_slice, dst=destination_rank, group=group)
 
     def send_input_ids(
         self,
@@ -333,7 +369,11 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         num_tokens = int(flat_ids.numel())
         self._validate_input_ids(flat_ids, num_tokens)
         buffer[:num_tokens].copy_(flat_ids, non_blocking=False)
-        dist.send(buffer[:num_tokens], dst=self.role_rank, group=group)
+        dist.send(
+            buffer[:num_tokens],
+            dst=self.mapping.subgroup_index,
+            group=group,
+        )
 
     def recv_input_ids(
         self,
@@ -346,10 +386,20 @@ class P2pHcclAFDConnector(AFDConnectorBase):
                 "DSV4 input_ids token count must be in "
                 f"[1, {self.max_num_batched_tokens}], got {num_tokens}",
             )
+        layout = self._stage_layout(
+            ubatch_idx,
+            fallback=num_tokens,
+        )
+        if layout.num_tokens != num_tokens:
+            raise ValueError(
+                "DSV4 input_ids token count does not match HCCL P2P peer layout: "
+                f"{num_tokens} != {layout.num_tokens}",
+            )
         buffer, group = self._ids_buffer_and_group(ubatch_idx)
         input_ids = buffer[:num_tokens]
-        source_rank = self.ffn_size + self.role_rank
-        dist.recv(input_ids, src=source_rank, group=group)
+        for source_rank, start, end in layout.peer_slices:
+            peer_slice = input_ids[start:end]
+            dist.recv(peer_slice, src=source_rank, group=group)
         return input_ids
 
     def prepare_stage_buffer(self, stage_idx: int, num_tokens: int) -> None:
@@ -373,8 +423,7 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         stage_idx: int,
         num_tokens: int,
     ) -> torch.Tensor:
-        if num_tokens <= 0:
-            raise ValueError(f"HCCL P2P token count must be positive, got {num_tokens}")
+        self._validate_receive_capacity(num_tokens)
         buffer = self.hidden_recv_buffers.get(stage_idx)
         if (
             buffer is None
@@ -390,16 +439,73 @@ class P2pHcclAFDConnector(AFDConnectorBase):
             self.hidden_recv_buffers[stage_idx] = buffer
         return buffer[:num_tokens]
 
-    def _num_tokens_for_stage(self, stage_idx: int, *, fallback: int) -> int:
+    def _peer_token_counts_for_stage(
+        self,
+        stage_idx: int,
+        *,
+        fallback: int,
+    ) -> list[int]:
+        return list(self._stage_layout(stage_idx, fallback=fallback).seq_lens)
+
+    def _stage_layout(
+        self,
+        stage_idx: int,
+        *,
+        fallback: int,
+    ) -> HCCLP2PStageLayout:
+        cached = self.stage_layouts.get(stage_idx)
+        if cached is not None:
+            return cached
+
         dp_metadata = self.dp_metadata_list.get(stage_idx)
         if dp_metadata is None:
-            return max(1, fallback)
-        return _num_tokens_for_attention_rank(
-            dp_metadata,
-            attention_rank=self.role_rank,
-            attention_size=self.attn_size,
-            fallback=fallback,
+            if self.afd_config.role == "ffn" and self.ratio > 1:
+                raise RuntimeError(
+                    "HCCL P2P FFN requires DP metadata for unequal topology",
+                )
+            seq_lens = (max(1, fallback),)
+        else:
+            attention_counts = _attention_token_counts(
+                dp_metadata,
+                attention_size=self.attn_size,
+                fallback=fallback,
+            )
+            first_attention_rank = self.mapping.subgroup_index * self.ratio
+            seq_lens = tuple(
+                max(
+                    1,
+                    int(
+                        attention_counts[first_attention_rank + offset]
+                        if first_attention_rank + offset < len(attention_counts)
+                        else fallback
+                    ),
+                )
+                for offset in range(self.ratio)
+            )
+
+        peer_ranks = self._attention_peer_world_ranks()
+        layout = HCCLP2PStageLayout(
+            peer_ranks=peer_ranks,
+            seq_lens=seq_lens,
+            peer_slices=_make_peer_slices(peer_ranks, seq_lens),
+            num_tokens=sum(seq_lens),
         )
+        if dp_metadata is not None:
+            self.stage_layouts[stage_idx] = layout
+        return layout
+
+    def _attention_peer_world_ranks(self) -> tuple[int, ...]:
+        if self.afd_config.role != "ffn":
+            raise RuntimeError("only an FFN rank owns Attention peer ranks")
+        return tuple(self.mapping.subgroup_ranks[1:])
+
+    def _validate_receive_capacity(self, num_tokens: int) -> None:
+        if num_tokens <= 0 or num_tokens > self.max_num_batched_tokens:
+            raise ValueError(
+                "HCCL P2P aggregate token count must be in "
+                f"[1, {self.max_num_batched_tokens}], got {num_tokens}; "
+                "increase FFN max_num_batched_tokens for this A/F ratio",
+            )
 
     def _validate_input_ids(
         self,
@@ -412,6 +518,17 @@ class P2pHcclAFDConnector(AFDConnectorBase):
                 f"[1, {self.max_num_batched_tokens}], got {num_tokens}",
             )
         if torch.compiler.is_compiling():
+            return
+        if flat_ids.dtype not in (torch.int32, torch.int64):
+            raise TypeError(
+                "DSV4 input_ids must use int32 or int64 before HCCL transfer; "
+                f"got {flat_ids.dtype}",
+            )
+        # NPU IDs originate from vLLM's validated scheduler/tokenizer path.
+        # Reading min/max back to the host here adds two device-wide syncs to
+        # every decode step, so retain the value-domain check for CPU/Mock
+        # boundaries and keep the production data path device-local.
+        if flat_ids.device.type != "cpu":
             return
         min_id = int(flat_ids.min().item())
         max_id = int(flat_ids.max().item())
@@ -455,17 +572,14 @@ class P2pHcclAFDControlPlane(AFDControlPlane):
     ) -> None:
         connector = self.connector
         connector.dp_metadata_list = payload.dp_metadata_list
+        connector.stage_layouts = {}
         connector.is_graph_capturing = payload.is_graph_capturing
         connector.is_warmup = payload.is_warmup
         if connector.afd_config.role != "ffn":
             return
-        for stage_idx, dp_metadata in payload.dp_metadata_list.items():
-            num_tokens = _num_tokens_for_attention_rank(
-                dp_metadata,
-                attention_rank=connector.role_rank,
-                attention_size=connector.attn_size,
-            )
-            connector.prepare_stage_buffer(int(stage_idx), num_tokens)
+        for stage_idx in payload.dp_metadata_list:
+            layout = connector._stage_layout(int(stage_idx), fallback=1)
+            connector.prepare_stage_buffer(int(stage_idx), layout.num_tokens)
 
     def send_dp_metadata_list(
         self,
@@ -474,11 +588,14 @@ class P2pHcclAFDControlPlane(AFDControlPlane):
         connector = self.connector
         if connector.p2p_pg is None:
             return
-        if connector.afd_config.role != "attention":
+        if (
+            connector.afd_config.role != "attention"
+            or connector.mapping.rank_in_subgroup != 1
+        ):
             return
         send_control_payload(
             payload,
-            dst=connector.role_rank,
+            dst=connector.mapping.subgroup_index,
             group=connector.p2p_pg,
             device=torch.device("cpu"),
         )
@@ -489,7 +606,8 @@ class P2pHcclAFDControlPlane(AFDControlPlane):
             raise RuntimeError(
                 "HCCL P2P DP metadata process group is not initialized",
             )
-        source_rank = connector.ffn_size + connector.role_rank
+        first_attention_rank = connector.mapping.subgroup_index * connector.ratio
+        source_rank = connector.ffn_size + first_attention_rank
         return recv_control_payload(
             src=source_rank,
             group=connector.p2p_pg,
@@ -504,15 +622,42 @@ def _num_tokens_for_attention_rank(
     attention_size: int,
     fallback: int = 1,
 ) -> int:
+    counts = _attention_token_counts(
+        dp_metadata,
+        attention_size=attention_size,
+        fallback=fallback,
+    )
+    if 0 <= attention_rank < len(counts):
+        return counts[attention_rank]
+    return max(1, fallback)
+
+
+def _attention_token_counts(
+    dp_metadata: DPMetadata | AFDDPMetadata,
+    *,
+    attention_size: int,
+    fallback: int,
+) -> list[int]:
     counts = dp_metadata.num_tokens_across_dp_cpu.flatten().tolist()
     if not counts:
-        return max(1, fallback)
+        return [max(1, fallback)] * attention_size
     if len(counts) < attention_size and attention_size % len(counts) == 0:
         tp_size = attention_size // len(counts)
         counts = [counts[index // tp_size] for index in range(attention_size)]
-    if 0 <= attention_rank < len(counts):
-        return max(1, int(counts[attention_rank]))
-    return max(1, fallback)
+    return [max(1, int(count)) for count in counts]
+
+
+def _make_peer_slices(
+    peer_ranks: tuple[int, ...],
+    seq_lens: tuple[int, ...],
+) -> tuple[tuple[int, int, int], ...]:
+    offset = 0
+    slices = []
+    for peer_rank, peer_tokens in zip(peer_ranks, seq_lens, strict=True):
+        end = offset + peer_tokens
+        slices.append((peer_rank, offset, end))
+        offset = end
+    return tuple(slices)
 
 
 __all__ = [

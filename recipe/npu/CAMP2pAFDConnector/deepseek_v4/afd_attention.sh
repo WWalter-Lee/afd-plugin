@@ -14,8 +14,10 @@ AFD_PORT="${AFD_PORT:-29761}"
 AFD_CONNECTOR="${AFD_CONNECTOR:-CAMP2pAFDConnector}"
 ATTENTION_RANKS="${ATTENTION_RANKS:-8}"
 FFN_RANKS="${FFN_RANKS:-8}"
-MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-1024}"
+MAX_NUM_BATCHED_TOKENS="${ATTENTION_MAX_NUM_BATCHED_TOKENS:-${MAX_NUM_BATCHED_TOKENS:-1024}}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 EXECUTION_MODE="${EXECUTION_MODE:-eager}"
 U_BATCHES="${U_BATCHES:-1}"
 DBO_DECODE_TOKEN_THRESHOLD="${DBO_DECODE_TOKEN_THRESHOLD:-2}"
@@ -23,8 +25,9 @@ DBO_PREFILL_TOKEN_THRESHOLD="${DBO_PREFILL_TOKEN_THRESHOLD:-12}"
 MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-8}"
 CUDAGRAPH_CAPTURE_SIZES="${CUDAGRAPH_CAPTURE_SIZES:-1 2 4 8}"
 
-export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export ASCEND_RT_VISIBLE_DEVICES="${ATTENTION_DEVICES:-${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}}"
 export HCCL_IF_IP="${HCCL_IF_IP:-192.169.91.106}"
+export HCCL_IF_BASE_PORT="${ATTENTION_HCCL_IF_BASE_PORT:-51000}"
 export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-eth0}"
 export HCCL_SOCKET_IFNAME="${HCCL_SOCKET_IFNAME:-eth0}"
 export OMP_PROC_BIND=false
@@ -100,14 +103,14 @@ exec vllm serve "$MODEL_PATH" \
   --port "$API_PORT" \
   --api-server-count 1 \
   --served-model-name dsv4-afd \
-  --max-model-len 4096 \
+  --max-model-len "$MAX_MODEL_LEN" \
   --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
   --max-num-seqs "$MAX_NUM_SEQS" \
   --data-parallel-size "$ATTENTION_RANKS" \
   --tensor-parallel-size 1 \
   --enable-expert-parallel \
   --seed 1024 \
-  --gpu-memory-utilization 0.90 \
+  --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
   --tokenizer-mode deepseek_v4 \
   --no-enable-prefix-caching \
   --safetensors-load-strategy lazy \

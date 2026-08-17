@@ -427,7 +427,10 @@ def recv_control_payload(
             "Attention control plane closed before the payload body arrived"
         )
     object_bytes = object_tensor.cpu().numpy().tobytes()
-    if not object_bytes.strip(b"\x00"):
+    # The Gloo receive can report the expected source after writing only part
+    # of the body when the sender exits concurrently. JSON control frames never
+    # contain NUL bytes, so zero-filled remainder marks an interrupted frame.
+    if b"\x00" in object_bytes:
         raise AFDControlPlaneClosedError(
             "Attention control plane closed before the payload body arrived"
         )
