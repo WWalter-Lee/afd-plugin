@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ VALIDATOR_PATH = (
 )
 HCCL_RECIPE_DIR = REPO_ROOT / "recipe/npu/P2pHcclAFDConnector/deepseek_v4"
 PERFORMANCE_RUNNER_PATH = HCCL_RECIPE_DIR / "run_performance.py"
+MTP_AUDIT_PATH = REPO_ROOT / "tools/dsv4/audit_mtp_contract.py"
 
 
 def _load_validator():
@@ -40,6 +42,14 @@ def _load_performance_runner():
         "dsv4_run_performance",
         PERFORMANCE_RUNNER_PATH,
     )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_mtp_audit():
+    spec = importlib.util.spec_from_file_location("dsv4_mtp_audit", MTP_AUDIT_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -118,6 +128,65 @@ def test_dsv4_hccl_recipe_selects_hccl_connector_without_copying_validator():
             encoding="utf-8"
         )
         assert "P2pHcclAFDConnector currently supports only" not in shared_script
+
+
+def test_dsv4_v023_native_baseline_has_explicit_mtp_switch():
+    script = (REPO_ROOT / "tools/dsv4/run_v023_native_baseline.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'ENABLE_MTP="${ENABLE_MTP:-0}"' in script
+    assert 'MTP_NUM_SPECULATIVE_TOKENS="${MTP_NUM_SPECULATIVE_TOKENS:-1}"' in script
+    assert '\\"method\\":\\"mtp\\"' in script
+    assert '\\"num_speculative_tokens\\":${MTP_NUM_SPECULATIVE_TOKENS}' in script
+    assert "--speculative-config" in script
+    assert (
+        "VLLM_PLUGINS=ascend,ascend_model,ascend_model_loader,ascend_kv_connector"
+        in script
+    )
+    assert "ascend_kv_connector,afd" not in script
+
+
+@pytest.mark.parametrize(
+    ("name", "role"),
+    [
+        ("mtp.0.ffn.experts.0.w1.weight", "ffn"),
+        ("mtp.0.ffn.experts.0.w1.weight_scale", "ffn"),
+        ("mtp.0.ffn.experts.0.w1.weight_offset", "ffn"),
+        ("mtp.0.ffn.gate.weight", "ffn"),
+        ("mtp.0.ffn_norm.weight", "attention"),
+        ("mtp.0.hc_ffn_fn", "attention"),
+        ("mtp.0.attn.wq_a.weight", "attention"),
+        ("mtp.0.emb.tok_emb.weight", "attention"),
+        ("model.mtp.0.head.weight", "attention"),
+    ],
+)
+def test_dsv4_mtp_contract_classifies_raw_checkpoint_keys(name, role):
+    assert _load_mtp_audit().classify_mtp_key(name) == role
+
+
+def test_dsv4_mtp_contract_audits_quantized_tensor_families(tmp_path):
+    audit = _load_mtp_audit()
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "mtp.0.ffn.experts.0.w1.weight": "part-1.safetensors",
+                    "mtp.0.ffn.experts.0.w1.weight_scale": "part-1.safetensors",
+                    "mtp.0.ffn.experts.0.w1.weight_offset": "part-1.safetensors",
+                    "mtp.0.attn.wq_a.weight": "part-2.safetensors",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = audit.build_report(index_path)
+
+    assert report["passed"]
+    assert report["mtp"]["role_counts"] == {"attention": 1, "ffn": 3}
+    assert report["contract"]["weight_scale_offset_same_role"]
 
 
 def test_dsv4_hccl_a8f4_topology_derives_ffn_capacity_and_unused_devices():

@@ -14,6 +14,28 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-1024}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
+ENABLE_MTP="${ENABLE_MTP:-0}"
+MTP_NUM_SPECULATIVE_TOKENS="${MTP_NUM_SPECULATIVE_TOKENS:-1}"
+
+MTP_ARGS=()
+case "${ENABLE_MTP}" in
+  0)
+    ;;
+  1)
+    if [[ ! "${MTP_NUM_SPECULATIVE_TOKENS}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "MTP_NUM_SPECULATIVE_TOKENS must be a positive integer" >&2
+      exit 2
+    fi
+    MTP_ARGS=(
+      --speculative-config
+      "{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP_NUM_SPECULATIVE_TOKENS},\"enforce_eager\":true}"
+    )
+    ;;
+  *)
+    echo "ENABLE_MTP must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
 
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export HCCL_IF_IP="${HCCL_IF_IP:-192.169.91.106}"
@@ -49,4 +71,5 @@ exec vllm serve "${MODEL_PATH}" \
   --no-enable-prefix-caching \
   --safetensors-load-strategy lazy \
   --quantization ascend \
-  --block-size 128
+  --block-size 128 \
+  "${MTP_ARGS[@]}"
