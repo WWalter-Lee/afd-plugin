@@ -233,12 +233,24 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 len(acl_graphs),
             )
             graph_info["graph"].replay()
+            # ### PATCH START: eager draft after target graph replay.
+            # Upstream commit 3da28f94 runs colocated target and draft models.
+            # AFD replays only the target graph, then performs the validated
+            # cross-service MTP exchange eagerly for the current step.
+            self._mtp_ffn_forward(
+                sorted(int(stage_idx) for stage_idx in dp_metadata_list) or [0]
+            )
+            # ### PATCH END: eager draft after target graph replay.
             return None
 
         self._ffn_forward(
             dp_metadata_list=dp_metadata_list,
             input_ids_by_stage=input_ids_by_stage,
             update_connector_state=False,
+        )
+        # Keep the same phase boundary when a target graph is unavailable.
+        self._mtp_ffn_forward(
+            sorted(int(stage_idx) for stage_idx in dp_metadata_list) or [0]
         )
         return None
 
@@ -289,11 +301,26 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self,
         dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
     ) -> tuple:
-        return make_ffn_graph_key(
+        # ### PATCH START: isolate target graphs by speculative configuration.
+        decoder_key = make_ffn_graph_key(
             dp_metadata_list,
             attention_size=int(self.connector.attn_size),
             ffn_size=int(self.connector.ffn_size),
             fallback=int(self.max_num_tokens),
+        )
+        graph_key = ("decoder", *self._speculative_graph_signature(), *decoder_key)
+        # ### PATCH END: isolate target graphs by speculative configuration.
+        return graph_key
+
+    def _speculative_graph_signature(self) -> tuple[str, int, bool]:
+        vllm_config = getattr(self, "vllm_config", None)
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if speculative_config is None:
+            return ("off", 0, False)
+        return (
+            str(getattr(speculative_config, "method", "unknown")),
+            int(getattr(speculative_config, "num_speculative_tokens", 0)),
+            bool(getattr(speculative_config, "enforce_eager", False)),
         )
 
     def _ffn_forward(
@@ -424,15 +451,18 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                             context,
                             stage_idx=stage_idx,
                         )
-            if self.vllm_config.speculative_config is not None:
-                rank_ffn_output = self._mtp_ffn_forward(stage_ids)
         finally:
             input_ids_cache.clear()
         return rank_ffn_output
 
-    def _mtp_ffn_forward(self, stage_ids: list[int]) -> torch.Tensor:
+    def _mtp_ffn_forward(
+        self,
+        stage_ids: list[int],
+    ) -> torch.Tensor | None:
+        if self.vllm_config.speculative_config is None:
+            return None
         if stage_ids != [0]:
-            raise RuntimeError("DSV4 AFD MTP M1 supports only eager U1")
+            raise RuntimeError("DSV4 AFD MTP supports only U1")
         if self.mtp_ffn_model is None:
             raise RuntimeError("DSV4 AFD MTP FFN model is not loaded")
 
@@ -566,6 +596,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         start_free_memory = int(torch.npu.mem_get_info()[0])
         set_cudagraph_capturing_enabled(True)
         try:
+            stage_ids = sorted(int(stage_idx) for stage_idx in dp_metadata_list) or [0]
             if is_warmup:
                 self._ffn_forward(
                     dp_metadata_list=dp_metadata_list,
@@ -573,6 +604,9 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     input_ids_by_stage=input_ids_by_stage,
                     update_connector_state=False,
                 )
+                # Warmup remains end-to-end; only the actual target capture
+                # omits the eager draft phase.
+                self._mtp_ffn_forward(stage_ids)
             else:
                 with graph_capture(device=self.device):
                     self._capture_graphs(

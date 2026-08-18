@@ -555,7 +555,7 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         buffer[2] = num_tokens
         buffer[3] = self.ffn_size
         buffer[_MTP_HEADER_PREFIX_SIZE:].copy_(counts, non_blocking=False)
-        dist.send(
+        self._send_tensor(
             buffer,
             dst=self.mapping.subgroup_index,
             group=group,
@@ -795,7 +795,7 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         self._validate_mtp_topology()
         if metadata.layer_idx != 0 or metadata.speculative_step != 0:
             raise RuntimeError(
-                "DSV4 HCCL P2P MTP M1 supports only layer 0/speculative step 0"
+                "DSV4 HCCL P2P MTP supports only layer 0/speculative step 0"
             )
         self._validate_receive_capacity(metadata.total_tokens)
 
@@ -803,7 +803,7 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         if self.attn_size != self.ffn_size or self.ratio != 1:
             raise RuntimeError("DSV4 HCCL P2P MTP requires equal A/F ranks")
         if len(self.data_pg_list) != 1:
-            raise RuntimeError("DSV4 HCCL P2P MTP requires eager U1")
+            raise RuntimeError("DSV4 HCCL P2P MTP requires U1")
 
     def _validate_mtp_header_values(
         self,
@@ -815,13 +815,22 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         self._validate_mtp_topology()
         self._validate_receive_capacity(num_tokens)
         if speculative_step != 0:
-            raise RuntimeError("DSV4 HCCL P2P MTP M1 supports only speculative step 0")
-        counts = [int(value) for value in num_tokens_across_dp.reshape(-1).tolist()]
-        if len(counts) != self.ffn_size:
+            raise RuntimeError("DSV4 HCCL P2P MTP supports only speculative step 0")
+        count_size = int(num_tokens_across_dp.numel())
+        if count_size != self.ffn_size:
             raise ValueError(
                 "DSV4 MTP token-count vector must match FFN world size: "
-                f"{len(counts)} != {self.ffn_size}"
+                f"{count_size} != {self.ffn_size}"
             )
+        # ### PATCH START: keep eager MTP traceable beside a target ACL graph.
+        # torch.compile traces the draft model even when speculative-config
+        # enforce_eager disables draft ACL graph capture. Tensor-to-list value
+        # checks are data dependent and cannot be part of that full graph; the
+        # scheduler-owned DP counts are validated on every non-compiled entry.
+        if torch.compiler.is_compiling():
+            return
+        # ### PATCH END: keep eager MTP traceable beside a target ACL graph.
+        counts = [int(value) for value in num_tokens_across_dp.reshape(-1).tolist()]
         if any(value < 0 for value in counts):
             raise ValueError("DSV4 MTP token counts cannot be negative")
 

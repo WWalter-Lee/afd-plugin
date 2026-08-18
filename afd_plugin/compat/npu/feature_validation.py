@@ -179,23 +179,28 @@ def _fail_if_unsupported_deepseek_v4_features(
             raise RuntimeError("DeepSeek-V4 AFD MTP supports only P2pHcclAFDConnector")
         if afd_config.num_attention_ranks != afd_config.num_ffn_ranks:
             raise RuntimeError("DeepSeek-V4 AFD MTP requires equal A/F ranks")
-        if not vllm_config.model_config.enforce_eager:
-            raise RuntimeError("DeepSeek-V4 AFD MTP M1 supports only eager execution")
         if bool(getattr(parallel_config, "use_ubatching", False)):
-            raise RuntimeError("DeepSeek-V4 AFD MTP M1 supports only U1")
+            raise RuntimeError("DeepSeek-V4 AFD MTP supports only U1")
         if getattr(speculative_config, "method", None) != "mtp":
             raise RuntimeError("DeepSeek-V4 AFD supports only MTP speculative method")
         if int(getattr(speculative_config, "num_speculative_tokens", 0)) != 1:
+            raise RuntimeError("DeepSeek-V4 AFD MTP supports num_speculative_tokens=1")
+        draft_enforce_eager = bool(getattr(speculative_config, "enforce_eager", False))
+        target_enforce_eager = bool(vllm_config.model_config.enforce_eager)
+        if target_enforce_eager and not draft_enforce_eager:
             raise RuntimeError(
-                "DeepSeek-V4 AFD MTP M1 supports num_speculative_tokens=1"
+                "DeepSeek-V4 AFD MTP eager execution requires draft enforce_eager=true"
             )
-        if not bool(getattr(speculative_config, "enforce_eager", False)):
-            raise RuntimeError("DeepSeek-V4 AFD MTP draft requires enforce_eager=true")
+        if not target_enforce_eager and not draft_enforce_eager:
+            raise RuntimeError(
+                "DeepSeek-V4 AFD MTP Graph/U1 currently requires draft "
+                "enforce_eager=true; draft ACL Graph is not validated"
+            )
         num_mtp_layers = int(
             getattr(vllm_config.model_config.hf_config, "num_nextn_predict_layers", 1)
         )
         if num_mtp_layers != 1:
-            raise RuntimeError("DeepSeek-V4 AFD MTP M1 supports exactly one MTP layer")
+            raise RuntimeError("DeepSeek-V4 AFD MTP supports exactly one MTP layer")
     if not vllm_config.model_config.enforce_eager:
         if (
             afd_config.connector == "P2pHcclAFDConnector"

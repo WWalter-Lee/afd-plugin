@@ -76,10 +76,24 @@ def test_batch_gate_rejects_bad_prompt_ids_or_completion_shape():
     )
 
 
+def test_dsv4_validation_defaults_to_pinned_v023_native_golden():
+    runner = _load_runner()
+
+    assert (
+        Path(
+            "/mnt/workspace/validation/dsv4_v023_vllm_cann_native_baseline/"
+            "golden_results.json"
+        )
+        == runner.DEFAULT_GOLDEN
+    )
+
+
 def test_dsv4_role_scripts_offer_u1_graph_and_eager_u2():
     recipe_dir = RUNNER_PATH.parent
     for role in ("attention", "ffn"):
         script = (recipe_dir / f"afd_{role}.sh").read_text(encoding="utf-8")
+        assert "/mnt/workspace/code/.venvs/afd-v023-vllm-cann" in script
+        assert "/mnt/workspace/code/vllm-ascend-rfc-vllm-cann" in script
         assert 'EXECUTION_MODE="${EXECUTION_MODE:-eager}"' in script
         assert 'U_BATCHES="${U_BATCHES:-1}"' in script
         assert 'MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"' in script
@@ -98,12 +112,14 @@ def test_dsv4_role_scripts_offer_u1_graph_and_eager_u2():
         )
         assert '"method":"mtp"' in script
         assert '"num_speculative_tokens":1' in script
-        assert '"enforce_eager":true' in script
+        assert "MTP_DRAFT_ENFORCE_EAGER=true" in script
+        assert "MTP_DRAFT_ENFORCE_EAGER=false" not in script
+        assert '"enforce_eager":%s' in script
         assert '"${MTP_ARGS[@]}"' in script
-        assert "MTP M1 requires P2pHcclAFDConnector" in script
-        assert "MTP M1 requires eager/U1" in script
-        assert "MTP M1 requires equal Attention/FFN ranks" in script
-        assert "MTP M1 supports exactly one speculative token" in script
+        assert "MTP requires P2pHcclAFDConnector" in script
+        assert "MTP requires U1" in script
+        assert "MTP requires equal Attention/FFN ranks" in script
+        assert "MTP supports exactly one speculative token" in script
 
     attention_script = (recipe_dir / "afd_attention.sh").read_text(encoding="utf-8")
     assert 'HCCL_IF_BASE_PORT="${ATTENTION_HCCL_IF_BASE_PORT:-51000}"' in (
@@ -272,7 +288,7 @@ def test_dsv4_hccl_graph_topology_requires_equal_roles():
     )
 
 
-def test_dsv4_hccl_mtp_m1_topology_gate_and_environment(monkeypatch):
+def test_dsv4_hccl_mtp_m2_topology_gate_and_environment(monkeypatch):
     runner = _load_runner()
     topology = {"attention_ranks": 8, "ffn_ranks": 8}
     monkeypatch.setenv("ENABLE_MTP", "0")
@@ -281,6 +297,14 @@ def test_dsv4_hccl_mtp_m1_topology_gate_and_environment(monkeypatch):
     runner._validate_execution_topology(
         connector="P2pHcclAFDConnector",
         execution_mode="eager",
+        u_batches=1,
+        enable_mtp=True,
+        mtp_num_speculative_tokens=1,
+        topology=topology,
+    )
+    runner._validate_execution_topology(
+        connector="P2pHcclAFDConnector",
+        execution_mode="full-decode-only",
         u_batches=1,
         enable_mtp=True,
         mtp_num_speculative_tokens=1,
@@ -295,8 +319,7 @@ def test_dsv4_hccl_mtp_m1_topology_gate_and_environment(monkeypatch):
 
     invalid_cases = [
         ({"connector": "CAMP2pAFDConnector"}, "P2pHcclAFDConnector"),
-        ({"execution_mode": "full-decode-only"}, "eager/U1"),
-        ({"u_batches": 2}, "eager/U1"),
+        ({"u_batches": 2}, "requires U1"),
         (
             {"topology": {"attention_ranks": 8, "ffn_ranks": 4}},
             "equal Attention/FFN",
@@ -360,6 +383,7 @@ def test_dsv4_performance_reproducibility_files_are_hashed():
 def test_dsv4_performance_mtp_uses_m1_gate_and_environment(monkeypatch):
     runner = _load_performance_runner()
     args = SimpleNamespace(
+        execution_mode="eager",
         u_batches=1,
         enable_mtp=True,
         mtp_num_speculative_tokens=1,
@@ -373,7 +397,7 @@ def test_dsv4_performance_mtp_uses_m1_gate_and_environment(monkeypatch):
     assert topology["ffn_devices"] == list(range(8, 16))
 
     args.u_batches = 2
-    with pytest.raises(ValueError, match="eager/U1"):
+    with pytest.raises(ValueError, match="requires U1"):
         runner._validate_execution_args(args)
 
     args.u_batches = 1
@@ -408,6 +432,7 @@ def test_dsv4_performance_mtp_manifest_preserves_structured_topology(monkeypatch
     )
     monkeypatch.setattr(runner, "_file_sha256", lambda _path: "a" * 64)
     args = SimpleNamespace(
+        execution_mode="eager",
         u_batches=1,
         dbo_decode_token_threshold=2,
         dbo_prefill_token_threshold=12,
@@ -440,7 +465,13 @@ def test_dsv4_performance_mtp_manifest_preserves_structured_topology(monkeypatch
     assert manifest["topology_label"] == "A8F8"
     assert manifest["enable_mtp"] is True
     assert manifest["mtp_num_speculative_tokens"] == 1
+    assert manifest["mtp_draft_execution"] == "eager"
     assert manifest["topology"] == runner._a8f8_topology(1024)
+
+    args.execution_mode = "full-decode-only"
+    graph_manifest = runner._runtime_manifest(args)
+    assert graph_manifest["stage"] == "A3-P7M2-P1"
+    assert graph_manifest["execution_mode"] == "full-decode-only"
 
 
 def test_dsv4_performance_detects_exited_service():
@@ -765,6 +796,45 @@ def test_dsv4_log_gate_rejects_hidden_worker_fatal(tmp_path, fatal_marker):
     assert result["passed"] is False
     assert result["roles"]["attention"]["passed"] is True
     assert result["roles"]["ffn"]["fatal_markers"] == [fatal_marker]
+
+
+def test_dsv4_log_gate_ignores_tbe_queue_eof_after_shutdown(tmp_path):
+    runner = _load_runner()
+    (tmp_path / "attention.log").write_text(
+        """INFO [shutdown] API server: shutdown triggered
+Exception in thread Thread-1:
+Traceback (most recent call last):
+  File \"tbe/common/repository_manager/utils/multiprocess_util.py\", line 68
+    item = self.task_q.get()
+EOFError
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "ffn.log").write_text("clean shutdown\n", encoding="utf-8")
+
+    result = runner._role_log_gate(tmp_path)
+
+    assert result["passed"] is True
+    assert result["roles"]["attention"]["fatal_markers"] == []
+
+
+def test_dsv4_log_gate_rejects_tbe_queue_eof_before_shutdown(tmp_path):
+    runner = _load_runner()
+    (tmp_path / "attention.log").write_text(
+        """Exception in thread Thread-1:
+Traceback (most recent call last):
+  File \"tbe/common/repository_manager/utils/multiprocess_util.py\", line 68
+    item = self.task_q.get()
+EOFError
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "ffn.log").write_text("clean shutdown\n", encoding="utf-8")
+
+    result = runner._role_log_gate(tmp_path)
+
+    assert result["passed"] is False
+    assert result["roles"]["attention"]["fatal_markers"] == ["Exception in thread"]
 
 
 def test_dsv4_log_gate_reports_missing_role_log(tmp_path):

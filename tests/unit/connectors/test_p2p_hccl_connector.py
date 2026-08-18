@@ -235,6 +235,39 @@ def test_p2p_hccl_mtp_sends_fixed_header_before_moe_input(
     assert events[1][0].shape == (3, 4)
 
 
+def test_p2p_hccl_mtp_header_uses_graph_send_while_compiling(monkeypatch):
+    connector = _connector(role="attention", mtp=True)
+    events = []
+    monkeypatch.setattr(hccl_module.torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(
+        connector,
+        "_send_tensor",
+        lambda tensor, *, dst, group: events.append(
+            (tensor.clone(), dst, group),
+        ),
+    )
+
+    connector.send_mtp_header(
+        num_tokens=3,
+        speculative_step=0,
+        num_tokens_across_dp=torch.tensor([3], dtype=torch.int32),
+        stage_idx=0,
+    )
+
+    assert len(events) == 1
+    header, dst, group = events[0]
+    assert (dst, group) == (0, connector.ids_pg_list[0])
+    assert header[1:].tolist() == [0, 3, 1, 3]
+
+    with pytest.raises(ValueError, match="token-count vector"):
+        connector.send_mtp_header(
+            num_tokens=3,
+            speculative_step=0,
+            num_tokens_across_dp=torch.tensor([1, 2], dtype=torch.int32),
+            stage_idx=0,
+        )
+
+
 def test_p2p_hccl_mtp_rejects_pre_hc_three_dimensional_hidden():
     connector = _connector(role="attention", mtp=True)
 

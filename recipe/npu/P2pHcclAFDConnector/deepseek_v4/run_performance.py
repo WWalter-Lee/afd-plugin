@@ -164,7 +164,7 @@ class _FatalLogWatcher:
                 continue
             content = self._tails[role] + chunk
             text = content.decode("utf-8", errors="replace")
-            markers = [marker for marker in SHARED.FATAL_LOG_MARKERS if marker in text]
+            markers = SHARED._fatal_log_markers(text)
             self._tails[role] = content[-self._carry_size :]
             if markers:
                 failures[role] = markers
@@ -390,7 +390,7 @@ class _NPUMonitor:
 def _runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
     manifest = SHARED._runtime_manifest(
         connector="P2pHcclAFDConnector",
-        execution_mode="eager",
+        execution_mode=args.execution_mode,
         u_batches=args.u_batches,
         dbo_decode_token_threshold=args.dbo_decode_token_threshold,
         dbo_prefill_token_threshold=args.dbo_prefill_token_threshold,
@@ -401,9 +401,18 @@ def _runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
     )
     manifest.update(
         {
-            "stage": "A3-P7M1-P1" if args.enable_mtp else "A3-P4",
+            "stage": (
+                (
+                    "A3-P7M2-P1"
+                    if args.execution_mode == "full-decode-only"
+                    else "A3-P7M1-P1"
+                )
+                if args.enable_mtp
+                else "A3-P4"
+            ),
             "topology_label": "A8F8",
             "npu_count": TOTAL_NPUS,
+            "mtp_draft_execution": "eager" if args.enable_mtp else None,
             "reproducibility_files_sha256": {
                 str(path.relative_to(REPO_ROOT)): _file_sha256(path)
                 for path in REPRODUCIBILITY_FILES
@@ -499,7 +508,7 @@ def _a8f8_topology(max_num_batched_tokens: int) -> dict[str, Any]:
 def _validate_execution_args(args: argparse.Namespace) -> None:
     SHARED._validate_execution_topology(
         connector="P2pHcclAFDConnector",
-        execution_mode="eager",
+        execution_mode=args.execution_mode,
         u_batches=args.u_batches,
         enable_mtp=args.enable_mtp,
         mtp_num_speculative_tokens=args.mtp_num_speculative_tokens,
@@ -526,6 +535,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "passed": False,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "execution_mode": args.execution_mode,
         "u_batches": args.u_batches,
         "enable_mtp": args.enable_mtp,
         "mtp_num_speculative_tokens": args.mtp_num_speculative_tokens,
@@ -540,7 +550,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             api_port=args.ffn_port,
             afd_port=args.afd_port,
             connector="P2pHcclAFDConnector",
-            execution_mode="eager",
+            execution_mode=args.execution_mode,
             u_batches=args.u_batches,
             dbo_decode_token_threshold=args.dbo_decode_token_threshold,
             dbo_prefill_token_threshold=args.dbo_prefill_token_threshold,
@@ -555,7 +565,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             api_port=args.attention_port,
             afd_port=args.afd_port,
             connector="P2pHcclAFDConnector",
-            execution_mode="eager",
+            execution_mode=args.execution_mode,
             u_batches=args.u_batches,
             dbo_decode_token_threshold=args.dbo_decode_token_threshold,
             dbo_prefill_token_threshold=args.dbo_prefill_token_threshold,
@@ -724,6 +734,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--ffn-port", type=int, default=8911)
     parser.add_argument("--afd-port", type=int, default=29761)
     parser.add_argument("--startup-timeout", type=float, default=3600)
+    parser.add_argument(
+        "--execution-mode",
+        choices=("eager", "full-decode-only"),
+        default="eager",
+    )
     parser.add_argument("--u-batches", type=int, choices=(1, 2), required=True)
     parser.add_argument(
         "--enable-mtp",

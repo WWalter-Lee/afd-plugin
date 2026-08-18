@@ -2,9 +2,9 @@
 set -eo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
-export DSV4_VLLM_VENV="${DSV4_RUNTIME_VENV:-/mnt/workspace/code/.venvs/afd-v026}"
+export DSV4_VLLM_VENV="${DSV4_RUNTIME_VENV:-/mnt/workspace/code/.venvs/afd-v023-vllm-cann}"
 source "${ROOT_DIR}/tools/dsv4/activate_runtime.sh"
-DSV4_VLLM_ASCEND_ROOT="${DSV4_VLLM_ASCEND_ROOT:-/mnt/workspace/code/vllm-ascend-afd-80d8c194f}"
+DSV4_VLLM_ASCEND_ROOT="${DSV4_VLLM_ASCEND_ROOT:-/mnt/workspace/code/vllm-ascend-rfc-vllm-cann}"
 source "${DSV4_VLLM_ASCEND_ROOT}/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/bin/set_env.bash"
 set -u
 
@@ -63,24 +63,39 @@ case "$ENABLE_MTP" in
     ;;
   1)
     if [[ "$AFD_CONNECTOR" != "P2pHcclAFDConnector" ]]; then
-      echo "DeepSeek-V4 MTP M1 requires P2pHcclAFDConnector" >&2
+      echo "DeepSeek-V4 MTP requires P2pHcclAFDConnector" >&2
       exit 2
     fi
-    if [[ "$EXECUTION_MODE" != "eager" || "$U_BATCHES" != "1" ]]; then
-      echo "DeepSeek-V4 MTP M1 requires eager/U1" >&2
+    if [[ "$U_BATCHES" != "1" ]]; then
+      echo "DeepSeek-V4 MTP requires U1" >&2
       exit 2
     fi
     if [[ "$ATTENTION_RANKS" != "$FFN_RANKS" ]]; then
-      echo "DeepSeek-V4 MTP M1 requires equal Attention/FFN ranks" >&2
+      echo "DeepSeek-V4 MTP requires equal Attention/FFN ranks" >&2
       exit 2
     fi
     if [[ "$MTP_NUM_SPECULATIVE_TOKENS" != "1" ]]; then
-      echo "DeepSeek-V4 MTP M1 supports exactly one speculative token" >&2
+      echo "DeepSeek-V4 MTP supports exactly one speculative token" >&2
       exit 2
     fi
+    case "$EXECUTION_MODE" in
+      eager)
+        MTP_DRAFT_ENFORCE_EAGER=true
+        ;;
+      full-decode-only)
+        # Target FULL_DECODE_ONLY + eager MTP is the validated functional
+        # baseline. Draft ACL Graph remains a separate optimization gate.
+        MTP_DRAFT_ENFORCE_EAGER=true
+        ;;
+      *)
+        echo "DeepSeek-V4 MTP supports eager or full-decode-only" >&2
+        exit 2
+        ;;
+    esac
+    MTP_CONFIG="$(printf '{"method":"mtp","num_speculative_tokens":1,"enforce_eager":%s}' "$MTP_DRAFT_ENFORCE_EAGER")"
     MTP_ARGS=(
       --speculative-config
-      '{"method":"mtp","num_speculative_tokens":1,"enforce_eager":true}'
+      "$MTP_CONFIG"
     )
     ;;
   *)

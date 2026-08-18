@@ -1072,6 +1072,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         previous_metadata = self._afd_pending_metadata
         previous_suppress_send = self._afd_suppress_metadata_send
         previous_is_graph_capturing = self._afd_is_graph_capturing
+        eager_drafter = None
         try:
             self._afd_is_graph_capturing = True
             if allow_microbatching:
@@ -1095,6 +1096,22 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     f"capture_{desc.num_tokens}_{cudagraph_runtime_mode.name}",
                 ),
             ):
+                # ### PATCH START: target-only capture with an eager MTP draft.
+                # Upstream commits 0fc695fc/3da28f94 run the target and drafter
+                # from the same dummy call. In AFD they live in separate
+                # services: a blocking eager HCCL draft exchange cannot cross
+                # the target graph context boundary. The eager draft has no
+                # graph to capture, so omit only that capture-time dummy call;
+                # warmup and live inference still execute the complete draft.
+                speculative_config = getattr(self, "speculative_config", None)
+                if (
+                    getattr(self, "drafter", None) is not None
+                    and speculative_config is not None
+                    and getattr(speculative_config, "method", None) == "mtp"
+                    and bool(getattr(speculative_config, "enforce_eager", False))
+                ):
+                    eager_drafter = self.drafter
+                    self.drafter = None
                 self._dummy_run(
                     desc.num_tokens,
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
@@ -1107,6 +1124,9 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     profile_seq_lens=profile_seq_lens,
                 )
         finally:
+            if eager_drafter is not None:
+                self.drafter = eager_drafter
+                # ### PATCH END: target-only capture with an eager MTP draft.
             self._afd_is_graph_capturing = previous_is_graph_capturing
             self._afd_suppress_metadata_send = previous_suppress_send
             self._afd_pending_metadata = previous_metadata
@@ -1493,15 +1513,15 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         if forward_context.additional_kwargs is None:
             forward_context.additional_kwargs = {}
         forward_context.additional_kwargs["afd_metadata"] = self._afd_pending_metadata
-        if self.connector.control_plane is None:
-            return
-        if getattr(self, "_afd_suppress_metadata_send", False):
-            return
         dp_metadata = forward_context.dp_metadata
         ubatch_slices = forward_context.ubatch_slices
         padded_graph_tokens = _full_cudagraph_padded_tokens(forward_context)
         if padded_graph_tokens is not None and not ubatch_slices:
             dp_metadata = self._build_capture_dp_metadata(padded_graph_tokens)
+        if self.connector.control_plane is None:
+            return
+        if getattr(self, "_afd_suppress_metadata_send", False):
+            return
         self._send_dp_metadata(dp_metadata, ubatch_slices)
 
     def _install_async_moe_ubatch_metadata_on_forward_context(

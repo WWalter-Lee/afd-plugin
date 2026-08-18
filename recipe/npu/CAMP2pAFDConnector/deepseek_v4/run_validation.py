@@ -19,6 +19,9 @@ from typing import Any
 
 RECIPE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = RECIPE_DIR.parents[3]
+DEFAULT_GOLDEN = Path(
+    "/mnt/workspace/validation/dsv4_v023_vllm_cann_native_baseline/golden_results.json"
+)
 FATAL_LOG_MARKERS = (
     "AFD NPU FFN worker loop failed",
     "EngineCore encountered a fatal error",
@@ -122,6 +125,26 @@ def _log_tail(path: Path, lines: int = 80) -> str:
     )
 
 
+def _fatal_log_markers(text: str) -> list[str]:
+    markers = [
+        marker
+        for marker in FATAL_LOG_MARKERS
+        if marker != "Exception in thread" and marker in text
+    ]
+    for match in re.finditer(r"Exception in thread", text):
+        before = text[max(0, match.start() - 8192) : match.start()]
+        traceback = text[match.start() : match.start() + 4096]
+        known_tbe_shutdown_eof = (
+            "[shutdown]" in before
+            and "tbe/common/repository_manager/utils/multiprocess_util.py" in traceback
+            and re.search(r"(?:^|\n).*EOFError(?:\n|$)", traceback) is not None
+        )
+        if not known_tbe_shutdown_eof:
+            markers.append("Exception in thread")
+            break
+    return markers
+
+
 def _wait_for_api(
     endpoint: str,
     processes: dict[str, subprocess.Popen[bytes]],
@@ -132,10 +155,17 @@ def _wait_for_api(
     last_error: BaseException | None = None
     while time.monotonic() < deadline:
         for role, process in processes.items():
+            log_path = log_dir / f"{role}.log"
             if process.poll() is not None:
-                tail = _log_tail(log_dir / f"{role}.log")
+                tail = _log_tail(log_path)
                 raise RuntimeError(
                     f"{role} exited during startup with {process.returncode}\n{tail}"
+                )
+            tail = _log_tail(log_path)
+            markers = _fatal_log_markers(tail)
+            if markers:
+                raise RuntimeError(
+                    f"{role} reported a fatal startup error: {markers}\n{tail}"
                 )
         try:
             with urllib.request.urlopen(endpoint, timeout=5) as response:
@@ -249,7 +279,7 @@ def _role_log_gate(log_dir: Path) -> dict[str, Any]:
             }
             continue
         text = log_path.read_text(encoding="utf-8", errors="replace")
-        markers = [marker for marker in FATAL_LOG_MARKERS if marker in text]
+        markers = _fatal_log_markers(text)
         roles[role] = {"passed": not markers, "fatal_markers": markers}
     return {
         "roles": roles,
@@ -401,15 +431,15 @@ def _runtime_manifest(
 ) -> dict[str, Any]:
     venv_path = os.environ.get(
         "DSV4_RUNTIME_VENV",
-        "/mnt/workspace/code/.venvs/afd-v026",
+        "/mnt/workspace/code/.venvs/afd-v023-vllm-cann",
     )
     vllm_root = os.environ.get(
         "DSV4_VLLM_ROOT",
-        "/mnt/workspace/code/vllm-afd-v0.26.0",
+        "/mnt/workspace/code/vllm-release-v0.23.0",
     )
     vllm_ascend_root = os.environ.get(
         "DSV4_VLLM_ASCEND_ROOT",
-        "/mnt/workspace/code/vllm-ascend-afd-80d8c194f",
+        "/mnt/workspace/code/vllm-ascend-rfc-vllm-cann",
     )
 
     def git_head(path: str) -> str:
@@ -444,6 +474,7 @@ def _runtime_manifest(
         "dbo_prefill_token_threshold": dbo_prefill_token_threshold,
         "enable_mtp": enable_mtp,
         "mtp_num_speculative_tokens": mtp_num_speculative_tokens,
+        "mtp_draft_execution": "eager" if enable_mtp else None,
         "profile": profile,
         "profile_role_ranks": [0] if profile else [],
         "torch_profiler_with_stack": False,
@@ -578,13 +609,15 @@ def _validate_execution_topology(
     if not enable_mtp:
         return
     if connector != "P2pHcclAFDConnector":
-        raise ValueError("DeepSeek-V4 MTP M1 requires P2pHcclAFDConnector")
-    if execution_mode != "eager" or u_batches != 1:
-        raise ValueError("DeepSeek-V4 MTP M1 requires eager/U1")
+        raise ValueError("DeepSeek-V4 MTP requires P2pHcclAFDConnector")
+    if execution_mode not in {"eager", "full-decode-only"}:
+        raise ValueError("DeepSeek-V4 MTP requires eager or full-decode-only execution")
+    if u_batches != 1:
+        raise ValueError("DeepSeek-V4 MTP requires U1")
     if topology["attention_ranks"] != topology["ffn_ranks"]:
-        raise ValueError("DeepSeek-V4 MTP M1 requires equal Attention/FFN ranks")
+        raise ValueError("DeepSeek-V4 MTP requires equal Attention/FFN ranks")
     if mtp_num_speculative_tokens != 1:
-        raise ValueError("DeepSeek-V4 MTP M1 supports exactly one speculative token")
+        raise ValueError("DeepSeek-V4 MTP supports exactly one speculative token")
 
 
 def main() -> None:
@@ -593,9 +626,7 @@ def main() -> None:
     parser.add_argument(
         "--golden",
         type=Path,
-        default=Path(
-            "/mnt/workspace/validation/dsv4_milestone0_20260810/golden_results.json"
-        ),
+        default=DEFAULT_GOLDEN,
     )
     parser.add_argument("--attention-port", type=int, default=8910)
     parser.add_argument("--ffn-port", type=int, default=8911)
