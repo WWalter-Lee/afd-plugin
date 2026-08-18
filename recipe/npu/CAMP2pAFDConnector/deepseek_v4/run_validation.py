@@ -395,6 +395,8 @@ def _runtime_manifest(
     dbo_decode_token_threshold: int,
     dbo_prefill_token_threshold: int,
     profile: bool,
+    enable_mtp: bool = False,
+    mtp_num_speculative_tokens: int = 1,
     topology: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     venv_path = os.environ.get(
@@ -440,6 +442,8 @@ def _runtime_manifest(
         "u_batches": u_batches,
         "dbo_decode_token_threshold": dbo_decode_token_threshold,
         "dbo_prefill_token_threshold": dbo_prefill_token_threshold,
+        "enable_mtp": enable_mtp,
+        "mtp_num_speculative_tokens": mtp_num_speculative_tokens,
         "profile": profile,
         "profile_role_ranks": [0] if profile else [],
         "torch_profiler_with_stack": False,
@@ -540,10 +544,26 @@ def _set_topology_environment(topology: dict[str, Any]) -> None:
     )
 
 
+def _set_mtp_environment(
+    *,
+    enable_mtp: bool,
+    mtp_num_speculative_tokens: int,
+) -> None:
+    os.environ.update(
+        {
+            "ENABLE_MTP": "1" if enable_mtp else "0",
+            "MTP_NUM_SPECULATIVE_TOKENS": str(mtp_num_speculative_tokens),
+        }
+    )
+
+
 def _validate_execution_topology(
     *,
     connector: str,
     execution_mode: str,
+    u_batches: int = 1,
+    enable_mtp: bool = False,
+    mtp_num_speculative_tokens: int = 1,
     topology: dict[str, Any],
 ) -> None:
     if (
@@ -555,6 +575,16 @@ def _validate_execution_topology(
             "P2pHcclAFDConnector full-decode-only execution requires equal "
             "Attention and FFN ranks",
         )
+    if not enable_mtp:
+        return
+    if connector != "P2pHcclAFDConnector":
+        raise ValueError("DeepSeek-V4 MTP M1 requires P2pHcclAFDConnector")
+    if execution_mode != "eager" or u_batches != 1:
+        raise ValueError("DeepSeek-V4 MTP M1 requires eager/U1")
+    if topology["attention_ranks"] != topology["ffn_ranks"]:
+        raise ValueError("DeepSeek-V4 MTP M1 requires equal Attention/FFN ranks")
+    if mtp_num_speculative_tokens != 1:
+        raise ValueError("DeepSeek-V4 MTP M1 supports exactly one speculative token")
 
 
 def main() -> None:
@@ -610,6 +640,16 @@ def main() -> None:
         action="store_true",
         help="Collect plugin-owned Attention and FFN torch-npu traces.",
     )
+    parser.add_argument(
+        "--enable-mtp",
+        action="store_true",
+        default=os.environ.get("ENABLE_MTP", "0") == "1",
+    )
+    parser.add_argument(
+        "--mtp-num-speculative-tokens",
+        type=int,
+        default=int(os.environ.get("MTP_NUM_SPECULATIVE_TOKENS", "1")),
+    )
     args = parser.parse_args()
 
     if args.u_batches == 2 and args.execution_mode != "eager":
@@ -629,11 +669,18 @@ def main() -> None:
         _validate_execution_topology(
             connector=args.connector,
             execution_mode=args.execution_mode,
+            u_batches=args.u_batches,
+            enable_mtp=args.enable_mtp,
+            mtp_num_speculative_tokens=args.mtp_num_speculative_tokens,
             topology=topology,
         )
     except ValueError as exc:
         parser.error(str(exc))
     _set_topology_environment(topology)
+    _set_mtp_environment(
+        enable_mtp=args.enable_mtp,
+        mtp_num_speculative_tokens=args.mtp_num_speculative_tokens,
+    )
 
     for port in (args.attention_port, args.ffn_port, args.afd_port):
         if not _port_is_free(port):
@@ -648,6 +695,8 @@ def main() -> None:
                 dbo_decode_token_threshold=args.dbo_decode_token_threshold,
                 dbo_prefill_token_threshold=args.dbo_prefill_token_threshold,
                 profile=args.profile,
+                enable_mtp=args.enable_mtp,
+                mtp_num_speculative_tokens=args.mtp_num_speculative_tokens,
                 topology=topology,
             ),
             indent=2,

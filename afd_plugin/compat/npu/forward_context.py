@@ -26,6 +26,7 @@ def ascend_forward_context(
     num_tokens: int = 0,
     num_tokens_across_dp: torch.Tensor | None = None,
     aclgraph_runtime_mode: CUDAGraphMode | None = None,
+    is_draft_model: bool = False,
 ) -> Iterator[ForwardContext]:
     """Create the minimal forward context needed by connector-driven FFN steps."""
 
@@ -45,6 +46,7 @@ def ascend_forward_context(
         num_tokens=int(num_tokens),
         num_tokens_across_dp=num_tokens_across_dp,
         input_ids=input_ids,
+        is_draft_model=is_draft_model,
     ):
         forward_context = get_forward_context()
         if forward_context.additional_kwargs is None:

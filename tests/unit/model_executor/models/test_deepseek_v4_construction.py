@@ -73,7 +73,48 @@ def construction_env(monkeypatch):
     return calls
 
 
-def _vllm_config(*, role: str, layer_count: int = 43):
+@pytest.fixture
+def mtp_construction_env(monkeypatch, construction_env):
+    calls = construction_env
+    calls.update(linear=[], shared_head=[], mtp_embedding=[])
+    linear_type = _stage_type("linear")
+    shared_head_type = _stage_type("shared_head")
+    mtp_embedding_type = _stage_type("mtp_embedding")
+
+    monkeypatch.setattr(
+        adapter.native_mtp,
+        "ReplicatedLinear",
+        lambda *args, **kwargs: linear_type(calls, *args, **kwargs),
+    )
+    monkeypatch.setattr(
+        adapter.native_mtp,
+        "RMSNorm",
+        lambda *args, **kwargs: _stage_type("norm")(calls, *args, **kwargs),
+    )
+    monkeypatch.setattr(
+        adapter.native_mtp,
+        "SharedHead",
+        lambda *args, **kwargs: shared_head_type(calls, *args, **kwargs),
+    )
+    monkeypatch.setattr(
+        adapter.native_mtp,
+        "VocabParallelEmbedding",
+        lambda *args, **kwargs: mtp_embedding_type(calls, *args, **kwargs),
+    )
+    monkeypatch.setattr(
+        adapter.native_mtp,
+        "LogitsProcessor",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        adapter.native_mtp,
+        "current_platform",
+        SimpleNamespace(device_type="cpu"),
+    )
+    return calls
+
+
+def _vllm_config(*, role: str, layer_count: int = 43, mtp: bool = False):
     config = SimpleNamespace(
         hc_eps=1e-6,
         hc_mult=4,
@@ -81,7 +122,9 @@ def _vllm_config(*, role: str, layer_count: int = 43):
         hidden_size=8,
         index_topk=4,
         n_group=1,
+        num_attention_heads=8,
         num_hidden_layers=layer_count,
+        num_nextn_predict_layers=1,
         rms_norm_eps=1e-6,
         rope_parameters={"original_max_position_embeddings": 64},
         routed_scaling_factor=1.5,
@@ -95,6 +138,14 @@ def _vllm_config(*, role: str, layer_count: int = 43):
         parallel_config=SimpleNamespace(),
         quant_config=None,
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+        speculative_config=(
+            SimpleNamespace(
+                method="mtp",
+                draft_model_config=SimpleNamespace(hf_config=config),
+            )
+            if mtp
+            else None
+        ),
     )
 
 
@@ -138,6 +189,17 @@ def test_pinned_constructor_signatures_match_native_model():
     assert without_annotations(
         adapter.AFDDeepseekV4Model.__init__
     ) == without_annotations(adapter.native.DeepseekV4Model.__init__)
+    assert without_annotations(
+        adapter.AFDDeepSeekMultiTokenPredictorLayer.__init__
+    ) == without_annotations(
+        adapter.native_mtp.DeepSeekMultiTokenPredictorLayer.__init__
+    )
+    assert without_annotations(
+        adapter.AFDDeepSeekMultiTokenPredictor.__init__
+    ) == without_annotations(adapter.native_mtp.DeepSeekMultiTokenPredictor.__init__)
+    assert without_annotations(
+        adapter.AFDDeepSeekV4MTP.__init__
+    ) == without_annotations(adapter.native_mtp.DeepSeekV4MTP.__init__)
 
 
 @pytest.mark.parametrize("layer_idx", [0, 2, 3, 42])
@@ -149,9 +211,7 @@ def test_attention_layer_owns_attention_hc_and_norm_only(
     layer = _make_layer(monkeypatch, role="attention", layer_idx=layer_idx)
     names = _parameter_names(layer)
 
-    assert construction_env["attention"] == [
-        f"model.layers.{layer_idx}.self_attn"
-    ]
+    assert construction_env["attention"] == [f"model.layers.{layer_idx}.self_attn"]
     assert construction_env["moe"] == []
     assert isinstance(layer.mlp, adapter.AFDDeepseekV4RemoteMoEProxy)
     assert "self_attn.weight" in names
@@ -213,6 +273,46 @@ def test_model_constructor_enforces_role_ownership(
         assert not any(".mlp.weight" in name for name in names)
     else:
         assert set(names) == {"layers.0.mlp.weight", "layers.1.mlp.weight"}
+
+
+def test_attention_target_allocates_mtp_hidden_buffer_only_when_enabled(
+    monkeypatch,
+    construction_env,
+):
+    _patch_make_layers(monkeypatch)
+    model = adapter.AFDDeepseekV4Model(
+        vllm_config=_vllm_config(role="attention", layer_count=1, mtp=True),
+        prefix="model",
+    )
+
+    assert model._mtp_hidden_buffer.shape == (8, 32)
+    assert model._mtp_hidden_buffer.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+def test_mtp_constructor_enforces_role_ownership(
+    mtp_construction_env,
+    role,
+):
+    model = adapter.AFDDeepSeekV4MTP(
+        vllm_config=_vllm_config(role=role, layer_count=1, mtp=True),
+    )
+    names = _parameter_names(model)
+
+    assert model.model.start_layer == 0
+    assert model.model.end_layer == 1
+    if role == "attention":
+        assert mtp_construction_env["attention"] == ["mtp.0.self_attn"]
+        assert mtp_construction_env["moe"] == []
+        assert "model.layers.0.e_proj.weight" in names
+        assert "model.layers.0.h_proj.weight" in names
+        assert "model.layers.0.shared_head.weight" in names
+        assert "model.embed_tokens.weight" in names
+        assert not any("mtp_block.mlp" in name for name in names)
+    else:
+        assert mtp_construction_env["attention"] == []
+        assert mtp_construction_env["moe"] == ["mtp.0.mlp"]
+        assert names == {"model.layers.0.mtp_block.mlp.weight"}
 
 
 def test_afd_activation_is_required_before_construction():

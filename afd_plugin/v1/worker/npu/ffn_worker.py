@@ -20,7 +20,10 @@ from afd_plugin.compat.npu import (
     npu_afd_num_ubatches,
 )
 from afd_plugin.connectors import AFDControlPlaneClosedError
-from afd_plugin.model_executor.models.model_utils import get_afd_model_config
+from afd_plugin.model_executor.models.model_utils import (
+    get_afd_model_config,
+    install_afd_speculative_model_config,
+)
 from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
 from afd_plugin.validation import NPU_FFN_WORKER_FQCN, assert_compatible_afd_stack
 
@@ -71,6 +74,7 @@ class AFDNPUFFNWorker(NPUWorker):
         self.vllm_config.model_config = get_afd_model_config(
             self.vllm_config.model_config,
         )
+        install_afd_speculative_model_config(self.vllm_config)
         self.model_runner = AFDNPUFFNModelRunner(self.vllm_config, self.device)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -113,8 +117,7 @@ class AFDNPUFFNWorker(NPUWorker):
             except Exception as exc:
                 shutdown_event = self._ffn_shutdown_event
                 if shutdown_event is not None and (
-                    shutdown_event.is_set()
-                    or _is_attention_control_plane_shutdown(exc)
+                    shutdown_event.is_set() or _is_attention_control_plane_shutdown(exc)
                 ):
                     shutdown_event.set()
                     logger.debug(

@@ -26,6 +26,8 @@ DBO_DECODE_TOKEN_THRESHOLD="${DBO_DECODE_TOKEN_THRESHOLD:-2}"
 DBO_PREFILL_TOKEN_THRESHOLD="${DBO_PREFILL_TOKEN_THRESHOLD:-12}"
 MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-8}"
 CUDAGRAPH_CAPTURE_SIZES="${CUDAGRAPH_CAPTURE_SIZES:-1 2 4 8}"
+ENABLE_MTP="${ENABLE_MTP:-0}"
+MTP_NUM_SPECULATIVE_TOKENS="${MTP_NUM_SPECULATIVE_TOKENS:-1}"
 
 export ASCEND_RT_VISIBLE_DEVICES="${FFN_DEVICES:-${ASCEND_RT_VISIBLE_DEVICES:-8,9,10,11,12,13,14,15}}"
 export HCCL_IF_IP="${HCCL_IF_IP:-192.169.91.106}"
@@ -51,6 +53,38 @@ case "$AFD_CONNECTOR" in
     ;;
   *)
     echo "Unsupported DeepSeek-V4 NPU connector: $AFD_CONNECTOR" >&2
+    exit 2
+    ;;
+esac
+
+case "$ENABLE_MTP" in
+  0)
+    MTP_ARGS=()
+    ;;
+  1)
+    if [[ "$AFD_CONNECTOR" != "P2pHcclAFDConnector" ]]; then
+      echo "DeepSeek-V4 MTP M1 requires P2pHcclAFDConnector" >&2
+      exit 2
+    fi
+    if [[ "$EXECUTION_MODE" != "eager" || "$U_BATCHES" != "1" ]]; then
+      echo "DeepSeek-V4 MTP M1 requires eager/U1" >&2
+      exit 2
+    fi
+    if [[ "$ATTENTION_RANKS" != "$FFN_RANKS" ]]; then
+      echo "DeepSeek-V4 MTP M1 requires equal Attention/FFN ranks" >&2
+      exit 2
+    fi
+    if [[ "$MTP_NUM_SPECULATIVE_TOKENS" != "1" ]]; then
+      echo "DeepSeek-V4 MTP M1 supports exactly one speculative token" >&2
+      exit 2
+    fi
+    MTP_ARGS=(
+      --speculative-config
+      '{"method":"mtp","num_speculative_tokens":1,"enforce_eager":true}'
+    )
+    ;;
+  *)
+    echo "ENABLE_MTP must be 0 or 1" >&2
     exit 2
     ;;
 esac
@@ -127,6 +161,7 @@ vllm serve "$MODEL_PATH" \
   --quantization ascend \
   --block-size 128 \
   --additional-config "$ADDITIONAL_CONFIG" \
+  "${MTP_ARGS[@]}" \
   "${UBATCH_ARGS[@]}" \
   "${EXECUTION_ARGS[@]}" &
 vllm_pid=$!

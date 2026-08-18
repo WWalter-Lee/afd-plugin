@@ -178,17 +178,26 @@ class AFDTransferMetadata:
             the expected leading dimension for tensors validated against this
             metadata. For one-to-one transfers this is usually a single-item
             list; for fan-in/fan-out paths it can describe split sizes.
+        phase: Logical execution phase. ``decoder`` is the ordinary target
+            model path; ``mtp`` is the speculative draft virtual layer.
+        speculative_step: Zero-based draft iteration within the MTP phase.
     """
 
     layer_idx: int
     stage_idx: int
     seq_lens: list[int]
+    phase: str = "decoder"
+    speculative_step: int = 0
 
     def __post_init__(self) -> None:
         if not self.seq_lens:
             raise ValueError("seq_lens cannot be empty")
         if any(length <= 0 for length in self.seq_lens):
             raise ValueError("all sequence lengths must be positive")
+        if self.phase not in {"decoder", "mtp"}:
+            raise ValueError(f"unsupported AFD transfer phase: {self.phase}")
+        if self.speculative_step < 0:
+            raise ValueError("speculative_step cannot be negative")
 
     @property
     def total_tokens(self) -> int:
@@ -201,11 +210,15 @@ class AFDTransferMetadata:
         layer_idx: int,
         stage_idx: int,
         seq_len: int,
+        phase: str = "decoder",
+        speculative_step: int = 0,
     ) -> AFDTransferMetadata:
         return cls(
             layer_idx=layer_idx,
             stage_idx=stage_idx,
             seq_lens=[seq_len],
+            phase=phase,
+            speculative_step=speculative_step,
         )
 
     @classmethod
@@ -215,11 +228,15 @@ class AFDTransferMetadata:
         layer_idx: int,
         stage_idx: int,
         seq_lens: list[int],
+        phase: str = "decoder",
+        speculative_step: int = 0,
     ) -> AFDTransferMetadata:
         return cls(
             layer_idx=layer_idx,
             stage_idx=stage_idx,
             seq_lens=list(seq_lens),
+            phase=phase,
+            speculative_step=speculative_step,
         )
 
     def validate_tensor_shape(self, tensor_shape: tuple[int, ...]) -> bool:

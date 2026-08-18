@@ -1609,6 +1609,14 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
 
     def load_model(self) -> None:
         super().load_model()
+        if self.speculative_config is not None:
+            if self.speculative_config.method != "mtp" or self.drafter is None:
+                raise RuntimeError("DSV4 AFD supports only an initialized MTP drafter")
+            draft_model = self.drafter.get_model()
+            attach_connector = getattr(draft_model, "attach_afd_connector", None)
+            if not callable(attach_connector):
+                raise RuntimeError("DSV4 AFD MTP draft model is not role-aware")
+            attach_connector(self.connector)
         if bool(self.vllm_config.parallel_config.use_ubatching):
             self._install_ascend_ubatch_wrapper()
 

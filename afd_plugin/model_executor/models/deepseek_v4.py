@@ -13,6 +13,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm_ascend.models import deepseek_v4 as native
+from vllm_ascend.models import deepseek_v4_mtp as native_mtp
 
 from afd_plugin.config import parse_afd_config
 from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
@@ -34,6 +35,34 @@ def _checkpoint_weight_roles(name: str) -> frozenset[str]:
     return _ATTENTION_ROLE
 
 
+def _mtp_checkpoint_weight_roles(name: str) -> frozenset[str]:
+    """Return the strict AFD owner of one raw DSV4 MTP checkpoint key."""
+    normalized = name.removeprefix("model.")
+    parts = normalized.split(".")
+    if len(parts) < 3 or parts[0] != "mtp" or not parts[1].isdigit():
+        return _NO_ROLE
+    return _FFN_ROLE if parts[2] == "ffn" else _ATTENTION_ROLE
+
+
+def _iter_mtp_role_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    *,
+    role: str,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Consume one MTP checkpoint iterator once for the active AFD role."""
+    for name, loaded_weight in weights:
+        if role in _mtp_checkpoint_weight_roles(name):
+            yield name, loaded_weight
+
+
+def _uses_mtp(vllm_config: VllmConfig) -> bool:
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    return (
+        speculative_config is not None
+        and getattr(speculative_config, "method", None) == "mtp"
+    )
+
+
 def _iter_role_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
     *,
@@ -49,6 +78,8 @@ class AFDDeepseekV4RemoteMoEProxy(RemoteFFNProxy):
     """Parameter-free DSV4 MoE stage executed by the remote FFN role."""
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.phase == "mtp":
+            return self._send_and_receive(hidden_states)
         input_ids = None
         if self.layer_idx == 0:
             input_ids = getattr(get_forward_context(), "input_ids", None)
@@ -107,7 +138,10 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
             )
-            self.mlp = AFDDeepseekV4RemoteMoEProxy(layer_idx=self.layer_idx)
+            self.mlp = AFDDeepseekV4RemoteMoEProxy(
+                layer_idx=self.layer_idx,
+                phase="mtp" if is_draft_layer else "decoder",
+            )
             self.input_layernorm = native.RMSNorm(
                 config.hidden_size,
                 eps=self.norm_eps,
@@ -127,12 +161,8 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
             self.hc_ffn_fn = nn.Parameter(
                 torch.empty(mix_hc, hc_dim, dtype=torch.float32)
             )
-            self.hc_attn_base = nn.Parameter(
-                torch.empty(mix_hc, dtype=torch.float32)
-            )
-            self.hc_ffn_base = nn.Parameter(
-                torch.empty(mix_hc, dtype=torch.float32)
-            )
+            self.hc_attn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
+            self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
             self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
             self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         else:
@@ -184,6 +214,11 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
     # Signature: matches the pinned upstream function; no added parameters.
     # Upstream: vllm-ascend/vllm_ascend/models/deepseek_v4.py
     # Commit: 80d8c194f7584b17fe08065ea99a130916f6b0e7
+    # Patch reason: upstream forward always runs locally owned draft MoE.
+    # Patch functionality: reject FFN full execution and identify the remote step.
+    # Signature: matches upstream; no added parameters.
+    # Upstream: vllm_ascend/models/deepseek_v4_mtp.py
+    # Commit: 3da28f9414583d2d0b672a8f06d1fae142404bda
     def forward(
         self,
         positions: torch.Tensor,
@@ -336,8 +371,14 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
                 torch.empty(self.hc_mult, dtype=torch.float32)
             )
             self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
-        # MTP is unsupported in the first DSV4 AFD release, so no target buffer
-        # is allocated or updated.
+        self.mtp_enabled = self.afd_role == "attention" and _uses_mtp(vllm_config)
+        if self.mtp_enabled:
+            self._mtp_hidden_buffer = torch.empty(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                hc_dim,
+                dtype=vllm_config.model_config.dtype,
+                device=self.device,
+            )
         # ### PATCH END
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -354,9 +395,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
     ) -> torch.Tensor:
         shape, dtype = x.size(), x.dtype
         flattened = x.flatten(1).float()
-        rsqrt = torch.rsqrt(
-            flattened.square().mean(-1, keepdim=True) + self.norm_eps
-        )
+        rsqrt = torch.rsqrt(flattened.square().mean(-1, keepdim=True) + self.norm_eps)
         mixes = torch.nn.functional.linear(flattened, hc_fn) * rsqrt
         pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
         output = torch.sum(pre.unsqueeze(-1) * flattened.view(shape), dim=1)
@@ -403,6 +442,10 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
             )
             if layer.layer_idx + 1 in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states.mean(dim=1))
+
+        if self.mtp_enabled:
+            mtp_hidden = hidden_states.flatten(1)
+            self._mtp_hidden_buffer[: mtp_hidden.shape[0]].copy_(mtp_hidden)
 
         if not native.get_pp_group().is_last_rank:
             return native.IntermediateTensors({"hidden_states": hidden_states})
@@ -491,13 +534,307 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
     ) -> torch.Tensor:
         return self.model.compute_ffn_output(hidden_states, layer_idx, **kwargs)
 
-    def get_mtp_target_hidden_states(self) -> None:
-        return None
+    def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
+        if self.afd_role != "attention":
+            return None
+        return getattr(self.model, "_mtp_hidden_buffer", None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return super().load_weights(
-            _iter_role_weights(weights, role=self.afd_role)
+        return super().load_weights(_iter_role_weights(weights, role=self.afd_role))
+
+
+class AFDDeepSeekMultiTokenPredictorLayer(native_mtp.DeepSeekMultiTokenPredictorLayer):
+    """Role-selective DSV4 MTP layer for the pinned v0.23 Ascend stack."""
+
+    # Patch reason: upstream MTP allocates Attention, HC, head, and MoE together.
+    # Patch functionality: allocate only the active AFD role and remote the MoE.
+    # Upstream: vllm_ascend/models/deepseek_v4_mtp.py
+    # Commit: 3da28f9414583d2d0b672a8f06d1fae142404bda
+    def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
+        # ### PATCH START: role-selective MTP construction.
+        nn.Module.__init__(self)
+        self.afd_role = parse_afd_config(vllm_config, validate=False).role
+        config = vllm_config.speculative_config.draft_model_config.hf_config
+        self.config = config
+        quant_config = vllm_config.quant_config
+        self.device = native_mtp.current_platform.device_type
+        self.is_v32 = hasattr(config, "index_topk")
+
+        if self.afd_role == "attention":
+            self.e_proj = native_mtp.ReplicatedLinear(
+                config.hidden_size,
+                config.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.e_proj",
+                return_bias=False,
+            )
+            self.h_proj = native_mtp.ReplicatedLinear(
+                config.hidden_size,
+                config.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.h_proj",
+                return_bias=False,
+            )
+            self.enorm = native_mtp.RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+            )
+            self.hnorm = native_mtp.RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+            )
+            topk_indices_buffer = (
+                torch.empty(
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    config.index_topk,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                if self.is_v32
+                else None
+            )
+            self.shared_head = native_mtp.SharedHead(
+                config=config,
+                prefix=prefix,
+                quant_config=quant_config,
+            )
+            self.hc_eps = config.hc_eps
+            self.hc_mult = hc_mult = config.hc_mult
+            hc_dim = hc_mult * config.hidden_size
+            self.hc_head_fn = nn.Parameter(
+                torch.empty(hc_mult, hc_dim, dtype=torch.float32)
+            )
+            self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
+            self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
+            self.norm_eps = config.rms_norm_eps
+        else:
+            topk_indices_buffer = None
+
+        self.mtp_block = AFDDeepseekV4DecoderLayer(
+            vllm_config,
+            prefix,
+            config=self.config,
+            topk_indices_buffer=topk_indices_buffer,
+            is_draft_layer=True,
+        )
+        # ### PATCH END
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        previous_hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_index: int = 0,
+    ) -> torch.Tensor:
+        # ### PATCH START: Attention-only remote-MoE execution.
+        if self.afd_role != "attention":
+            raise RuntimeError("DSV4 MTP FFN role is connector-driven")
+        if inputs_embeds is None:
+            raise RuntimeError("DSV4 MTP Attention requires inputs_embeds")
+        # ### PATCH END
+        inputs_embeds = torch.where(
+            positions.unsqueeze(-1) == 0,
+            0,
+            inputs_embeds,
+        )
+        inputs_embeds = self.enorm(inputs_embeds)
+        previous_hidden_states = previous_hidden_states.view(
+            -1,
+            self.hc_mult,
+            self.config.hidden_size,
+        )
+        previous_hidden_states = self.hnorm(previous_hidden_states)
+        hidden_states = self.e_proj(inputs_embeds).unsqueeze(-2) + self.h_proj(
+            previous_hidden_states
+        )
+        # ### PATCH START: bind this proposal iteration to the MTP phase.
+        proxy = self.mtp_block.mlp
+        if isinstance(proxy, AFDDeepseekV4RemoteMoEProxy):
+            proxy.speculative_step = spec_step_index
+        # ### PATCH END
+        hidden_states, _ = self.mtp_block(
+            positions=positions,
+            hidden_states=hidden_states,
+            residual=None,
+        )
+        return hidden_states
+
+    def compute_ffn_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.mtp_block.compute_ffn_output(hidden_states)
+
+
+class AFDDeepSeekMultiTokenPredictor(native_mtp.DeepSeekMultiTokenPredictor):
+    """Role-aware container for the single DSV4 MTP layer."""
+
+    # Patch reason: upstream constructs embeddings and full MTP layers on both roles.
+    # Patch functionality: construct role-owned modules and expose layer bounds.
+    # Signature: matches upstream; no added parameters.
+    # Upstream: vllm_ascend/models/deepseek_v4_mtp.py
+    # Commit: 3da28f9414583d2d0b672a8f06d1fae142404bda
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        # ### PATCH START: role-selective MTP container.
+        nn.Module.__init__(self)
+        self.afd_role = parse_afd_config(vllm_config, validate=False).role
+        config = vllm_config.model_config.hf_config
+        self.mtp_start_layer_idx = config.num_hidden_layers
+        self.num_mtp_layers = getattr(config, "num_nextn_predict_layers", 1)
+        # vLLM-Ascend caches the target model's layer-index capability and
+        # subsequently reads these attributes from the draft model as well.
+        self.start_layer = 0
+        self.end_layer = self.num_mtp_layers
+        self.layers = nn.ModuleDict(
+            {
+                str(index): AFDDeepSeekMultiTokenPredictorLayer(
+                    vllm_config,
+                    f"{prefix}.{index}",
+                )
+                for index in range(self.num_mtp_layers)
+            }
+        )
+        if self.afd_role == "attention":
+            self.embed_tokens = native_mtp.VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+            )
+            self.logits_processor = native_mtp.LogitsProcessor(config.vocab_size)
+        else:
+            self.embed_tokens = native.PPMissingLayer()
+            self.logits_processor = None
+        # ### PATCH END
+
+    # Patch reason: upstream permits embedding lookup on every constructed role.
+    # Patch functionality: enforce Attention ownership of draft embeddings.
+    # Signature: matches upstream; no added parameters.
+    # Upstream: vllm_ascend/models/deepseek_v4_mtp.py
+    # Commit: 3da28f9414583d2d0b672a8f06d1fae142404bda
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # ### PATCH START: Attention-only embedding ownership.
+        if self.afd_role != "attention":
+            raise RuntimeError("DSV4 MTP FFN role does not own embeddings")
+        # ### PATCH END
+        return self.embed_tokens(input_ids)
+
+    # Patch reason: upstream permits full MTP execution on every constructed role.
+    # Patch functionality: run draft orchestration only on Attention.
+    # Signature: matches upstream; no added parameters.
+    # Upstream: vllm_ascend/models/deepseek_v4_mtp.py
+    # Commit: 3da28f9414583d2d0b672a8f06d1fae142404bda
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        previous_hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        # ### PATCH START: Attention-only draft orchestration.
+        if self.afd_role != "attention":
+            raise RuntimeError("DSV4 MTP FFN role is connector-driven")
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        # ### PATCH END
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        return self.layers[str(current_step_idx)](
+            input_ids,
+            positions,
+            previous_hidden_states,
+            inputs_embeds,
+            current_step_idx,
         )
 
+    # Patch reason: upstream exposes logits for every constructed role.
+    # Patch functionality: enforce Attention ownership of draft logits.
+    # Signature: matches upstream; no added parameters.
+    # Upstream: vllm_ascend/models/deepseek_v4_mtp.py
+    # Commit: 3da28f9414583d2d0b672a8f06d1fae142404bda
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        # ### PATCH START: Attention-only logits ownership.
+        if self.afd_role != "attention" or self.logits_processor is None:
+            raise RuntimeError("DSV4 MTP logits belong to the Attention role")
+        # ### PATCH END
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        mtp_layer = self.layers[str(current_step_idx)]
+        hidden_states = hidden_states.view(
+            -1,
+            mtp_layer.hc_mult,
+            mtp_layer.config.hidden_size,
+        )
+        hidden_states = mtp_layer.hc_head(
+            hidden_states,
+            mtp_layer.hc_head_fn,
+            mtp_layer.hc_head_scale,
+            mtp_layer.hc_head_base,
+        )
+        return self.logits_processor(
+            mtp_layer.shared_head.head,
+            mtp_layer.shared_head(hidden_states),
+        )
 
-__all__ = ["AFDDeepseekV4ForCausalLM"]
+    def compute_ffn_output(
+        self,
+        hidden_states: torch.Tensor,
+        layer_idx: int = 0,
+    ) -> torch.Tensor:
+        return self.layers[str(layer_idx)].compute_ffn_output(hidden_states)
+
+
+@native_mtp.support_torch_compile
+class AFDDeepSeekV4MTP(native_mtp.DeepSeekV4MTP):
+    """Strict AFD role wrapper for the native DSV4 MTP model."""
+
+    # Patch reason: upstream constructs a full draft model for every worker.
+    # Patch functionality: use the role-aware MTP container.
+    # Signature: matches upstream; no added parameters.
+    # Upstream: vllm_ascend/models/deepseek_v4_mtp.py
+    # Commit: 3da28f9414583d2d0b672a8f06d1fae142404bda
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        # ### PATCH START: role-aware top-level MTP model.
+        nn.Module.__init__(self)
+        self.afd_role = parse_afd_config(vllm_config, validate=False).role
+        self.config = vllm_config.model_config.hf_config
+        self.quant_config = vllm_config.quant_config
+        self.model = AFDDeepSeekMultiTokenPredictor(
+            vllm_config=vllm_config,
+            prefix=native_mtp.maybe_prefix(prefix, "mtp"),
+        )
+        self.set_moe_parameters()
+        # ### PATCH END
+
+    def compute_ffn_output(
+        self,
+        hidden_states: torch.Tensor,
+        layer_idx: int = 0,
+    ) -> torch.Tensor:
+        if self.afd_role != "ffn":
+            raise RuntimeError("DSV4 MTP Attention does not own local MoE weights")
+        return self.model.compute_ffn_output(hidden_states, layer_idx)
+
+    def attach_afd_connector(self, connector: object) -> None:
+        if self.afd_role != "attention":
+            return
+        for layer in self.model.layers.values():
+            proxy = layer.mtp_block.mlp
+            if isinstance(proxy, AFDDeepseekV4RemoteMoEProxy):
+                proxy.attach_connector(connector)
+
+    # Patch reason: upstream loader receives both Attention and FFN checkpoint keys.
+    # Patch functionality: filter original keys once, then reuse the native loader.
+    # Signature: matches upstream; no added parameters. Native delegation is retained
+    # because its quantized expert mappings must remain pinned to the target stack.
+    # Upstream: vllm_ascend/models/deepseek_v4_mtp.py
+    # Commit: 3da28f9414583d2d0b672a8f06d1fae142404bda
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # ### PATCH START: one-shot role filtering before native load.
+        role_weights = _iter_mtp_role_weights(weights, role=self.afd_role)
+        # ### PATCH END
+        return super().load_weights(role_weights)
+
+
+__all__ = ["AFDDeepseekV4ForCausalLM", "AFDDeepSeekV4MTP"]

@@ -12,7 +12,12 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import DPMetadata, override_forward_context
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner, graph_capture
+from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
+from vllm_ascend.worker.model_runner_v1 import (
+    NPUModelRunner,
+    get_tp_context,
+    graph_capture,
+)
 
 from afd_plugin.compat.npu import (
     ascend_forward_context,
@@ -88,6 +93,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self.prof = create_afd_npu_profiler("ffn", role_rank=rank)
         self._is_shutdown = False
         self._ffn_input_ids_cache: dict[int, torch.Tensor] = {}
+        self.mtp_ffn_model: torch.nn.Module | None = None
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
@@ -104,6 +110,27 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
 
     def profile_run(self) -> None:
         return None
+
+    def load_model(self) -> None:
+        if self.speculative_config is None:
+            super().load_model()
+            return
+        if self.speculative_config.method != "mtp" or self.drafter is None:
+            raise RuntimeError("DSV4 AFD FFN requires an initialized MTP drafter")
+
+        # The FFN service owns no scheduler-side proposer or sampler. Load the
+        # target model normally, then construct only the role-filtered MTP MoE.
+        drafter = self.drafter
+        self.drafter = None
+        try:
+            super().load_model()
+        finally:
+            self.drafter = drafter
+        if self.vllm_config.quant_config is not None:
+            patch_load_weights(self.vllm_config)
+        with get_tp_context(drafter):
+            drafter.model = drafter._get_model()
+        self.mtp_ffn_model = drafter.get_model()
 
     def execute_ffn_step(
         self,
@@ -397,9 +424,61 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                             context,
                             stage_idx=stage_idx,
                         )
+            if self.vllm_config.speculative_config is not None:
+                rank_ffn_output = self._mtp_ffn_forward(stage_ids)
         finally:
             input_ids_cache.clear()
         return rank_ffn_output
+
+    def _mtp_ffn_forward(self, stage_ids: list[int]) -> torch.Tensor:
+        if stage_ids != [0]:
+            raise RuntimeError("DSV4 AFD MTP M1 supports only eager U1")
+        if self.mtp_ffn_model is None:
+            raise RuntimeError("DSV4 AFD MTP FFN model is not loaded")
+
+        stage_idx = 0
+        header = self.connector.recv_mtp_header(stage_idx=stage_idx)
+        payload = self.connector.recv_attn_output(
+            ubatch_idx=stage_idx,
+            layer_idx=0,
+            phase="mtp",
+            speculative_step=header.speculative_step,
+            num_tokens=header.num_tokens,
+        )
+        metadata = payload.context.metadata
+        if metadata.phase != "mtp" or metadata.speculative_step != 0:
+            raise RuntimeError("DSV4 AFD FFN received an invalid MTP phase")
+
+        afd_metadata = AFDForwardContextMetadata(
+            tokens_start_loc=[0],
+            requests_start_loc=[0],
+            stage_idx=stage_idx,
+            connector=self.connector,
+            tokens_lens=[header.num_tokens],
+            num_stages=1,
+            tokens_unpadded_lens=[header.num_tokens],
+        )
+        with ascend_forward_context(
+            vllm_config=self.vllm_config,
+            afd_metadata=afd_metadata,
+            model_instance=self.mtp_ffn_model,
+            num_tokens=header.num_tokens,
+            num_tokens_across_dp=header.num_tokens_across_dp,
+            is_draft_model=True,
+        ) as forward_context:
+            forward_context.additional_kwargs["afd_metadata"] = metadata
+            _set_moe_layer_index(forward_context, 0)
+            output = self.mtp_ffn_model.compute_ffn_output(
+                hidden_states=payload.hidden_states,
+                layer_idx=0,
+            )
+        _send_ffn_output(
+            self.connector,
+            output,
+            payload.context,
+            stage_idx=stage_idx,
+        )
+        return output
 
     def _ffn_forward_connector_driven(
         self,

@@ -163,3 +163,42 @@ def test_loopback_layer_matches_local_reference(
     assert len(connector.received) == 1
     assert connector.sent[0][1].metadata.layer_idx == layer_idx
     assert connector.sent[0][1].metadata.seq_lens == [num_tokens]
+
+
+def test_mtp_remote_moe_does_not_require_or_send_input_ids(monkeypatch):
+    hidden_states = torch.ones((3, 4, 8), dtype=torch.bfloat16)
+    ffn_layer = _ffn_layer(layer_idx=0, quantized=False)
+    connector = _LoopbackConnector(ffn_layer)
+    proxy = adapter.AFDDeepseekV4RemoteMoEProxy(layer_idx=0, phase="mtp")
+    proxy.attach_connector(connector)
+
+    monkeypatch.setattr(
+        proxy_runtime,
+        "get_afd_metadata_from_forward_context",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        proxy_runtime,
+        "get_forward_context",
+        lambda: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "get_forward_context",
+        lambda: pytest.fail("MTP phase must not query target input_ids"),
+    )
+    monkeypatch.setattr(
+        proxy_runtime,
+        "maybe_apply_dbo_yield",
+        lambda tensor, *, role: tensor,
+    )
+
+    output = proxy(hidden_states)
+
+    assert output.shape == hidden_states.shape
+    assert len(connector.sent) == 1
+    _, context, send_kwargs = connector.sent[0]
+    assert context.metadata.phase == "mtp"
+    assert context.metadata.layer_idx == 0
+    assert "input_ids" not in send_kwargs
+    assert send_kwargs["num_tokens_across_dp"].tolist() == [3]

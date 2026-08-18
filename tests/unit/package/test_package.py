@@ -35,6 +35,9 @@ def test_deepseek_afd_model_registration_paths_are_lazy_strings():
     assert registrations["DeepseekV4ForCausalLM"] == (
         "afd_plugin.model_executor.models.deepseek_v4:AFDDeepseekV4ForCausalLM"
     )
+    assert registrations["DeepSeekV4MTPModel"] == (
+        "afd_plugin.model_executor.models.deepseek_v4:AFDDeepSeekV4MTP"
+    )
 
 
 def test_register_afd_does_not_replace_native_deepseek_model():
@@ -96,10 +99,27 @@ def test_deepseek_v4_afd_model_config_uses_private_architecture_copy():
 
     afd_model_config = get_afd_model_config(model_config)
 
-    assert afd_model_config.hf_config.architectures == [
-        "AFDDeepseekV4ForCausalLM"
-    ]
+    assert afd_model_config.hf_config.architectures == ["AFDDeepseekV4ForCausalLM"]
     assert model_config.hf_config.architectures == ["DeepseekV4ForCausalLM"]
+
+
+def test_deepseek_v4_mtp_draft_config_uses_private_afd_architecture_copy():
+    pytest.importorskip("vllm")
+    from afd_plugin.model_executor.models.model_utils import (
+        install_afd_speculative_model_config,
+    )
+
+    hf_config = SimpleNamespace(architectures=["DeepSeekV4MTPModel"])
+    draft_config = SimpleNamespace(hf_config=hf_config, hf_text_config=hf_config)
+    speculative_config = SimpleNamespace(draft_model_config=draft_config)
+    vllm_config = SimpleNamespace(speculative_config=speculative_config)
+
+    install_afd_speculative_model_config(vllm_config)
+
+    installed = speculative_config.draft_model_config
+    assert installed is not draft_config
+    assert installed.hf_config.architectures == ["AFDDeepSeekV4MTPModel"]
+    assert draft_config.hf_config.architectures == ["DeepSeekV4MTPModel"]
 
 
 def test_entry_point_is_registered():

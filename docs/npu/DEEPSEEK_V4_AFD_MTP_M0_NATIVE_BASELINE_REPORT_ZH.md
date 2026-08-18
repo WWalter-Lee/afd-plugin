@@ -155,6 +155,11 @@ Attention -> FFN: MTP hidden [T, 4, 4096], bfloat16
 FFN       -> Attention: MTP output [T, 4, 4096], bfloat16
 ```
 
+> M1 勘误（2026-08-18）：以上三维 shape 是 M0 根据 target HC residual 得出的
+> 预冻结假设。M1 真实 AF 执行确认远端 MoE 边界位于 HC collapse 之后，原生 MoE
+> 只接受二维输入；线上协议已经修正为双向 `[T,4096]` BF16，并显式拒绝三维
+> pre-HC tensor。M0 的权重所有权、target buffer 和“不发送 IDs”结论保持不变。
+
 MTP phase 使用独立预分配 buffer 和独立 cache key，不能复用尚未完成的 decoder
 layer transfer state。等量 A8F8 下 Attention rank `i` 只和 FFN rank `i`
 交换。FFN receive state 必须在 matching output send 后于 `finally` 清理；取消、

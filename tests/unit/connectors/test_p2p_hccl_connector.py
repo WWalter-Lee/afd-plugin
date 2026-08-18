@@ -18,6 +18,7 @@ from afd_plugin.connectors import (  # noqa: E402
 )
 from afd_plugin.connectors.npu import p2p_hccl as hccl_module  # noqa: E402
 from afd_plugin.connectors.npu.p2p_hccl import (  # noqa: E402
+    HCCLMTPHeader,
     HCCLP2PTransferState,
     P2pHcclAFDConnector,
 )
@@ -28,6 +29,7 @@ def _vllm_config(
     num_ubatches: int = 1,
     dsv4: bool = True,
     max_num_batched_tokens: int = 16,
+    mtp: bool = False,
 ):
     return SimpleNamespace(
         additional_config={"afd": {"connector_extra_config": {}}},
@@ -46,9 +48,11 @@ def _vllm_config(
             hf_config=SimpleNamespace(
                 architectures=["DeepseekV4ForCausalLM"] if dsv4 else [],
                 hidden_size=4,
+                hc_mult=4,
                 vocab_size=32,
             ),
         ),
+        speculative_config=(SimpleNamespace(method="mtp") if mtp else None),
     )
 
 
@@ -69,6 +73,7 @@ def _connector(
     ffn: int = 1,
     num_ubatches: int = 1,
     max_num_batched_tokens: int = 16,
+    mtp: bool = False,
 ):
     connector = P2pHcclAFDConnector(
         0,
@@ -76,6 +81,7 @@ def _connector(
         _vllm_config(
             num_ubatches=num_ubatches,
             max_num_batched_tokens=max_num_batched_tokens,
+            mtp=mtp,
         ),
         _afd_config(role=role, attention=attention, ffn=ffn),
         role_rank,
@@ -86,6 +92,9 @@ def _connector(
     connector.input_ids_buffers = [
         torch.empty(16, dtype=torch.int32) for _ in range(num_ubatches)
     ]
+    connector.mtp_header_buffers = [
+        torch.empty(4 + ffn, dtype=torch.int32) for _ in range(num_ubatches)
+    ]
     return connector
 
 
@@ -95,6 +104,18 @@ def _attention_context(*, layer_idx: int, stage_idx: int, num_tokens: int):
             layer_idx=layer_idx,
             stage_idx=stage_idx,
             seq_len=num_tokens,
+        ),
+    )
+
+
+def _mtp_attention_context(*, num_tokens: int):
+    return AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=0,
+            stage_idx=0,
+            seq_len=num_tokens,
+            phase="mtp",
+            speculative_step=0,
         ),
     )
 
@@ -183,6 +204,87 @@ def test_p2p_hccl_attention_sends_ids_before_hidden(monkeypatch):
     assert events[0][1:3] == (0, connector.ids_pg_list[0])
     assert events[2][1:3] == (0, connector.data_pg_list[0])
     assert events[0][3].dtype == torch.int32
+
+
+def test_p2p_hccl_mtp_sends_fixed_header_before_moe_input(
+    monkeypatch,
+):
+    connector = _connector(role="attention", mtp=True)
+    events = []
+    monkeypatch.setattr(
+        hccl_module.dist,
+        "send",
+        lambda tensor, *, dst, group: events.append(
+            (tensor.clone(), dst, group),
+        ),
+    )
+    hidden = torch.ones((3, 4), dtype=torch.bfloat16)
+
+    connector.send_attn_output(
+        hidden,
+        _mtp_attention_context(num_tokens=3),
+        num_tokens_across_dp=torch.tensor([3], dtype=torch.int32),
+    )
+
+    assert len(events) == 2
+    header, dst, group = events[0]
+    assert (dst, group) == (0, connector.ids_pg_list[0])
+    assert header.dtype == torch.int32
+    assert header[1:].tolist() == [0, 3, 1, 3]
+    assert events[1][1:] == (0, connector.data_pg_list[0])
+    assert events[1][0].shape == (3, 4)
+
+
+def test_p2p_hccl_mtp_rejects_pre_hc_three_dimensional_hidden():
+    connector = _connector(role="attention", mtp=True)
+
+    with pytest.raises(ValueError, match="post-HC MoE input shape"):
+        connector.send_attn_output(
+            torch.ones((3, 4, 4), dtype=torch.bfloat16),
+            _mtp_attention_context(num_tokens=3),
+            num_tokens_across_dp=torch.tensor([3], dtype=torch.int32),
+        )
+
+
+def test_p2p_hccl_ffn_receives_mtp_header_and_separate_hidden_buffer(monkeypatch):
+    connector = _connector(role="ffn", mtp=True)
+    connector.mtp_hidden_recv_buffers[0] = torch.empty(
+        (3, 4),
+        dtype=torch.bfloat16,
+    )
+    events = []
+
+    def recv(tensor, *, src, group):
+        events.append((src, group, tuple(tensor.shape)))
+        if tensor.dtype == torch.int32:
+            tensor.copy_(torch.tensor([0x4D545031, 0, 3, 1, 3]))
+        else:
+            tensor.fill_(7)
+
+    monkeypatch.setattr(hccl_module.dist, "recv", recv)
+
+    header = connector.recv_mtp_header(stage_idx=0)
+    payload = connector.recv_attn_output(
+        ubatch_idx=0,
+        layer_idx=0,
+        phase="mtp",
+        speculative_step=header.speculative_step,
+        num_tokens=header.num_tokens,
+    )
+
+    assert header == HCCLMTPHeader(
+        num_tokens=3,
+        speculative_step=0,
+        num_tokens_across_dp=torch.tensor([3], dtype=torch.int32),
+    )
+    assert events == [
+        (1, connector.ids_pg_list[0], (5,)),
+        (1, connector.data_pg_list[0], (3, 4)),
+    ]
+    assert payload.context.metadata.phase == "mtp"
+    assert payload.input_ids is None
+    assert payload.hidden_states.shape == (3, 4)
+    assert torch.equal(payload.hidden_states, torch.full_like(payload.hidden_states, 7))
 
 
 def test_p2p_hccl_pretransferred_ids_send_only_hidden(monkeypatch):

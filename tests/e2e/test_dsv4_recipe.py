@@ -92,6 +92,18 @@ def test_dsv4_role_scripts_offer_u1_graph_and_eager_u2():
         assert '"${UBATCH_ARGS[@]}"' in script
         assert '--max-model-len "$MAX_MODEL_LEN"' in script
         assert '--gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"' in script
+        assert 'ENABLE_MTP="${ENABLE_MTP:-0}"' in script
+        assert 'MTP_NUM_SPECULATIVE_TOKENS="${MTP_NUM_SPECULATIVE_TOKENS:-1}"' in (
+            script
+        )
+        assert '"method":"mtp"' in script
+        assert '"num_speculative_tokens":1' in script
+        assert '"enforce_eager":true' in script
+        assert '"${MTP_ARGS[@]}"' in script
+        assert "MTP M1 requires P2pHcclAFDConnector" in script
+        assert "MTP M1 requires eager/U1" in script
+        assert "MTP M1 requires equal Attention/FFN ranks" in script
+        assert "MTP M1 supports exactly one speculative token" in script
 
     attention_script = (recipe_dir / "afd_attention.sh").read_text(encoding="utf-8")
     assert 'HCCL_IF_BASE_PORT="${ATTENTION_HCCL_IF_BASE_PORT:-51000}"' in (
@@ -260,6 +272,51 @@ def test_dsv4_hccl_graph_topology_requires_equal_roles():
     )
 
 
+def test_dsv4_hccl_mtp_m1_topology_gate_and_environment(monkeypatch):
+    runner = _load_runner()
+    topology = {"attention_ranks": 8, "ffn_ranks": 8}
+    monkeypatch.setenv("ENABLE_MTP", "0")
+    monkeypatch.setenv("MTP_NUM_SPECULATIVE_TOKENS", "9")
+
+    runner._validate_execution_topology(
+        connector="P2pHcclAFDConnector",
+        execution_mode="eager",
+        u_batches=1,
+        enable_mtp=True,
+        mtp_num_speculative_tokens=1,
+        topology=topology,
+    )
+    runner._set_mtp_environment(
+        enable_mtp=True,
+        mtp_num_speculative_tokens=1,
+    )
+    assert runner.os.environ["ENABLE_MTP"] == "1"
+    assert runner.os.environ["MTP_NUM_SPECULATIVE_TOKENS"] == "1"
+
+    invalid_cases = [
+        ({"connector": "CAMP2pAFDConnector"}, "P2pHcclAFDConnector"),
+        ({"execution_mode": "full-decode-only"}, "eager/U1"),
+        ({"u_batches": 2}, "eager/U1"),
+        (
+            {"topology": {"attention_ranks": 8, "ffn_ranks": 4}},
+            "equal Attention/FFN",
+        ),
+        ({"mtp_num_speculative_tokens": 2}, "exactly one speculative token"),
+    ]
+    defaults = {
+        "connector": "P2pHcclAFDConnector",
+        "execution_mode": "eager",
+        "u_batches": 1,
+        "enable_mtp": True,
+        "mtp_num_speculative_tokens": 1,
+        "topology": topology,
+    }
+    for overrides, message in invalid_cases:
+        kwargs = {**defaults, **overrides}
+        with pytest.raises(ValueError, match=message):
+            runner._validate_execution_topology(**kwargs)
+
+
 def test_dsv4_performance_command_locks_workload_and_fixed_python(tmp_path):
     runner = _load_performance_runner()
     result_path = tmp_path / "result.json"
@@ -298,6 +355,92 @@ def test_dsv4_performance_reproducibility_files_are_hashed():
         digest = runner._file_sha256(path)
         assert len(digest) == 64
         assert digest == runner.hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_dsv4_performance_mtp_uses_m1_gate_and_environment(monkeypatch):
+    runner = _load_performance_runner()
+    args = SimpleNamespace(
+        u_batches=1,
+        enable_mtp=True,
+        mtp_num_speculative_tokens=1,
+        max_num_batched_tokens=1024,
+    )
+
+    runner._validate_execution_args(args)
+    topology = runner._a8f8_topology(args.max_num_batched_tokens)
+    assert topology["attention_ranks"] == topology["ffn_ranks"] == 8
+    assert topology["attention_devices"] == list(range(8))
+    assert topology["ffn_devices"] == list(range(8, 16))
+
+    args.u_batches = 2
+    with pytest.raises(ValueError, match="eager/U1"):
+        runner._validate_execution_args(args)
+
+    args.u_batches = 1
+    args.mtp_num_speculative_tokens = 2
+    with pytest.raises(ValueError, match="exactly one speculative token"):
+        runner._validate_execution_args(args)
+
+    args.mtp_num_speculative_tokens = 1
+    monkeypatch.setenv("ENABLE_MTP", "0")
+    monkeypatch.setenv("MTP_NUM_SPECULATIVE_TOKENS", "9")
+    runner._set_service_environment(
+        SimpleNamespace(
+            **vars(args),
+            max_model_len=4096,
+            max_num_seqs=8,
+            gpu_memory_utilization=0.9,
+            attention_hccl_base_port=51000,
+            ffn_hccl_base_port=52000,
+            profile=False,
+        )
+    )
+    assert runner.os.environ["ENABLE_MTP"] == "1"
+    assert runner.os.environ["MTP_NUM_SPECULATIVE_TOKENS"] == "1"
+
+
+def test_dsv4_performance_mtp_manifest_preserves_structured_topology(monkeypatch):
+    runner = _load_performance_runner()
+    monkeypatch.setattr(
+        runner.SHARED,
+        "_runtime_manifest",
+        lambda **kwargs: dict(kwargs),
+    )
+    monkeypatch.setattr(runner, "_file_sha256", lambda _path: "a" * 64)
+    args = SimpleNamespace(
+        u_batches=1,
+        dbo_decode_token_threshold=2,
+        dbo_prefill_token_threshold=12,
+        profile=False,
+        enable_mtp=True,
+        mtp_num_speculative_tokens=1,
+        max_model_len=4096,
+        max_num_batched_tokens=1024,
+        max_num_seqs=8,
+        gpu_memory_utilization=0.9,
+        attention_hccl_base_port=51000,
+        ffn_hccl_base_port=52000,
+        input_len=1024,
+        output_len=128,
+        concurrencies=[32],
+        repeats=1,
+        prompts_per_concurrency=4,
+        min_prompts=128,
+        warmup_input_len=256,
+        warmup_output_len=16,
+        warmup_prompts=16,
+        warmup_concurrency=8,
+        max_throughput_cv=0.1,
+        benchmark_timeout=1800,
+    )
+
+    manifest = runner._runtime_manifest(args)
+
+    assert manifest["stage"] == "A3-P7M1-P1"
+    assert manifest["topology_label"] == "A8F8"
+    assert manifest["enable_mtp"] is True
+    assert manifest["mtp_num_speculative_tokens"] == 1
+    assert manifest["topology"] == runner._a8f8_topology(1024)
 
 
 def test_dsv4_performance_detects_exited_service():

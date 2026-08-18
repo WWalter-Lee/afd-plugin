@@ -395,11 +395,14 @@ def _runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
         dbo_decode_token_threshold=args.dbo_decode_token_threshold,
         dbo_prefill_token_threshold=args.dbo_prefill_token_threshold,
         profile=args.profile,
+        enable_mtp=args.enable_mtp,
+        mtp_num_speculative_tokens=args.mtp_num_speculative_tokens,
+        topology=_a8f8_topology(args.max_num_batched_tokens),
     )
     manifest.update(
         {
-            "stage": "A3-P4",
-            "topology": "A8F8",
+            "stage": "A3-P7M1-P1" if args.enable_mtp else "A3-P4",
+            "topology_label": "A8F8",
             "npu_count": TOTAL_NPUS,
             "reproducibility_files_sha256": {
                 str(path.relative_to(REPO_ROOT)): _file_sha256(path)
@@ -459,6 +462,10 @@ def _set_service_environment(args: argparse.Namespace) -> None:
             "TORCH_PROFILER_WITH_STACK": "0",
         }
     )
+    SHARED._set_mtp_environment(
+        enable_mtp=args.enable_mtp,
+        mtp_num_speculative_tokens=args.mtp_num_speculative_tokens,
+    )
     if not args.profile:
         return
     for role in ("ATTENTION", "FFN"):
@@ -474,6 +481,30 @@ def _set_service_environment(args: argparse.Namespace) -> None:
                 f"{prefix}_WITH_STACK": "0",
             }
         )
+
+
+def _a8f8_topology(max_num_batched_tokens: int) -> dict[str, Any]:
+    return {
+        "attention_ranks": 8,
+        "ffn_ranks": 8,
+        "ratio": 1,
+        "attention_devices": list(range(8)),
+        "ffn_devices": list(range(8, 16)),
+        "unused_devices": [],
+        "attention_max_num_batched_tokens": max_num_batched_tokens,
+        "ffn_max_num_batched_tokens": max_num_batched_tokens,
+    }
+
+
+def _validate_execution_args(args: argparse.Namespace) -> None:
+    SHARED._validate_execution_topology(
+        connector="P2pHcclAFDConnector",
+        execution_mode="eager",
+        u_batches=args.u_batches,
+        enable_mtp=args.enable_mtp,
+        mtp_num_speculative_tokens=args.mtp_num_speculative_tokens,
+        topology=_a8f8_topology(args.max_num_batched_tokens),
+    )
 
 
 def _run(args: argparse.Namespace) -> dict[str, Any]:
@@ -496,6 +527,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "passed": False,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "u_batches": args.u_batches,
+        "enable_mtp": args.enable_mtp,
+        "mtp_num_speculative_tokens": args.mtp_num_speculative_tokens,
         "profile": args.profile,
     }
     startup_started = time.monotonic()
@@ -692,6 +725,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--afd-port", type=int, default=29761)
     parser.add_argument("--startup-timeout", type=float, default=3600)
     parser.add_argument("--u-batches", type=int, choices=(1, 2), required=True)
+    parser.add_argument(
+        "--enable-mtp",
+        action="store_true",
+        default=os.environ.get("ENABLE_MTP", "0") == "1",
+    )
+    parser.add_argument(
+        "--mtp-num-speculative-tokens",
+        type=int,
+        default=int(os.environ.get("MTP_NUM_SPECULATIVE_TOKENS", "1")),
+    )
     parser.add_argument("--dbo-decode-token-threshold", type=int, default=2)
     parser.add_argument("--dbo-prefill-token-threshold", type=int, default=12)
     parser.add_argument("--input-len", type=int, default=1024)
@@ -758,6 +801,10 @@ def _parse_args() -> argparse.Namespace:
             parser.error(f"--{field.replace('_', '-')} must be in [1024, 60000]")
     if abs(args.attention_hccl_base_port - args.ffn_hccl_base_port) < 1000:
         parser.error("Attention and FFN HCCL base ports must be at least 1000 apart")
+    try:
+        _validate_execution_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     return args
 
 

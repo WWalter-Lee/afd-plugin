@@ -173,6 +173,29 @@ def _fail_if_unsupported_deepseek_v4_features(
         raise RuntimeError("DeepSeek-V4 AFD does not support sequence-parallel MoE")
     if afd_config.compute_gate_on_attention:
         raise RuntimeError("DeepSeek-V4 AFD requires FFN-side gate computation")
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is not None:
+        if afd_config.connector != "P2pHcclAFDConnector":
+            raise RuntimeError("DeepSeek-V4 AFD MTP supports only P2pHcclAFDConnector")
+        if afd_config.num_attention_ranks != afd_config.num_ffn_ranks:
+            raise RuntimeError("DeepSeek-V4 AFD MTP requires equal A/F ranks")
+        if not vllm_config.model_config.enforce_eager:
+            raise RuntimeError("DeepSeek-V4 AFD MTP M1 supports only eager execution")
+        if bool(getattr(parallel_config, "use_ubatching", False)):
+            raise RuntimeError("DeepSeek-V4 AFD MTP M1 supports only U1")
+        if getattr(speculative_config, "method", None) != "mtp":
+            raise RuntimeError("DeepSeek-V4 AFD supports only MTP speculative method")
+        if int(getattr(speculative_config, "num_speculative_tokens", 0)) != 1:
+            raise RuntimeError(
+                "DeepSeek-V4 AFD MTP M1 supports num_speculative_tokens=1"
+            )
+        if not bool(getattr(speculative_config, "enforce_eager", False)):
+            raise RuntimeError("DeepSeek-V4 AFD MTP draft requires enforce_eager=true")
+        num_mtp_layers = int(
+            getattr(vllm_config.model_config.hf_config, "num_nextn_predict_layers", 1)
+        )
+        if num_mtp_layers != 1:
+            raise RuntimeError("DeepSeek-V4 AFD MTP M1 supports exactly one MTP layer")
     if not vllm_config.model_config.enforce_eager:
         if (
             afd_config.connector == "P2pHcclAFDConnector"
@@ -198,8 +221,6 @@ def _fail_if_unsupported_deepseek_v4_features(
             raise RuntimeError(
                 "DeepSeek-V4 AFD DBO/ubatching currently supports only eager execution"
             )
-    if vllm_config.speculative_config is not None:
-        raise RuntimeError("DeepSeek-V4 AFD does not support MTP/speculative decoding")
     if getattr(vllm_config, "kv_transfer_config", None) is not None:
         raise RuntimeError("DeepSeek-V4 AFD standalone baseline does not support PD")
 

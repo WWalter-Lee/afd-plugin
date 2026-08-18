@@ -1389,6 +1389,57 @@ def test_npu_ffn_runner_executes_eager_ffn_step(monkeypatch):
     ]
 
 
+def test_npu_ffn_runner_executes_decoder_then_mtp_phase(monkeypatch):
+    _patch_ffn_forward_context(monkeypatch)
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn",
+        connector="P2pHcclAFDConnector",
+        speculative_config=SimpleNamespace(
+            method="mtp",
+            num_speculative_tokens=1,
+            enforce_eager=True,
+        ),
+    )
+    runner.connector = _FakeFFNConnector()
+    runner.model = _FakeModel()
+    runner.mtp_ffn_model = _FakeModel()
+    runner.num_layers = 1
+    runner.max_num_tokens = 2
+    runner.use_aclgraph = False
+    runner._acl_graphs = {}
+    decoder_metadata = AFDTransferMetadata.create_attention_metadata(
+        layer_idx=0,
+        stage_idx=0,
+        seq_len=2,
+    )
+    mtp_metadata = AFDTransferMetadata.create_attention_metadata(
+        layer_idx=0,
+        stage_idx=0,
+        seq_len=2,
+        phase="mtp",
+        speculative_step=0,
+    )
+    runner.connector.attn_outputs.extend(
+        [
+            ("decoder-hidden", decoder_metadata),
+            ("mtp-hidden", mtp_metadata),
+        ]
+    )
+    runner.connector.recv_mtp_header = lambda *, stage_idx: SimpleNamespace(
+        num_tokens=2,
+        speculative_step=0,
+        num_tokens_across_dp=torch.tensor([2], dtype=torch.int32),
+    )
+
+    runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([2])})
+
+    assert runner.connector.ffn_outputs == [
+        ("npu-ffn(decoder-hidden, layer=0)", decoder_metadata, {"ubatch_idx": 0}),
+        ("npu-ffn(mtp-hidden, layer=0)", mtp_metadata, {"ubatch_idx": 0}),
+    ]
+
+
 def test_npu_ffn_runner_builds_forward_context_for_each_dbo_stage(monkeypatch):
     _require_npu_runtime()
     from afd_plugin.v1.worker.npu import ffn_model_runner
@@ -2463,6 +2514,16 @@ def _dsv4_config(**kwargs):
     return config
 
 
+def _mtp_speculative_config(**overrides):
+    values = {
+        "method": "mtp",
+        "num_speculative_tokens": 1,
+        "enforce_eager": True,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def test_dsv4_feature_validation_accepts_eager_u1_camp2p():
     fail_if_unsupported_npu_afd_features(_dsv4_config())
 
@@ -2512,6 +2573,13 @@ def test_dsv4_feature_validation_accepts_eager_hccl_p2p_a2f1():
 def test_dsv4_feature_validation_accepts_hccl_p2p_full_decode_only_u1():
     config = _dsv4_config(cudagraph_mode="FULL_DECODE_ONLY")
     config.model_config.enforce_eager = False
+    config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
+def test_dsv4_feature_validation_accepts_mtp_m1_eager_u1_hccl_p2p():
+    config = _dsv4_config(speculative_config=_mtp_speculative_config())
     config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
 
     fail_if_unsupported_npu_afd_features(config)
@@ -2581,7 +2649,7 @@ def test_dsv4_feature_validation_rejects_hccl_p2p_graph_a2f1():
         ),
         (
             lambda config: setattr(config, "speculative_config", object()),
-            "MTP/speculative",
+            "MTP supports only P2pHcclAFDConnector",
         ),
         (
             lambda config: setattr(config, "kv_transfer_config", object()),
@@ -2591,6 +2659,66 @@ def test_dsv4_feature_validation_rejects_hccl_p2p_graph_a2f1():
 )
 def test_dsv4_feature_validation_rejects_unvalidated_modes(mutation, message):
     config = _dsv4_config()
+    mutation(config)
+
+    with pytest.raises(RuntimeError, match=message):
+        fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda config: config.additional_config["afd"].update(
+                num_attention_ranks=2,
+                num_ffn_ranks=1,
+            ),
+            "requires equal A/F ranks",
+        ),
+        (
+            lambda config: setattr(config.model_config, "enforce_eager", False),
+            "MTP M1 supports only eager execution",
+        ),
+        (
+            lambda config: setattr(config.parallel_config, "use_ubatching", True),
+            "MTP M1 supports only U1",
+        ),
+        (
+            lambda config: setattr(config.speculative_config, "method", "draft"),
+            "supports only MTP speculative method",
+        ),
+        (
+            lambda config: setattr(
+                config.speculative_config,
+                "num_speculative_tokens",
+                2,
+            ),
+            "supports num_speculative_tokens=1",
+        ),
+        (
+            lambda config: setattr(
+                config.speculative_config,
+                "enforce_eager",
+                False,
+            ),
+            "MTP draft requires enforce_eager=true",
+        ),
+        (
+            lambda config: setattr(
+                config.model_config.hf_config,
+                "num_nextn_predict_layers",
+                2,
+            ),
+            "supports exactly one MTP layer",
+        ),
+    ],
+)
+def test_dsv4_feature_validation_rejects_unvalidated_mtp_m1_modes(
+    mutation,
+    message,
+):
+    config = _dsv4_config(speculative_config=_mtp_speculative_config())
+    config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
     mutation(config)
 
     with pytest.raises(RuntimeError, match=message):

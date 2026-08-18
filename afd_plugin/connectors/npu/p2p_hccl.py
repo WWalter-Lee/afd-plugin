@@ -120,6 +120,19 @@ class HCCLP2PStageLayout:
     num_tokens: int
 
 
+@dataclass(frozen=True, slots=True)
+class HCCLMTPHeader:
+    """MTP phase shape and DP layout sent before the draft hidden tensor."""
+
+    num_tokens: int
+    speculative_step: int
+    num_tokens_across_dp: torch.Tensor
+
+
+_MTP_HEADER_MAGIC = 0x4D545031
+_MTP_HEADER_PREFIX_SIZE = 4
+
+
 class P2pHcclAFDConnector(AFDConnectorBase):
     """Move AFD tensors with standard HCCL point-to-point operations."""
 
@@ -170,13 +183,20 @@ class P2pHcclAFDConnector(AFDConnectorBase):
             architecture in {"DeepseekV4ForCausalLM", "AFDDeepseekV4ForCausalLM"}
             for architecture in architectures
         )
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        self.requires_mtp = (
+            speculative_config is not None
+            and getattr(speculative_config, "method", None) == "mtp"
+        )
         self.vocab_size = int(vllm_config.model_config.hf_config.vocab_size)
 
         self.data_pg_list: list[ProcessGroup] = []
         self.ids_pg_list: list[ProcessGroup] = []
         self.p2p_pg: ProcessGroup | None = None
         self.input_ids_buffers: list[torch.Tensor] = []
+        self.mtp_header_buffers: list[torch.Tensor] = []
         self.hidden_recv_buffers: dict[int, torch.Tensor] = {}
+        self.mtp_hidden_recv_buffers: dict[int, torch.Tensor] = {}
         self.dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata] = {}
         self.stage_layouts: dict[int, HCCLP2PStageLayout] = {}
         self.is_graph_capturing = False
@@ -213,7 +233,7 @@ class P2pHcclAFDConnector(AFDConnectorBase):
                 )
                 self.data_pg_list.append(data_group)
 
-                if self.requires_input_ids:
+                if self.requires_input_ids or self.requires_mtp:
                     ids_group = init_afd_process_group(
                         backend="hccl",
                         init_method=(
@@ -228,6 +248,13 @@ class P2pHcclAFDConnector(AFDConnectorBase):
                     self.input_ids_buffers.append(
                         torch.empty(
                             self.max_num_batched_tokens,
+                            dtype=torch.int32,
+                            device=f"npu:{self.local_rank}",
+                        ),
+                    )
+                    self.mtp_header_buffers.append(
+                        torch.empty(
+                            _MTP_HEADER_PREFIX_SIZE + self.ffn_size,
                             dtype=torch.int32,
                             device=f"npu:{self.local_rank}",
                         ),
@@ -260,7 +287,9 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         self.ids_pg_list = []
         self.data_pg_list = []
         self.input_ids_buffers = []
+        self.mtp_header_buffers = []
         self.hidden_recv_buffers = {}
+        self.mtp_hidden_recv_buffers = {}
         self.dp_metadata_list = {}
         self.stage_layouts = {}
         self._initialized = False
@@ -281,7 +310,26 @@ class P2pHcclAFDConnector(AFDConnectorBase):
                 f"HCCL P2P metadata token count {metadata.total_tokens}",
             )
 
-        if self.requires_input_ids:
+        if metadata.phase == "mtp":
+            self._validate_mtp_scope(metadata)
+            expected_shape = (metadata.total_tokens, self.hidden_size)
+            if tuple(hidden_states.shape) != expected_shape:
+                raise ValueError(
+                    "DSV4 MTP HCCL transfer requires post-HC MoE input shape "
+                    f"{expected_shape}, got {tuple(hidden_states.shape)}"
+                )
+            num_tokens_across_dp = kwargs.get("num_tokens_across_dp")
+            if num_tokens_across_dp is None:
+                raise RuntimeError(
+                    "DSV4 MTP HCCL transfer requires num_tokens_across_dp"
+                )
+            self.send_mtp_header(
+                num_tokens=metadata.total_tokens,
+                speculative_step=metadata.speculative_step,
+                num_tokens_across_dp=num_tokens_across_dp,
+                stage_idx=metadata.stage_idx,
+            )
+        elif self.requires_input_ids:
             input_ids: torch.Tensor | None = kwargs.get("input_ids")
             if metadata.layer_idx == 0:
                 if input_ids is None:
@@ -333,18 +381,45 @@ class P2pHcclAFDConnector(AFDConnectorBase):
     ) -> AFDA2FTransferPayload:
         self._require_initialized()
         layer_idx = int(kwargs.get("layer_idx", 0))
-        layout = self._stage_layout(
-            ubatch_idx,
-            fallback=int(kwargs.get("max_num_tokens", 1)),
-        )
+        phase = str(kwargs.get("phase", "decoder"))
+        speculative_step = int(kwargs.get("speculative_step", 0))
+        if phase == "mtp":
+            explicit_num_tokens = int(kwargs.get("num_tokens", 0))
+            metadata_probe = AFDTransferMetadata.create_ffn_metadata(
+                layer_idx=layer_idx,
+                stage_idx=ubatch_idx,
+                seq_lens=[explicit_num_tokens],
+                phase=phase,
+                speculative_step=speculative_step,
+            )
+            self._validate_mtp_scope(metadata_probe)
+            peer_ranks = self._attention_peer_world_ranks()
+            layout = HCCLP2PStageLayout(
+                peer_ranks=peer_ranks,
+                seq_lens=(explicit_num_tokens,),
+                peer_slices=_make_peer_slices(
+                    peer_ranks,
+                    (explicit_num_tokens,),
+                ),
+                num_tokens=explicit_num_tokens,
+            )
+        else:
+            layout = self._stage_layout(
+                ubatch_idx,
+                fallback=int(kwargs.get("max_num_tokens", 1)),
+            )
         num_tokens = layout.num_tokens
         input_ids = None
-        if self.requires_input_ids and layer_idx == 0:
+        if phase == "decoder" and self.requires_input_ids and layer_idx == 0:
             input_ids = kwargs.get("input_ids")
             if input_ids is None:
                 input_ids = self.recv_input_ids(num_tokens, ubatch_idx=ubatch_idx)
 
-        hidden_states = self._hidden_recv_buffer(ubatch_idx, num_tokens)
+        hidden_states = (
+            self._mtp_hidden_recv_buffer(ubatch_idx, num_tokens)
+            if phase == "mtp"
+            else self._hidden_recv_buffer(ubatch_idx, num_tokens)
+        )
         group = self._data_group(ubatch_idx)
         for source_rank, start, end in layout.peer_slices:
             peer_slice = hidden_states[start:end]
@@ -353,6 +428,8 @@ class P2pHcclAFDConnector(AFDConnectorBase):
             layer_idx=layer_idx,
             stage_idx=ubatch_idx,
             seq_lens=layout.seq_lens,
+            phase=phase,
+            speculative_step=speculative_step,
         )
         return AFDA2FTransferPayload(
             hidden_states=hidden_states,
@@ -455,6 +532,62 @@ class P2pHcclAFDConnector(AFDConnectorBase):
             dist.recv(peer_slice, src=source_rank, group=group)
         return input_ids
 
+    def send_mtp_header(
+        self,
+        *,
+        num_tokens: int,
+        speculative_step: int,
+        num_tokens_across_dp: torch.Tensor,
+        stage_idx: int,
+    ) -> None:
+        self._validate_mtp_header_values(
+            num_tokens=num_tokens,
+            speculative_step=speculative_step,
+            num_tokens_across_dp=num_tokens_across_dp,
+        )
+        buffer, group = self._mtp_header_buffer_and_group(stage_idx)
+        counts = num_tokens_across_dp.reshape(-1).to(
+            device=buffer.device,
+            dtype=torch.int32,
+        )
+        buffer[0] = _MTP_HEADER_MAGIC
+        buffer[1] = speculative_step
+        buffer[2] = num_tokens
+        buffer[3] = self.ffn_size
+        buffer[_MTP_HEADER_PREFIX_SIZE:].copy_(counts, non_blocking=False)
+        dist.send(
+            buffer,
+            dst=self.mapping.subgroup_index,
+            group=group,
+        )
+
+    def recv_mtp_header(self, *, stage_idx: int) -> HCCLMTPHeader:
+        if self.afd_config.role != "ffn":
+            raise RuntimeError("only the FFN role receives MTP headers")
+        self._validate_mtp_topology()
+        buffer, group = self._mtp_header_buffer_and_group(stage_idx)
+        source_rank = self._attention_peer_world_ranks()[0]
+        dist.recv(buffer, src=source_rank, group=group)
+        values = [int(value) for value in buffer.cpu().tolist()]
+        if values[0] != _MTP_HEADER_MAGIC:
+            raise RuntimeError(f"invalid DSV4 MTP HCCL header magic: {values[0]}")
+        if values[3] != self.ffn_size:
+            raise RuntimeError(
+                "DSV4 MTP HCCL header DP size does not match FFN world: "
+                f"{values[3]} != {self.ffn_size}"
+            )
+        counts = torch.tensor(values[_MTP_HEADER_PREFIX_SIZE:], dtype=torch.int32)
+        self._validate_mtp_header_values(
+            num_tokens=values[2],
+            speculative_step=values[1],
+            num_tokens_across_dp=counts,
+        )
+        return HCCLMTPHeader(
+            num_tokens=values[2],
+            speculative_step=values[1],
+            num_tokens_across_dp=counts,
+        )
+
     def prepare_stage_buffer(self, stage_idx: int, num_tokens: int) -> None:
         """Ensure the FFN receive buffer is allocated before posting recv."""
         if self.afd_config.role != "ffn":
@@ -505,6 +638,27 @@ class P2pHcclAFDConnector(AFDConnectorBase):
                 device=f"npu:{self.local_rank}",
             )
             self.hidden_recv_buffers[stage_idx] = buffer
+        return buffer[:num_tokens]
+
+    def _mtp_hidden_recv_buffer(
+        self,
+        stage_idx: int,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        self._validate_receive_capacity(num_tokens)
+        buffer = self.mtp_hidden_recv_buffers.get(stage_idx)
+        if (
+            buffer is None
+            or int(buffer.shape[0]) < num_tokens
+            or tuple(buffer.shape[1:]) != (self.hidden_size,)
+            or buffer.dtype != self.dtype
+        ):
+            buffer = torch.empty(
+                (num_tokens, self.hidden_size),
+                dtype=self.dtype,
+                device=f"npu:{self.local_rank}",
+            )
+            self.mtp_hidden_recv_buffers[stage_idx] = buffer
         return buffer[:num_tokens]
 
     def _peer_token_counts_for_stage(
@@ -623,6 +777,54 @@ class P2pHcclAFDConnector(AFDConnectorBase):
             )
         return self.input_ids_buffers[stage_idx], self.ids_pg_list[stage_idx]
 
+    def _mtp_header_buffer_and_group(
+        self,
+        stage_idx: int,
+    ) -> tuple[torch.Tensor, ProcessGroup]:
+        if stage_idx < 0 or stage_idx >= len(self.mtp_header_buffers):
+            raise RuntimeError(
+                f"HCCL P2P MTP header stage {stage_idx} is not initialized",
+            )
+        return self.mtp_header_buffers[stage_idx], self.ids_pg_list[stage_idx]
+
+    def _validate_mtp_scope(self, metadata: AFDTransferMetadata) -> None:
+        if metadata.phase != "mtp":
+            raise ValueError("MTP scope validation requires phase=mtp")
+        if not self.requires_mtp:
+            raise RuntimeError("HCCL P2P MTP transfer is not enabled")
+        self._validate_mtp_topology()
+        if metadata.layer_idx != 0 or metadata.speculative_step != 0:
+            raise RuntimeError(
+                "DSV4 HCCL P2P MTP M1 supports only layer 0/speculative step 0"
+            )
+        self._validate_receive_capacity(metadata.total_tokens)
+
+    def _validate_mtp_topology(self) -> None:
+        if self.attn_size != self.ffn_size or self.ratio != 1:
+            raise RuntimeError("DSV4 HCCL P2P MTP requires equal A/F ranks")
+        if len(self.data_pg_list) != 1:
+            raise RuntimeError("DSV4 HCCL P2P MTP requires eager U1")
+
+    def _validate_mtp_header_values(
+        self,
+        *,
+        num_tokens: int,
+        speculative_step: int,
+        num_tokens_across_dp: torch.Tensor,
+    ) -> None:
+        self._validate_mtp_topology()
+        self._validate_receive_capacity(num_tokens)
+        if speculative_step != 0:
+            raise RuntimeError("DSV4 HCCL P2P MTP M1 supports only speculative step 0")
+        counts = [int(value) for value in num_tokens_across_dp.reshape(-1).tolist()]
+        if len(counts) != self.ffn_size:
+            raise ValueError(
+                "DSV4 MTP token-count vector must match FFN world size: "
+                f"{len(counts)} != {self.ffn_size}"
+            )
+        if any(value < 0 for value in counts):
+            raise ValueError("DSV4 MTP token counts cannot be negative")
+
     def _require_initialized(self) -> None:
         if not self._initialized:
             raise RuntimeError("HCCL P2P connector is not initialized")
@@ -729,6 +931,7 @@ def _make_peer_slices(
 
 
 __all__ = [
+    "HCCLMTPHeader",
     "HCCLP2PTransferState",
     "P2pHcclAFDConnector",
     "P2pHcclAFDControlPlane",

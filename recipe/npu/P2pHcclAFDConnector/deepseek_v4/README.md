@@ -1,5 +1,9 @@
 # DeepSeek-V4 HCCL P2P validation
 
+For the pinned vLLM 0.23 + vLLM-Ascend installation and A8F8 deployment
+procedure, see the
+[Chinese installation and deployment guide](../../../../docs/npu/DEEPSEEK_V4_AFD_HCCL_P2P_INSTALL_DEPLOYMENT_GUIDE_ZH.md).
+
 This recipe validates Attention/FFN disaggregation through standard
 `torch.distributed.send` and `torch.distributed.recv` calls backed by HCCL. It
 does not use `afd_camp2p_send_attn_output`, `afd_ascend.a2e`, or
@@ -13,8 +17,10 @@ Supported execution boundary:
 - integer-multiple topology contract `A >= F` and `A % F == 0`;
 - eager U1 or eager U2, including the integer-multiple topologies above;
 - `FULL_DECODE_ONLY` Graph U1 for equal Attention/FFN rank counts;
-- Graph U2, Graph with unequal Attention/FFN ranks, MTP, PD, sequence
-  parallelism, and Attention-side gate are disabled.
+- eager U1 + MTP for A8F8, one MTP layer, and one speculative token;
+- Graph U2, Graph with unequal Attention/FFN ranks, Graph/U2/unequal MTP,
+  multiple speculative tokens, PD, sequence parallelism, and Attention-side
+  gate are disabled.
 
 The current implementation deliberately remains synchronous: the data path
 uses blocking `torch.distributed.send/recv` and retains its explicit NPU
@@ -25,6 +31,11 @@ Under Graph U1, torch-npu lowers the hidden-state `send/recv` calls into the
 ACL Graph. Input IDs remain on the one-shot HCCL side channel before capture or
 replay, so no host metadata or dynamically sized ID message is placed in the
 captured graph.
+
+The MTP virtual layer has a separate phase and fixed header. Its learned gate
+does not consume input IDs: Attention sends the per-DP token counts followed by
+post-HC `[T,4096]` BF16 hidden states, and FFN returns a tensor with the same
+shape. Pre-HC `[T,4,4096]` transfers are rejected.
 
 Run the Graph U1 correctness gate on the vLLM 0.23 + `rfc/vllm_cann` stack:
 
@@ -37,10 +48,22 @@ python recipe/npu/P2pHcclAFDConnector/deepseek_v4/run_validation.py \
   --output-dir /mnt/workspace/validation/dsv4_afd_v023_hccl_graph_u1_<timestamp>
 ```
 
+Run an eager U1 + MTP correctness gate:
+
+```bash
+source tools/dsv4/activate_v023_vllm_cann_runtime.sh
+python recipe/npu/P2pHcclAFDConnector/deepseek_v4/run_validation.py \
+  --enable-mtp --connector P2pHcclAFDConnector \
+  --execution-mode eager --u-batches 1 \
+  --golden /mnt/workspace/validation/dsv4_v023_vllm_cann_native_baseline/golden_results.json \
+  --cycles 1 --idle-seconds 0 --rounds 3 --batch-sizes 1 8 32 \
+  --output-dir /mnt/workspace/validation/dsv4_afd_v023_hccl_mtp_m1_<timestamp>
+```
+
 Run a U1 smoke validation:
 
 ```bash
-source tools/dsv4/activate_runtime.sh
+source tools/dsv4/activate_v023_vllm_cann_runtime.sh
 python recipe/npu/P2pHcclAFDConnector/deepseek_v4/run_validation.py \
   --cycles 1 --idle-seconds 0 --rounds 1 --batch-sizes 1 \
   --output-dir /mnt/workspace/validation/dsv4_afd_hccl_p2p_u1_smoke_$(date +%Y%m%d_%H%M%S)
@@ -49,7 +72,7 @@ python recipe/npu/P2pHcclAFDConnector/deepseek_v4/run_validation.py \
 Run the complete eager U2 correctness gate:
 
 ```bash
-source tools/dsv4/activate_runtime.sh
+source tools/dsv4/activate_v023_vllm_cann_runtime.sh
 python recipe/npu/P2pHcclAFDConnector/deepseek_v4/run_validation.py \
   --u-batches 2 \
   --dbo-decode-token-threshold 2 \
@@ -96,7 +119,7 @@ performance-benefit result.
 Run the U1 and U2 performance references separately:
 
 ```bash
-source tools/dsv4/activate_runtime.sh
+source tools/dsv4/activate_v023_vllm_cann_runtime.sh
 python recipe/npu/P2pHcclAFDConnector/deepseek_v4/run_performance.py \
   --u-batches 1 \
   --output-dir /mnt/workspace/validation/dsv4_afd_a3_p4_hccl_u1_<timestamp>
@@ -106,6 +129,17 @@ python recipe/npu/P2pHcclAFDConnector/deepseek_v4/run_performance.py \
   --dbo-decode-token-threshold 2 \
   --dbo-prefill-token-threshold 12 \
   --output-dir /mnt/workspace/validation/dsv4_afd_a3_p4_hccl_u2_<timestamp>
+```
+
+For an MTP M1 disaster-regression guard, run only the fixed C32 point once.
+This is not a formal performance claim:
+
+```bash
+python recipe/npu/P2pHcclAFDConnector/deepseek_v4/run_performance.py \
+  --enable-mtp --u-batches 1 --concurrencies 32 --repeats 1 \
+  --input-len 1024 --output-len 128 \
+  --prompts-per-concurrency 4 --min-prompts 128 \
+  --output-dir /mnt/workspace/validation/dsv4_afd_v023_hccl_mtp_m1_p1_<timestamp>
 ```
 
 Collect profiler runs into different directories so profiler overhead never
@@ -134,7 +168,7 @@ different peer token counts, int32 IDs, BF16 hidden states, output splitting,
 two stages, two consecutive steps, and process-group close:
 
 ```bash
-source tools/dsv4/activate_runtime.sh
+source tools/dsv4/activate_v023_vllm_cann_runtime.sh
 
 python tools/dsv4/validate_hccl_p2p_roundtrip.py \
   --attention-devices 0,1 --ffn-devices 8 \
