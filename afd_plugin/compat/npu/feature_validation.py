@@ -173,14 +173,15 @@ def _fail_if_unsupported_deepseek_v4_features(
         raise RuntimeError("DeepSeek-V4 AFD does not support sequence-parallel MoE")
     if afd_config.compute_gate_on_attention:
         raise RuntimeError("DeepSeek-V4 AFD requires FFN-side gate computation")
-    if (
-        afd_config.connector == "P2pHcclAFDConnector"
-        and not vllm_config.model_config.enforce_eager
-    ):
-        raise RuntimeError(
-            "DeepSeek-V4 P2pHcclAFDConnector currently supports only eager execution"
-        )
     if not vllm_config.model_config.enforce_eager:
+        if (
+            afd_config.connector == "P2pHcclAFDConnector"
+            and afd_config.num_attention_ranks != afd_config.num_ffn_ranks
+        ):
+            raise RuntimeError(
+                "DeepSeek-V4 P2pHcclAFDConnector graph execution requires equal "
+                "Attention and FFN ranks"
+            )
         cudagraph_mode = getattr(
             getattr(vllm_config, "compilation_config", None),
             "cudagraph_mode",

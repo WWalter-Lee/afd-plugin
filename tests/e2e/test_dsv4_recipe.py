@@ -113,6 +113,12 @@ def test_dsv4_hccl_recipe_selects_hccl_connector_without_copying_validator():
     assert '"bench",' in performance_runner
     assert '"serve",' in performance_runner
 
+    for role in ("attention", "ffn"):
+        shared_script = (RUNNER_PATH.parent / f"afd_{role}.sh").read_text(
+            encoding="utf-8"
+        )
+        assert "P2pHcclAFDConnector currently supports only" not in shared_script
+
 
 def test_dsv4_hccl_a8f4_topology_derives_ffn_capacity_and_unused_devices():
     runner = _load_runner()
@@ -161,6 +167,28 @@ def test_dsv4_hccl_topology_rejects_invalid_deployment(
             attention_max_num_batched_tokens=1024,
             ffn_max_num_batched_tokens=ffn_tokens,
         )
+
+
+def test_dsv4_hccl_graph_topology_requires_equal_roles():
+    runner = _load_runner()
+
+    runner._validate_execution_topology(
+        connector="P2pHcclAFDConnector",
+        execution_mode="full-decode-only",
+        topology={"attention_ranks": 8, "ffn_ranks": 8},
+    )
+    with pytest.raises(ValueError, match="requires equal Attention and FFN"):
+        runner._validate_execution_topology(
+            connector="P2pHcclAFDConnector",
+            execution_mode="full-decode-only",
+            topology={"attention_ranks": 8, "ffn_ranks": 4},
+        )
+
+    runner._validate_execution_topology(
+        connector="P2pHcclAFDConnector",
+        execution_mode="eager",
+        topology={"attention_ranks": 8, "ffn_ranks": 4},
+    )
 
 
 def test_dsv4_performance_command_locks_workload_and_fixed_python(tmp_path):
@@ -376,7 +404,7 @@ def test_dsv4_runtime_manifest_records_graph_u1(monkeypatch):
     monkeypatch.setattr(runner.subprocess, "check_output", check_output)
 
     manifest = runner._runtime_manifest(
-        connector="CAMP2pAFDConnector",
+        connector="P2pHcclAFDConnector",
         execution_mode="full-decode-only",
         u_batches=1,
         dbo_decode_token_threshold=2,
@@ -385,6 +413,7 @@ def test_dsv4_runtime_manifest_records_graph_u1(monkeypatch):
     )
 
     assert manifest["execution_mode"] == "full-decode-only"
+    assert manifest["connector"] == "P2pHcclAFDConnector"
     assert manifest["u_batches"] == 1
     assert manifest["profile"] is True
     assert manifest["profile_role_ranks"] == [0]

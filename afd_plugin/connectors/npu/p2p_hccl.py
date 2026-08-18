@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
+import torch.distributed.distributed_c10d as c10d
 from torch.distributed.distributed_c10d import ProcessGroup
 from vllm.forward_context import DPMetadata, get_forward_context
 
@@ -48,6 +49,54 @@ from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+
+# torch-npu 2.10.0.post2 source:
+# torch_npu/dynamo/npugraph_ex/ops/_hcom_send_recv.py.
+# Its dist.send/recv tracing wrappers pass torch.Size directly, which the target
+# vLLM 0.23 compiler first flattens and then specializes despite a dynamic token
+# dimension. Keep the same HCCL lowering without the optional, unused shape.
+def _graph_hccl_send(
+    tensor: torch.Tensor,
+    *,
+    dst: int,
+    group: ProcessGroup,
+) -> None:
+    ranks = dist.get_process_group_ranks(group)
+    pg_tag = c10d._get_group_tag(group)
+    # ### PATCH START: avoid the torch-npu dynamic-shape tracing guard
+    torch.ops.npu_define._send.default(
+        tensor,
+        dst,
+        ranks,
+        pg_tag,
+        0,
+        None,
+        None,
+    )
+    # ### PATCH END: avoid the torch-npu dynamic-shape tracing guard
+
+
+def _graph_hccl_recv(
+    tensor: torch.Tensor,
+    *,
+    src: int,
+    group: ProcessGroup,
+) -> None:
+    ranks = dist.get_process_group_ranks(group)
+    pg_tag = c10d._get_group_tag(group)
+    # ### PATCH START: avoid the torch-npu dynamic-shape tracing guard
+    received = torch.ops.npu_define._recv.default(
+        tensor,
+        src,
+        ranks,
+        pg_tag,
+        0,
+        None,
+        None,
+    )
+    tensor.copy_(received)
+    # ### PATCH END: avoid the torch-npu dynamic-shape tracing guard
 
 
 @dataclass(slots=True)
@@ -265,7 +314,11 @@ class P2pHcclAFDConnector(AFDConnectorBase):
     ) -> torch.Tensor:
         self._require_initialized()
         group = self._data_group(ubatch_idx)
-        dist.recv(ref_tensor, src=self.mapping.subgroup_index, group=group)
+        self._recv_tensor(
+            ref_tensor,
+            src=self.mapping.subgroup_index,
+            group=group,
+        )
         # FFN processes layers in layer-major order (stage 0, then stage 1),
         # while each Attention DBO thread would otherwise continue directly
         # to the next layer. Yield after the blocking receive so the peer
@@ -295,7 +348,7 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         group = self._data_group(ubatch_idx)
         for source_rank, start, end in layout.peer_slices:
             peer_slice = hidden_states[start:end]
-            dist.recv(peer_slice, src=source_rank, group=group)
+            self._recv_tensor(peer_slice, src=source_rank, group=group)
         metadata = AFDTransferMetadata.create_ffn_metadata(
             layer_idx=layer_idx,
             stage_idx=ubatch_idx,
@@ -416,7 +469,22 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         group: ProcessGroup,
     ) -> None:
         send_tensor = tensor if tensor.is_contiguous() else tensor.contiguous()
+        if torch.compiler.is_compiling():
+            _graph_hccl_send(send_tensor, dst=dst, group=group)
+            return
         dist.send(send_tensor, dst=dst, group=group)
+
+    def _recv_tensor(
+        self,
+        tensor: torch.Tensor,
+        *,
+        src: int,
+        group: ProcessGroup,
+    ) -> None:
+        if torch.compiler.is_compiling():
+            _graph_hccl_recv(tensor, src=src, group=group)
+            return
+        dist.recv(tensor, src=src, group=group)
 
     def _hidden_recv_buffer(
         self,

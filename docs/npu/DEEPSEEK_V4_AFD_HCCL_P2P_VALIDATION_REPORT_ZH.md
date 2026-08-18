@@ -1,5 +1,7 @@
 # DeepSeek-V4 AFD 标准 HCCL P2P Connector 实现与验证报告
 
+> 状态说明（2026-08-18）：本文是首版 eager/U1、U2 验证快照。后续等量 A/F、`FULL_DECODE_ONLY`、U1 的 Graph 功能已经完成，当前状态与证据见 `DEEPSEEK_V4_AFD_HCCL_P2P_GRAPH_U1_VALIDATION_REPORT_ZH.md`；本文其余 eager 实验数据保持原样。
+
 ## 1. 结论
 
 `P2pHcclAFDConnector` 已在固定 A3 运行栈上完成首版实现和 eager 正确性闭环：
@@ -163,7 +165,7 @@ CPU/Mock 和 recipe 回归覆盖：
 本报告不宣称以下能力已经完成：
 
 - AFD 相对非 AFD 或 HCCL U2 相对 U1 的性能收益；
-- Graph/`FULL_DECODE_ONLY`；
+- 本报告当时尚未完成 Graph/`FULL_DECODE_ONLY`；后续等量 A/F 的 Graph/U1 已完成，Graph/U2、U3 和 Graph 非等量仍未支持；
 - A/F 非等量、TP/PP/CP/DCP 大于 1；
 - Attention-side gate、MTP、PD、sequence parallel；
 - A5 实机支持。

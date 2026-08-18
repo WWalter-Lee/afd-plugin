@@ -2509,12 +2509,24 @@ def test_dsv4_feature_validation_accepts_eager_hccl_p2p_a2f1():
     fail_if_unsupported_npu_afd_features(config)
 
 
-def test_dsv4_feature_validation_rejects_hccl_p2p_graph():
+def test_dsv4_feature_validation_accepts_hccl_p2p_full_decode_only_u1():
     config = _dsv4_config(cudagraph_mode="FULL_DECODE_ONLY")
     config.model_config.enforce_eager = False
     config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
 
-    with pytest.raises(RuntimeError, match="P2pHccl.*only eager"):
+    fail_if_unsupported_npu_afd_features(config)
+
+
+def test_dsv4_feature_validation_rejects_hccl_p2p_graph_a2f1():
+    config = _dsv4_config(cudagraph_mode="FULL_DECODE_ONLY")
+    config.model_config.enforce_eager = False
+    config.additional_config["afd"].update(
+        connector="P2pHcclAFDConnector",
+        num_attention_ranks=2,
+        num_ffn_ranks=1,
+    )
+
+    with pytest.raises(RuntimeError, match="graph execution requires equal"):
         fail_if_unsupported_npu_afd_features(config)
 
 

@@ -688,3 +688,37 @@ def test_p2p_hccl_module_has_no_camp2p_custom_op_reference():
 
     assert "torch.ops.vllm.afd_camp2p" not in source
     assert "torch.ops.afd_ascend" not in source
+
+
+def test_p2p_hccl_graph_lowering_omits_dynamic_shape_guard(monkeypatch):
+    calls = []
+
+    class FakeOp:
+        def default(self, *args):
+            calls.append(args)
+            return args[0]
+
+    monkeypatch.setattr(
+        hccl_module.torch,
+        "ops",
+        SimpleNamespace(
+            npu_define=SimpleNamespace(_send=FakeOp(), _recv=FakeOp()),
+        ),
+    )
+    monkeypatch.setattr(
+        hccl_module.dist,
+        "get_process_group_ranks",
+        lambda group: [0, 1] if group == "data-group" else pytest.fail(),
+    )
+    monkeypatch.setattr(
+        hccl_module.c10d,
+        "_get_group_tag",
+        lambda group: "afd-data" if group == "data-group" else pytest.fail(),
+    )
+    tensor = torch.zeros((2, 4), dtype=torch.bfloat16)
+
+    hccl_module._graph_hccl_send(tensor, dst=1, group="data-group")
+    hccl_module._graph_hccl_recv(tensor, src=0, group="data-group")
+
+    assert calls[0][1:] == (1, [0, 1], "afd-data", 0, None, None)
+    assert calls[1][1:] == (0, [0, 1], "afd-data", 0, None, None)

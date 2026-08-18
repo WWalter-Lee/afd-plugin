@@ -62,10 +62,6 @@ case "$EXECUTION_MODE" in
     EXECUTION_ARGS=(--enforce-eager)
     ;;
   full-decode-only)
-    if [[ "$AFD_CONNECTOR" == "P2pHcclAFDConnector" ]]; then
-      echo "P2pHcclAFDConnector currently supports only EXECUTION_MODE=eager" >&2
-      exit 2
-    fi
     read -r -a CAPTURE_SIZE_ARGS <<<"$CUDAGRAPH_CAPTURE_SIZES"
     EXECUTION_ARGS=(
       --max-cudagraph-capture-size "$MAX_CUDAGRAPH_CAPTURE_SIZE"

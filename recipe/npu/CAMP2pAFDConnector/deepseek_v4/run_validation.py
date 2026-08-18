@@ -540,6 +540,23 @@ def _set_topology_environment(topology: dict[str, Any]) -> None:
     )
 
 
+def _validate_execution_topology(
+    *,
+    connector: str,
+    execution_mode: str,
+    topology: dict[str, Any],
+) -> None:
+    if (
+        connector == "P2pHcclAFDConnector"
+        and execution_mode == "full-decode-only"
+        and topology["attention_ranks"] != topology["ffn_ranks"]
+    ):
+        raise ValueError(
+            "P2pHcclAFDConnector full-decode-only execution requires equal "
+            "Attention and FFN ranks",
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -597,8 +614,6 @@ def main() -> None:
 
     if args.u_batches == 2 and args.execution_mode != "eager":
         parser.error("DeepSeek-V4 U2 currently supports only eager execution")
-    if args.connector == "P2pHcclAFDConnector" and args.execution_mode != "eager":
-        parser.error("P2pHcclAFDConnector currently supports only eager execution")
     if args.dbo_decode_token_threshold < 0:
         parser.error("--dbo-decode-token-threshold must be non-negative")
     if args.dbo_prefill_token_threshold < 0:
@@ -610,6 +625,11 @@ def main() -> None:
             ffn_devices=args.ffn_devices,
             attention_max_num_batched_tokens=(args.attention_max_num_batched_tokens),
             ffn_max_num_batched_tokens=args.ffn_max_num_batched_tokens,
+        )
+        _validate_execution_topology(
+            connector=args.connector,
+            execution_mode=args.execution_mode,
+            topology=topology,
         )
     except ValueError as exc:
         parser.error(str(exc))
