@@ -250,7 +250,28 @@ AFD world        -> [F0 ... F(F-1), A0 ... A(A-1)]
 
 ## 5. A3 后续开发阶段
 
-每阶段独立提交、独立验证。上一阶段未通过时，不进入下一阶段。
+每阶段独立提交、独立验证。后续统一采用分级验收，不在每个功能阶段重复完整性能矩阵。
+
+### 5.0 分级验收策略
+
+| 级别 | 使用阶段 | 必须完成 | 不在本级完成 |
+|---|---|---|---|
+| F0 功能门禁 | 每个功能阶段 | CPU/Mock、NPU 组件、golden、batch、生命周期、fatal 日志和 NPU 清理 | 吞吐收益结论、全矩阵跑分和固定 profile |
+| P1 轻量性能 guard | 已能稳定 E2E 的中间阶段 | 单一固定负载的一次候选运行，检查成功率、OOM/timeout、HBM 和数量级回退 | 三轮统计、调参、正式收益结论和常规 profile |
+| P2 正式性能验收 | 功能组合闭环后的 A3-P8 | 完整公平对照、至少三轮、波动门禁、双侧 profile 和收益归因 | 不再引入新功能或同时改变多个变量 |
+
+F0 是进入下一功能阶段的硬门禁。P1 只负责尽早发现灾难性回退，不用于证明性能收益；建议固定 A8F8、C32、输入 1024 token、精确输出 128 token、128 请求，完成预热后只测 1 轮，并复用最近的同模式基线。P1 必须满足请求 100% 成功、无 OOM/timeout；若配置 U2，还必须实际观测到双 stage。若 output throughput 相对最近可比基线回退超过 20%，或 HBM/等待出现异常，则暂停扩大功能范围并先定位。单轮 P1 数据不得用于调整正式收益阈值，也不得写成“AFD 已有性能收益”。
+
+中间阶段不固定采集 profiler。只有 P1 出现超过 20% 的回退、异常 HCCL 等待、host 发射停顿或不明 HBM 增长时，才采集 Attention DP0 与 FFN DP0 的定向 profile；保持 `TORCH_PROFILER_WITH_STACK=0`，并使用与采集记录一致的 CANN 版本解析。功能阶段修复后只重跑 F0 和 P1，不补做完整 P2。
+
+P2 才回答最终问题“开启 AFD 和 microbatch 后是否有性能收益”。至少同时完成：
+
+- `HCCL P2P AFD U2` 对 `HCCL P2P AFD U1`：隔离 microbatch 的增量收益，并证明 U2 实际执行双 stage；
+- `HCCL P2P AFD U2` 对同总 NPU 预算的非 AFD：证明 AFD + microbatch 组合的整体收益；
+- eager 与 Graph 分开归因；Graph/U2 未完成前，只能声明 eager AFD + microbatch 的结论；
+- MTP off 先完成主结论，MTP on/off 作为独立维度报告 acceptance rate，不能把 speculative decoding 收益归因于 microbatch。
+
+P2 使用第 6 章的 concurrency、长度、三轮波动、延迟、HBM 和 `tokens/s/NPU` 门禁。128K 继续作为容量、TTFT 和 HBM 专项，不混入短输入 decode/microbatch 收益结论。
 
 | 阶段 | 主要交付 | 进入下一阶段的门禁 |
 |---|---|---|
@@ -264,15 +285,15 @@ AFD world        -> [F0 ... F(F-1), A0 ... A(A-1)]
 | A3-P7 | A8F8 同步 HCCL profiling、调优和公平性能验收 | 已取得 C32 +17.521% 旧栈候选收益；后续调优等待 MTP-M1/M2，之后补 C1/C8、冷服务重复与非 AFD 公平对照 |
 | A3-P7T | 迁移 vLLM 0.23 + `rfc/vllm_cann` | 功能已通过；U1/U2 三轮稳定，但 U2 回退 26.342%，只冻结功能兼容性 |
 | A3-P7G | 目标栈标准 HCCL P2P Graph/U1 | 已通过：A8F8、等量 A/F、`FULL_DECODE_ONLY`、30/30 golden、batch 1/8/32、两次冷启动、capture/replay、退出和清理通过 |
-| A3-P7M0 | 目标栈原生 MTP 基线与 AFD 协议设计 | 原生 MTP 启动、golden、权重 key、target hidden states、draft/verify/rejection 流程和 HBM 归属全部可复现；AFD 角色与消息契约冻结 |
-| A3-P7M1 | HCCL P2P eager/U1 + MTP | A8F8 等量拓扑、`num_speculative_tokens=1`，30/30 token IDs 对同栈原生 MTP golden 一致；proposal/accept 计数、batch、生命周期和清理通过 |
-| A3-P7M2 | HCCL P2P Graph/U1 + MTP | `FULL_DECODE_ONLY` capture/replay 通过；MTP on/off graph key 隔离，当前 step draft IDs/hidden 不固化，golden 和生命周期门禁通过 |
-| A3-P7M3 | MTP 能力扩展 | 按独立门禁依次评估更多 speculative token、eager/U2 和 eager 非等量拓扑；未通过项继续 fail-fast |
-| A3-P8 | 冻结目标栈 A3 HCCL 基线 | 功能 tag 与性能 tag 分开；报告、原始日志、trace、配置与清理证据齐全 |
+| A3-P7M0 | 目标栈原生 MTP 基线与 AFD 协议设计 | F0：原生 MTP 启动、golden、权重 key、target hidden states、draft/verify/rejection 流程和 HBM 归属可复现；AFD 角色与消息契约冻结；本阶段不做正式性能验收 |
+| A3-P7M1 | HCCL P2P eager/U1 + MTP | F0：A8F8 等量、`num_speculative_tokens=1`、30/30 golden、proposal/accept、batch、生命周期和清理通过；P1 单点 guard 通过 |
+| A3-P7M2 | HCCL P2P Graph/U1 + MTP | F0：capture/replay、MTP on/off graph key、当前 step draft state、golden 和生命周期通过；P1 单点 guard 通过 |
+| A3-P8 | 正式性能验收并冻结目标栈 A3 HCCL 基线 | P2：MTP-off 的 AFD U2 vs U1 和 AFD U2 vs 同预算非 AFD 三轮公平对照通过；MTP-on U1 独立报告；功能 tag 与性能 tag 分开，证据齐全 |
+| A3-P7M3 | MTP 能力扩展，不阻塞 P8 | 每个扩展分别通过 F0 + P1；按更多 speculative token、eager/U2 + MTP、eager 非等量 + MTP 顺序逐项解除门禁，分别追加 P2 对照 |
 
 ### 5.1 A3-P0：固定性能实验协议
 
-先锁定实验协议，再开始调优或改变拓扑。至少固定：
+先锁定实验协议，再开始调优或改变拓扑。以下“三轮”等正式统计要求只用于 P2；P1 使用 5.0 节的单点单轮 guard。至少固定：
 
 - prompt 集合和输入/输出长度；短请求、常规长上下文与 128K 能力点分开统计；
 - batch/concurrency 阶梯，至少保留 batch 1/8/32；
@@ -691,6 +712,8 @@ eager/U1 + MTP 完成后，才进入等量 A8F8、`FULL_DECODE_ONLY`、U1 + MTP�
 M1/M2 功能闭环后再恢复性能优化。性能矩阵新增同参数 native MTP on/off、HCCL P2P eager/U1 MTP on/off、HCCL P2P Graph/U1 MTP on/off；除吞吐、TTFT、TPOT 和 HBM 外，必须报告 proposal tokens/s、acceptance rate、accepted tokens/s 和每个最终 token 的 HCCL/计算成本。只有最终输出 token 吞吐收益超过三轮波动，才能宣称 MTP 带来性能收益。
 
 ## 6. A3 性能验收方法
+
+本章定义 P2 正式性能验收，只在目标功能组合完成后执行。中间功能阶段只运行 5.0 节定义的 F0 与 P1，不重复本章完整矩阵。
 
 ### 6.1 比较矩阵
 
