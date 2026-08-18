@@ -114,6 +114,6 @@ Attention 日志确认：
 
 ## 6. 下一步
 
-先将当前实现冻结为 HCCL P2P Graph/U1 功能基线，再进入性能阶段。性能比较至少包含同参数非 AFD Graph、HCCL P2P eager/U1 和 HCCL P2P Graph/U1，并分别采集 Attention DP0、FFN DP0 profile，检查 host 发射、等待、graph replay 和 HCCL 时间。
+当前实现已经由 tag `dsv4-afd-v023-hccl-graph-u1-v1` 冻结为 HCCL P2P Graph/U1 功能基线。下一功能阶段是 MTP：先建立目标栈原生 MTP golden 和 AFD 权重/消息契约，再依次完成 HCCL P2P eager/U1 + MTP 与 Graph/U1 + MTP；当前 MTP 门禁继续保留。
 
-Graph/U2、Graph/U3 和 Graph 非等量拓扑均作为后续独立功能里程碑；在 Graph/U1 性能与稳定性解释清楚前不提前开启。当前阶段继续使用阻塞式同步 HCCL，不引入 `isend/irecv`、后台通信线程或异步自定义 op。
+MTP 功能闭环后再进入性能阶段。性能比较至少包含同参数非 AFD Graph、HCCL P2P eager/U1 和 HCCL P2P Graph/U1，并为每种模式增加 MTP on/off 对照及 acceptance rate。Graph/U2、Graph/U3 和 Graph 非等量拓扑均作为后续独立功能里程碑。当前阶段继续使用阻塞式同步 HCCL，不引入 `isend/irecv`、后台通信线程或异步自定义 op。
