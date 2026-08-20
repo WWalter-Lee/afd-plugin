@@ -560,11 +560,15 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
     ) -> torch.Tensor | None:
         if self.vllm_config.speculative_config is None:
             return None
-        if stage_ids != [0]:
-            raise RuntimeError("DSV4 AFD MTP supports only U1")
+        if stage_ids not in ([0], [0, 1]):
+            raise RuntimeError(
+                "DSV4 AFD MTP requires target decoder stages [0] or [0, 1]"
+            )
         if self.mtp_ffn_model is None:
             raise RuntimeError("DSV4 AFD MTP FFN model is not loaded")
 
+        # The target decoder may run U2, but the upstream proposer consumes the
+        # merged target output and executes one full-batch MTP phase.
         stage_idx = 0
         header = self.connector.recv_mtp_header(stage_idx=stage_idx)
         payload = self.connector.recv_attn_output(

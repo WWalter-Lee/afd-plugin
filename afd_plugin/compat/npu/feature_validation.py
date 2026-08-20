@@ -179,14 +179,20 @@ def _fail_if_unsupported_deepseek_v4_features(
             raise RuntimeError("DeepSeek-V4 AFD MTP supports only P2pHcclAFDConnector")
         if afd_config.num_attention_ranks != afd_config.num_ffn_ranks:
             raise RuntimeError("DeepSeek-V4 AFD MTP requires equal A/F ranks")
-        if bool(getattr(parallel_config, "use_ubatching", False)):
-            raise RuntimeError("DeepSeek-V4 AFD MTP supports only U1")
         if getattr(speculative_config, "method", None) != "mtp":
             raise RuntimeError("DeepSeek-V4 AFD supports only MTP speculative method")
         if int(getattr(speculative_config, "num_speculative_tokens", 0)) != 1:
             raise RuntimeError("DeepSeek-V4 AFD MTP supports num_speculative_tokens=1")
         draft_enforce_eager = bool(getattr(speculative_config, "enforce_eager", False))
         target_enforce_eager = bool(vllm_config.model_config.enforce_eager)
+        if (
+            bool(getattr(parallel_config, "use_ubatching", False))
+            and not target_enforce_eager
+        ):
+            raise RuntimeError(
+                "DeepSeek-V4 AFD MTP target Graph/U2 is not validated; "
+                "use eager/U2 or Graph/U1"
+            )
         if target_enforce_eager and not draft_enforce_eager:
             raise RuntimeError(
                 "DeepSeek-V4 AFD MTP eager execution requires draft enforce_eager=true"

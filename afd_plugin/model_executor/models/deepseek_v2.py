@@ -202,9 +202,13 @@ class RemoteFFNProxy(nn.Module):
                 hidden_states,
                 role="attention",
             )
+        recv_kwargs = {}
+        if self.phase != "decoder":
+            recv_kwargs["phase"] = self.phase
         return connector.recv_ffn_output(
             ref_tensor=hidden_states,
             ubatch_idx=stage_idx,
+            **recv_kwargs,
         )
 
 

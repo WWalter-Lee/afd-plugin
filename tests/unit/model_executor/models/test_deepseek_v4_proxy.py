@@ -45,8 +45,8 @@ class _LoopbackConnector:
     def send_attn_output(self, hidden_states, context, **kwargs):
         self.sent.append((hidden_states.clone(), context, kwargs))
 
-    def recv_ffn_output(self, *, ref_tensor, ubatch_idx):
-        self.received.append((ref_tensor, ubatch_idx))
+    def recv_ffn_output(self, *, ref_tensor, ubatch_idx, **kwargs):
+        self.received.append((ref_tensor, ubatch_idx, kwargs))
         return self.ffn_layer.compute_ffn_output(self.sent[-1][0])
 
 
@@ -202,3 +202,4 @@ def test_mtp_remote_moe_does_not_require_or_send_input_ids(monkeypatch):
     assert context.metadata.layer_idx == 0
     assert "input_ids" not in send_kwargs
     assert send_kwargs["num_tokens_across_dp"].tolist() == [3]
+    assert connector.received[0][2] == {"phase": "mtp"}

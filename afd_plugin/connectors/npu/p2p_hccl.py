@@ -368,9 +368,7 @@ class P2pHcclAFDConnector(AFDConnectorBase):
             # Standalone connector component tests intentionally run without
             # a vLLM model forward context and must retain the synchronous path.
             return False
-        graph_ubatching = bool(
-            getattr(forward_context, "afd_graph_ubatching", False)
-        )
+        graph_ubatching = bool(getattr(forward_context, "afd_graph_ubatching", False))
         layer_major = bool(getattr(forward_context, "afd_layer_major_u2", False))
         return bool(
             (not graph_ubatching or layer_major)
@@ -484,7 +482,8 @@ class P2pHcclAFDConnector(AFDConnectorBase):
     ) -> torch.Tensor:
         self._require_initialized()
         group = self._data_group(ubatch_idx)
-        if self._attention_stream_pipeline_active():
+        phase = str(kwargs.get("phase", "decoder"))
+        if self._attention_stream_pipeline_active() and phase == "decoder":
             return self._enqueue_attention_receive(
                 ref_tensor,
                 stage_idx=ubatch_idx,
@@ -500,7 +499,8 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         # while each Attention DBO thread would otherwise continue directly
         # to the next layer. Yield after the blocking receive so the peer
         # stage can send the current layer before this stage sends layer + 1.
-        maybe_apply_dbo_yield(ref_tensor, role="attention")
+        if phase == "decoder":
+            maybe_apply_dbo_yield(ref_tensor, role="attention")
         return ref_tensor
 
     def _enqueue_attention_send(
@@ -1132,13 +1132,15 @@ class P2pHcclAFDConnector(AFDConnectorBase):
             raise RuntimeError(
                 "DSV4 HCCL P2P MTP supports only layer 0/speculative step 0"
             )
+        if metadata.stage_idx != 0:
+            raise RuntimeError("DSV4 HCCL P2P MTP uses the merged proposal on stage 0")
         self._validate_receive_capacity(metadata.total_tokens)
 
     def _validate_mtp_topology(self) -> None:
         if self.attn_size != self.ffn_size or self.ratio != 1:
             raise RuntimeError("DSV4 HCCL P2P MTP requires equal A/F ranks")
-        if len(self.data_pg_list) != 1:
-            raise RuntimeError("DSV4 HCCL P2P MTP requires U1")
+        if len(self.data_pg_list) not in (1, 2):
+            raise RuntimeError("DSV4 HCCL P2P MTP supports target decoder U1 or U2")
 
     def _validate_mtp_header_values(
         self,

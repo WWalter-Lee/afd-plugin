@@ -211,7 +211,7 @@ def test_p2p_hccl_attention_sends_ids_before_hidden(monkeypatch):
 def test_p2p_hccl_mtp_sends_fixed_header_before_moe_input(
     monkeypatch,
 ):
-    connector = _connector(role="attention", mtp=True)
+    connector = _connector(role="attention", num_ubatches=2, mtp=True)
     events = []
     monkeypatch.setattr(
         hccl_module.dist,
@@ -235,6 +235,39 @@ def test_p2p_hccl_mtp_sends_fixed_header_before_moe_input(
     assert header[1:].tolist() == [0, 3, 1, 3]
     assert events[1][1:] == (0, connector.data_pg_list[0])
     assert events[1][0].shape == (3, 4)
+
+
+def test_p2p_hccl_mtp_u2_uses_sync_stage_zero_receive(monkeypatch):
+    connector = _connector(role="attention", num_ubatches=2, mtp=True)
+    connector.a2f_send_stream = object()
+    connector.f2a_recv_stream = object()
+    connector.attention_pipeline_events = {(0, 0): object()}
+    monkeypatch.setattr(
+        hccl_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(dbo_enabled=True, num_ubatches=2),
+    )
+    calls = []
+    monkeypatch.setattr(
+        connector,
+        "_enqueue_attention_receive",
+        lambda *_args, **_kwargs: pytest.fail("MTP must not enter decoder pipeline"),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_recv_tensor",
+        lambda tensor, *, src, group: calls.append((tensor, src, group)),
+    )
+    hidden = torch.empty((3, 4), dtype=torch.bfloat16)
+
+    output = connector.recv_ffn_output(
+        hidden,
+        ubatch_idx=0,
+        phase="mtp",
+    )
+
+    assert output is hidden
+    assert calls == [(hidden, 0, connector.data_pg_list[0])]
 
 
 def test_p2p_hccl_mtp_header_uses_graph_send_while_compiling(monkeypatch):
@@ -734,16 +767,12 @@ def test_p2p_hccl_capture_uses_graph_send_recv(monkeypatch):
     monkeypatch.setattr(
         hccl_module,
         "_graph_hccl_send",
-        lambda tensor, *, dst, group: graph_calls.append(
-            ("send", tensor, dst, group)
-        ),
+        lambda tensor, *, dst, group: graph_calls.append(("send", tensor, dst, group)),
     )
     monkeypatch.setattr(
         hccl_module,
         "_graph_hccl_recv",
-        lambda tensor, *, src, group: graph_calls.append(
-            ("recv", tensor, src, group)
-        ),
+        lambda tensor, *, src, group: graph_calls.append(("recv", tensor, src, group)),
     )
     monkeypatch.setattr(
         hccl_module.dist,

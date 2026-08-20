@@ -67,8 +67,8 @@ case "$ENABLE_MTP" in
       echo "DeepSeek-V4 MTP requires P2pHcclAFDConnector" >&2
       exit 2
     fi
-    if [[ "$U_BATCHES" != "1" ]]; then
-      echo "DeepSeek-V4 MTP requires U1" >&2
+    if [[ "$EXECUTION_MODE" == "full-decode-only" && "$U_BATCHES" != "1" ]]; then
+      echo "DeepSeek-V4 MTP target Graph/U2 is not validated" >&2
       exit 2
     fi
     if [[ "$ATTENTION_RANKS" != "$FFN_RANKS" ]]; then

@@ -287,9 +287,21 @@ def _role_log_gate(log_dir: Path) -> dict[str, Any]:
     }
 
 
-def _ubatch_execution_gate(log_dir: Path, u_batches: int) -> dict[str, Any]:
-    """Require runtime evidence that both requested U2 stages executed."""
-    required = u_batches == 2
+def _ubatch_execution_gate(
+    log_dir: Path,
+    u_batches: int,
+    *,
+    enable_mtp: bool = False,
+    batch_sizes: list[int] | None = None,
+    data_parallel_size: int = 1,
+) -> dict[str, Any]:
+    """Validate U2 execution or the intentional low-concurrency MTP fallback."""
+    batch_sizes = batch_sizes or []
+    mtp_u2_min_batch = 2 * data_parallel_size
+    fallback_expected = bool(
+        u_batches == 2 and enable_mtp and max(batch_sizes, default=0) < mtp_u2_min_batch
+    )
+    required = u_batches == 2 and not fallback_expected
     log_path = log_dir / "attention.log"
     text = (
         log_path.read_text(encoding="utf-8", errors="replace")
@@ -302,7 +314,9 @@ def _ubatch_execution_gate(log_dir: Path, u_batches: int) -> dict[str, Any]:
     return {
         "required": required,
         "observed_two_stages": observed,
-        "passed": not required or observed,
+        "mtp_request_boundary_fallback_expected": fallback_expected,
+        "mtp_u2_min_batch": mtp_u2_min_batch if enable_mtp else None,
+        "passed": (not observed) if fallback_expected else (not required or observed),
     }
 
 
@@ -620,8 +634,8 @@ def _validate_execution_topology(
         raise ValueError("DeepSeek-V4 MTP requires P2pHcclAFDConnector")
     if execution_mode not in {"eager", "full-decode-only"}:
         raise ValueError("DeepSeek-V4 MTP requires eager or full-decode-only execution")
-    if u_batches != 1:
-        raise ValueError("DeepSeek-V4 MTP requires U1")
+    if execution_mode == "full-decode-only" and u_batches != 1:
+        raise ValueError("DeepSeek-V4 MTP target Graph/U2 is not validated")
     if topology["attention_ranks"] != topology["ffn_ranks"]:
         raise ValueError("DeepSeek-V4 MTP requires equal Attention/FFN ranks")
     if mtp_num_speculative_tokens != 1:
@@ -834,6 +848,9 @@ def main() -> None:
                 cycle_result["ubatch_gate"] = _ubatch_execution_gate(
                     cycle_dir,
                     args.u_batches,
+                    enable_mtp=args.enable_mtp,
+                    batch_sizes=args.batch_sizes,
+                    data_parallel_size=topology["attention_ranks"],
                 )
                 profile_passed = True
                 if profile_dir is not None:

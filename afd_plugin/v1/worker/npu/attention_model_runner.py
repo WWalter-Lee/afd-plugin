@@ -242,6 +242,13 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         self._afd_live_execution = False
         self.ubatch_slices = None
         self._afd_unpadded_tokens_across_dp: torch.Tensor | None = None
+        self._afd_request_boundary_stage_counts_across_dp: (
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+            ]
+            | None
+        ) = None
         self._afd_logged_metadata_stage_counts: set[int] = set()
         self.prof = create_afd_npu_profiler("attention", role_rank=rank)
 
@@ -397,6 +404,30 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             num_tokens_padded,
             num_reqs_padded,
         )
+        # MTP target verification schedules the target token and its draft
+        # token as one request.  Splitting those two tokens across stages
+        # changes the quantized/sparse-attention kernel shape and can change
+        # exact token results.  Keep every request intact while retaining U2
+        # across independent requests.
+        mtp_request_boundary_u2 = bool(
+            self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and isinstance(self.connector, P2pHcclAFDConnector)
+            and self.vllm_config.parallel_config.num_ubatches == 2
+        )
+        if mtp_request_boundary_u2 and ubatch_slices is not None:
+            if num_scheduled_tokens_np is None:
+                raise RuntimeError(
+                    "DSV4 HCCL MTP U2 requires per-request scheduled token counts"
+                )
+            request_boundary_slices = create_request_boundary_ubatch_slices(
+                num_scheduled_tokens_np,
+            )
+            if request_boundary_slices is None:
+                raise RuntimeError(
+                    "DSV4 HCCL MTP U2 requires at least two non-empty requests"
+                )
+            ubatch_slices = request_boundary_slices
         if self.afd_async_extra_info.async_moe_ubatching:
             self.ubatch_slices = None
             return self._build_attention_metadata_with_async_moe_ubatches(
@@ -1560,23 +1591,51 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         )
 
         if ubatch_slices and len(ubatch_slices) > 1:
-            unpadded_counts = getattr(
+            request_boundary_counts = getattr(
                 self,
-                "_afd_unpadded_tokens_across_dp",
+                "_afd_request_boundary_stage_counts_across_dp",
                 None,
             )
-            control_metadata = (
-                AFDDPMetadata(num_tokens_across_dp_cpu=unpadded_counts)
-                if unpadded_counts is not None
-                else dp_metadata
-            )
-            dp_metadata_list = _build_ubatch_control_metadata(
-                control_metadata,
-                ubatch_slices,
-                dp_size=int(
-                    self.vllm_config.parallel_config.data_parallel_size,
-                ),
-            )
+            if request_boundary_counts is not None:
+                dp_rank = int(self.vllm_config.parallel_config.data_parallel_rank)
+                for stage_idx, (ubatch_slice, stage_counts) in enumerate(
+                    zip(
+                        ubatch_slices,
+                        request_boundary_counts,
+                        strict=True,
+                    )
+                ):
+                    local_expected = int(stage_counts[dp_rank].item())
+                    if int(ubatch_slice.num_tokens) != local_expected:
+                        raise RuntimeError(
+                            "DSV4 HCCL MTP U2 request-boundary metadata mismatch: "
+                            f"stage={stage_idx} local={int(ubatch_slice.num_tokens)} "
+                            f"synced={local_expected}"
+                        )
+                dp_metadata_list = {
+                    stage_idx: AFDDPMetadata(
+                        num_tokens_across_dp_cpu=stage_counts,
+                    )
+                    for stage_idx, stage_counts in enumerate(request_boundary_counts)
+                }
+            else:
+                unpadded_counts = getattr(
+                    self,
+                    "_afd_unpadded_tokens_across_dp",
+                    None,
+                )
+                control_metadata = (
+                    AFDDPMetadata(num_tokens_across_dp_cpu=unpadded_counts)
+                    if unpadded_counts is not None
+                    else dp_metadata
+                )
+                dp_metadata_list = _build_ubatch_control_metadata(
+                    control_metadata,
+                    ubatch_slices,
+                    dp_size=int(
+                        self.vllm_config.parallel_config.data_parallel_size,
+                    ),
+                )
         else:
             dp_metadata = self._ensure_dp_metadata(dp_metadata)
             dp_metadata_list = {0: dp_metadata}
@@ -1668,7 +1727,6 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         enable_layer_major_eager_u2 = bool(
             isinstance(connector, P2pHcclAFDConnector)
             and connector.stream_overlap_enabled
-            and not connector.requires_mtp
             and callable(
                 getattr(model, "forward_ubatches_layer_major", None),
             )
@@ -1727,6 +1785,24 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     num_metadata_builders=2,
                 )
 
+    def _apply_local_request_boundary_gate(
+        self,
+        should_ubatch: bool,
+        *,
+        num_tokens: int,
+        stage0_tokens: int | None,
+    ) -> bool:
+        if stage0_tokens is None:
+            return should_ubatch
+        stage1_tokens = num_tokens - stage0_tokens
+        should_ubatch = bool(should_ubatch and stage0_tokens > 0 and stage1_tokens > 0)
+        if should_ubatch:
+            self._afd_request_boundary_stage_counts_across_dp = (
+                torch.full((self.dp_size,), stage0_tokens, dtype=torch.int32),
+                torch.full((self.dp_size,), stage1_tokens, dtype=torch.int32),
+            )
+        return should_ubatch
+
     def _sync_afd_metadata_across_dp(
         self,
         num_tokens_unpadded: int,
@@ -1735,8 +1811,10 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         is_draft_model: bool = False,
         cudagraph_mode: CUDAGraphMode | None = None,
         allow_dp_padding: bool = False,
+        request_boundary_stage0_tokens: int | None = None,
     ) -> tuple[bool, int, torch.Tensor | None, CUDAGraphMode]:
         self._afd_unpadded_tokens_across_dp = None
+        self._afd_request_boundary_stage_counts_across_dp = None
         if cudagraph_mode is None:
             cudagraph_mode = CUDAGraphMode.NONE
         if num_tokens_padded is None:
@@ -1753,6 +1831,11 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 num_tokens_padded,
                 uniform_decode=uniform_decode,
                 vllm_config=self.vllm_config,
+            )
+            should_ubatch = self._apply_local_request_boundary_gate(
+                should_ubatch,
+                num_tokens=num_tokens_unpadded,
+                stage0_tokens=request_boundary_stage0_tokens,
             )
             return should_ubatch, num_tokens_padded, None, cudagraph_mode
 
@@ -1772,6 +1855,11 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 num_tokens_padded,
                 uniform_decode=uniform_decode,
                 vllm_config=self.vllm_config,
+            )
+            should_ubatch = self._apply_local_request_boundary_gate(
+                should_ubatch,
+                num_tokens=num_tokens_unpadded,
+                stage0_tokens=request_boundary_stage0_tokens,
             )
             return (
                 should_ubatch,
@@ -1803,19 +1891,25 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 uniform_decode=uniform_decode,
                 vllm_config=self.vllm_config,
             )
+            should_ubatch = self._apply_local_request_boundary_gate(
+                should_ubatch,
+                num_tokens=num_tokens_unpadded,
+                stage0_tokens=request_boundary_stage0_tokens,
+            )
             return (
                 should_ubatch,
                 num_tokens_padded,
                 num_tokens_after_padding,
                 cudagraph_mode,
             )
-        packed_tensor = torch.zeros(4, self.dp_size, device="cpu", dtype=torch.int32)
+        packed_tensor = torch.zeros(5, self.dp_size, device="cpu", dtype=torch.int32)
         packed_tensor[0][self.dp_rank] = num_tokens_unpadded
         packed_tensor[1][self.dp_rank] = num_tokens_padded
         packed_tensor[2][self.dp_rank] = cudagraph_mode.value
         # A mixed prefill/decode rank must make every EP peer use the prefill
         # threshold so all ranks execute the same number of FFN stages.
         packed_tensor[3][self.dp_rank] = int(uniform_decode)
+        packed_tensor[4][self.dp_rank] = int(request_boundary_stage0_tokens or 0)
         dist.all_reduce(packed_tensor, group=get_dp_group().cpu_group)
 
         num_tokens_unpadded_across_dp = packed_tensor[0, :]
@@ -1827,6 +1921,14 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         min_tokens_across_dp = int(num_tokens_unpadded_across_dp.min().item())
         synced_cudagraph_mode = CUDAGraphMode(int(packed_tensor[2, :].min().item()))
         synced_uniform_decode = bool(packed_tensor[3, :].min().item())
+        request_boundary_ready = True
+        if request_boundary_stage0_tokens is not None:
+            stage0_counts = packed_tensor[4, :].cpu().clone()
+            stage1_counts = num_tokens_unpadded_across_dp.cpu() - stage0_counts
+            request_boundary_ready = bool(
+                torch.all(stage0_counts > 0).item()
+                and torch.all(stage1_counts > 0).item()
+            )
 
         should_ubatch = check_enable_ubatch(
             min_tokens_across_dp,
@@ -1834,6 +1936,12 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             uniform_decode=synced_uniform_decode,
             vllm_config=self.vllm_config,
         )
+        should_ubatch = should_ubatch and request_boundary_ready
+        if should_ubatch and request_boundary_stage0_tokens is not None:
+            self._afd_request_boundary_stage_counts_across_dp = (
+                stage0_counts,
+                stage1_counts,
+            )
 
         if allow_dp_padding or is_draft_model or should_ubatch:
             num_tokens_after_padding = torch.tensor(
@@ -1929,6 +2037,22 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             )
 
         should_ubatch, num_tokens_across_dp = False, None
+        mtp_request_boundary_u2 = bool(
+            self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and isinstance(self.connector, P2pHcclAFDConnector)
+            and self.vllm_config.parallel_config.num_ubatches == 2
+        )
+        request_boundary_slices = (
+            create_request_boundary_ubatch_slices(num_scheduled_tokens_np)
+            if mtp_request_boundary_u2
+            else None
+        )
+        request_boundary_stage0_tokens = (
+            int(request_boundary_slices[0].num_tokens)
+            if request_boundary_slices is not None
+            else (0 if mtp_request_boundary_u2 else None)
+        )
         # ### PATCH START: AFD DP metadata synchronization
         if self.vllm_config.parallel_config.data_parallel_size > 1:
             should_ubatch, _, num_tokens_across_dp, synced_cudagraph_mode = (
@@ -1941,6 +2065,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     or enable_sp(self.vllm_config)
                     or oproj_tp_enable()
                     or embedding_tp_enable(),
+                    request_boundary_stage0_tokens=request_boundary_stage0_tokens,
                 )
             )
             if num_tokens_across_dp is not None:
@@ -1958,6 +2083,13 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 uniform_decode=uniform_decode,
                 vllm_config=self.vllm_config,
             )
+            if mtp_request_boundary_u2:
+                stage0_tokens = int(request_boundary_stage0_tokens or 0)
+                should_ubatch = self._apply_local_request_boundary_gate(
+                    should_ubatch,
+                    num_tokens=num_tokens,
+                    stage0_tokens=stage0_tokens,
+                )
         # ### PATCH END: AFD DP metadata synchronization
         # ### PATCH START: AFD live NPU microbatching
         if not (allow_microbatching or self._afd_live_execution):

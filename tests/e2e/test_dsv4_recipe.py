@@ -134,7 +134,7 @@ def test_dsv4_role_scripts_offer_u1_graph_and_eager_u2():
         assert '"enforce_eager":%s' in script
         assert '"${MTP_ARGS[@]}"' in script
         assert "MTP requires P2pHcclAFDConnector" in script
-        assert "MTP requires U1" in script
+        assert "MTP target Graph/U2 is not validated" in script
         assert "MTP requires equal Attention/FFN ranks" in script
         assert "MTP supports exactly one speculative token" in script
         assert "graph U2 requires P2pHcclAFDConnector" in script
@@ -332,6 +332,14 @@ def test_dsv4_hccl_mtp_m2_topology_gate_and_environment(monkeypatch):
     )
     runner._validate_execution_topology(
         connector="P2pHcclAFDConnector",
+        execution_mode="eager",
+        u_batches=2,
+        enable_mtp=True,
+        mtp_num_speculative_tokens=1,
+        topology=topology,
+    )
+    runner._validate_execution_topology(
+        connector="P2pHcclAFDConnector",
         execution_mode="full-decode-only",
         u_batches=1,
         enable_mtp=True,
@@ -347,7 +355,10 @@ def test_dsv4_hccl_mtp_m2_topology_gate_and_environment(monkeypatch):
 
     invalid_cases = [
         ({"connector": "CAMP2pAFDConnector"}, "P2pHcclAFDConnector"),
-        ({"u_batches": 2}, "requires U1"),
+        (
+            {"execution_mode": "full-decode-only", "u_batches": 2},
+            "target Graph/U2 is not validated",
+        ),
         (
             {"topology": {"attention_ranks": 8, "ffn_ranks": 4}},
             "equal Attention/FFN",
@@ -544,9 +555,13 @@ def test_dsv4_performance_mtp_uses_m1_gate_and_environment(monkeypatch):
     assert topology["ffn_devices"] == list(range(8, 16))
 
     args.u_batches = 2
-    with pytest.raises(ValueError, match="requires U1"):
+    runner._validate_execution_args(args)
+
+    args.execution_mode = "full-decode-only"
+    with pytest.raises(ValueError, match="target Graph/U2 is not validated"):
         runner._validate_execution_args(args)
 
+    args.execution_mode = "eager"
     args.u_batches = 1
     args.mtp_num_speculative_tokens = 2
     with pytest.raises(ValueError, match="exactly one speculative token"):
@@ -999,25 +1014,37 @@ def test_dsv4_log_gate_reports_missing_role_log(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("u_batches", "attention_log", "expected"),
+    ("u_batches", "attention_log", "kwargs", "expected"),
     [
-        (1, "key=((0, (8,)),)\n", True),
-        (2, "key=((0, (8,)),)\n", False),
-        (2, "key=((0, (4,)), (1, (4,)))\n", True),
+        (1, "key=((0, (8,)),)\n", {}, True),
+        (2, "key=((0, (8,)),)\n", {}, False),
+        (2, "key=((0, (4,)), (1, (4,)))\n", {}, True),
+        (
+            2,
+            "key=((0, (16,)),)\n",
+            {"enable_mtp": True, "batch_sizes": [1], "data_parallel_size": 8},
+            True,
+        ),
+        (
+            2,
+            "key=((0, (8,)),)\n",
+            {"enable_mtp": True, "batch_sizes": [16], "data_parallel_size": 8},
+            False,
+        ),
     ],
 )
 def test_dsv4_ubatch_gate_requires_two_stage_runtime_evidence(
     tmp_path,
     u_batches,
     attention_log,
+    kwargs,
     expected,
 ):
     runner = _load_runner()
     (tmp_path / "attention.log").write_text(attention_log, encoding="utf-8")
 
-    result = runner._ubatch_execution_gate(tmp_path, u_batches)
+    result = runner._ubatch_execution_gate(tmp_path, u_batches, **kwargs)
 
-    assert result["required"] is (u_batches == 2)
     assert result["passed"] is expected
 
 

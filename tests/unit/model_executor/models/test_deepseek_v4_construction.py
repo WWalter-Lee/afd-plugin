@@ -290,7 +290,11 @@ def test_attention_target_allocates_mtp_hidden_buffer_only_when_enabled(
     assert model._mtp_hidden_buffer.dtype == torch.bfloat16
 
 
-def test_attention_layer_major_u2_runs_layer_then_stage(monkeypatch):
+@pytest.mark.parametrize("mtp_enabled", [False, True])
+def test_attention_layer_major_u2_runs_layer_then_stage(
+    monkeypatch,
+    mtp_enabled,
+):
     events = []
     active_context = [None]
 
@@ -342,7 +346,9 @@ def test_attention_layer_major_u2_runs_layer_then_stage(monkeypatch):
     model = object.__new__(adapter.AFDDeepseekV4Model)
     nn.Module.__init__(model)
     model.afd_role = "attention"
-    model.mtp_enabled = False
+    model.mtp_enabled = mtp_enabled
+    if mtp_enabled:
+        model._mtp_hidden_buffer = torch.empty((3, 1), dtype=torch.float32)
     model.hc_mult = 1
     model.start_layer = 0
     model.end_layer = 2
@@ -408,6 +414,8 @@ def test_attention_layer_major_u2_runs_layer_then_stage(monkeypatch):
         metadata[stage_idx].context.forward_context.afd_layer_major_u2
         for stage_idx in range(2)
     )
+    if mtp_enabled:
+        assert model._mtp_hidden_buffer.tolist() == [[4.0], [5.0], [13.0]]
 
 
 @pytest.mark.parametrize("role", ["attention", "ffn"])

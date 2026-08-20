@@ -16,19 +16,21 @@ Supported execution boundary:
 - A8F8 one-to-one deployment and A2F1/A4F2 component topologies;
 - integer-multiple topology contract `A >= F` and `A % F == 0`;
 - eager U1 or eager U2, including the integer-multiple topologies above;
-- `FULL_DECODE_ONLY` Graph U1 for equal Attention/FFN rank counts;
-- eager U1 + MTP for A8F8, one MTP layer, and one speculative token;
-- Graph U2, Graph with unequal Attention/FFN ranks, Graph/U2/unequal MTP,
-  multiple speculative tokens, PD, sequence parallelism, and Attention-side
-  gate are disabled.
+- `FULL_DECODE_ONLY` Graph U1 or U2 for equal Attention/FFN rank counts;
+- eager U1 or U2 + MTP for A8F8, one MTP layer, and one speculative token;
+- target Graph U1 + eager draft MTP for the same MTP boundary;
+- Graph with unequal Attention/FFN ranks, target Graph/U2 + MTP, full draft
+  Graph, unequal MTP, multiple speculative tokens, PD, sequence parallelism,
+  and Attention-side gate are disabled.
 
 The public communication API remains synchronous: every eager transfer still
 calls blocking `torch.distributed.send/recv`. Eager U2 additionally uses
 connector-owned NPU send/receive/compute streams and events to order device
 work across the two stages. DeepSeek-V4 drives the stages from one layer-major
 host loop; it does not use `isend/irecv`, background transfer threads, or an
-asynchronous custom HCCL op. U1, Graph U1, and MTP retain their existing
-execution paths.
+asynchronous custom HCCL op. U1 and Graph U1 retain their existing execution
+paths. Under MTP/U2 only the target decoder uses two stages; the merged MTP
+proposal remains one synchronous phase.
 
 Under Graph U1, torch-npu lowers the hidden-state `send/recv` calls into the
 ACL Graph. Input IDs remain on the one-shot HCCL side channel before capture or
@@ -63,6 +65,23 @@ python recipe/npu/P2pHcclAFDConnector/deepseek_v4/run_validation.py \
   --output-dir /mnt/workspace/validation/dsv4_afd_v023_hccl_mtp_m1_<timestamp>
 ```
 
+Run an eager U2 + MTP correctness gate:
+
+```bash
+source tools/dsv4/activate_v023_vllm_cann_runtime.sh
+python recipe/npu/P2pHcclAFDConnector/deepseek_v4/run_validation.py \
+  --enable-mtp --execution-mode eager --u-batches 2 \
+  --dbo-decode-token-threshold 2 --dbo-prefill-token-threshold 12 \
+  --golden /mnt/workspace/validation/dsv4_v023_vllm_cann_native_baseline/golden_results.json \
+  --cycles 1 --idle-seconds 0 --rounds 3 --batch-sizes 1 8 32 \
+  --output-dir /mnt/workspace/validation/dsv4_afd_v023_hccl_mtp_u2_<timestamp>
+```
+
+MTP/U2 splits the target decoder only at request boundaries. If any DP rank
+cannot form two non-empty request stages, all ranks fall back to U1 for that
+step. With DP8, batch sizes below 16 therefore exercise the fallback; batch 16
+or 32 is required to validate a real two-stage MTP target run.
+
 Run a U1 smoke validation:
 
 ```bash
@@ -84,10 +103,12 @@ python recipe/npu/P2pHcclAFDConnector/deepseek_v4/run_validation.py \
   --output-dir /mnt/workspace/validation/dsv4_afd_hccl_p2p_u2_$(date +%Y%m%d_%H%M%S)
 ```
 
-The HCCL connector rejects Graph U2, Graph with unequal rank counts, `A < F`,
-and non-integer A/F ratios. The shared validator records the selected connector
-in `runtime.json` and preserves the same golden, lifecycle, fatal-log, and NPU
-cleanup gates used by the CAMP2P baseline.
+The HCCL connector rejects Graph with unequal rank counts, Graph U3, `A < F`,
+and non-integer A/F ratios. MTP additionally rejects target Graph/U2, full draft
+Graph, unequal rank counts, and more than one speculative token. The shared
+validator records the selected connector in `runtime.json` and preserves the
+same golden, lifecycle, fatal-log, and NPU cleanup gates used by the CAMP2P
+baseline.
 
 The data path uses blocking HCCL point-to-point API calls. Under eager U2,
 events connect Attention compute, A2F send, F2A receive, FFN receive, FFN
@@ -160,6 +181,27 @@ Evidence:
 /mnt/workspace/validation/dsv4_afd_a3_layer_major_u2_profile_20260819_202039
 ```
 
+## A3-P7M3 eager U2 + MTP result
+
+M3 preserves request boundaries when splitting the target decoder, globally
+falls back to U1 when any DP rank cannot form two non-empty stages, and runs one
+merged MTP proposal after both decoder stages. The complete F0 passed 30/30
+serial golden requests and batch 1/8/32. Batch 32 recorded two
+`(4,4,4,4,4,4,4,4)` stages on every Attention rank; shutdown, fatal-log, and
+NPU cleanup gates passed.
+
+The fixed C32 P1 completed 128/128 requests at 16.238 output token/s. This is
+42.583% below MTP/U1 and 1.423% below the MTP-off P8D U2 point. M3 is therefore
+a functional baseline only. Do not expand it to target Graph/U2 + MTP or a
+three-repeat P2 matrix before the U2 performance gap is diagnosed.
+
+Evidence:
+
+```text
+/mnt/workspace/validation/dsv4_afd_v023_hccl_mtp_m3_f0_20260820_162944
+/mnt/workspace/validation/dsv4_afd_v023_hccl_mtp_m3_p1_20260820_164750
+```
+
 ## A3-P4 performance reference
 
 The performance runner uses the pinned Python environment directly and keeps
@@ -208,6 +250,10 @@ python recipe/npu/P2pHcclAFDConnector/deepseek_v4/run_performance.py \
   --prompts-per-concurrency 4 --min-prompts 128 \
   --output-dir /mnt/workspace/validation/dsv4_afd_v023_hccl_mtp_m1_p1_<timestamp>
 ```
+
+Use the same command with `--u-batches 2` for the M3 guard. It must observe two
+stages at C32, but its current 16.238 token/s result exceeds the 20% regression
+limit relative to MTP/U1; it is a diagnostic point, not a performance claim.
 
 Collect profiler runs into different directories so profiler overhead never
 enters the formal throughput results:

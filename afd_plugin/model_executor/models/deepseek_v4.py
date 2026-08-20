@@ -496,8 +496,6 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         """Run HCCL U2 in layer-major, stage-minor order on one host thread."""
         if self.afd_role != "attention":
             raise RuntimeError("DSV4 FFN model execution is connector-driven")
-        if self.mtp_enabled:
-            raise RuntimeError("DSV4 layer-major U2 does not support MTP")
         if len(ubatch_metadata) != 2:
             raise RuntimeError(
                 "DSV4 layer-major execution requires exactly two stages; "
@@ -527,9 +525,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
 
         connector = connectors[0]
         if any(stage_connector is not connector for stage_connector in connectors[1:]):
-            raise RuntimeError(
-                "DSV4 layer-major U2 stages must share one connector"
-            )
+            raise RuntimeError("DSV4 layer-major U2 stages must share one connector")
         require_idle = getattr(connector, "require_attention_pipeline_idle", None)
         wait_for_receive = getattr(
             connector,
@@ -538,9 +534,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         )
         reset_pipeline = getattr(connector, "reset_attention_pipeline_state", None)
         if not all(callable(method) for method in (require_idle, wait_for_receive)):
-            raise RuntimeError(
-                "DSV4 layer-major U2 requires the HCCL stream connector"
-            )
+            raise RuntimeError("DSV4 layer-major U2 requires the HCCL stream connector")
 
         hidden_ubatches: list[torch.Tensor] = []
         pending_layers: list[AFDDeepseekV4DecoderLayer | None] = [None, None]
@@ -651,6 +645,16 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
                 native.IntermediateTensors({"hidden_states": hidden_states})
                 for hidden_states in hidden_ubatches
             ]
+
+        if self.mtp_enabled:
+            buffer_offset = 0
+            for hidden_states in hidden_ubatches:
+                mtp_hidden = hidden_states.flatten(1)
+                next_offset = buffer_offset + mtp_hidden.shape[0]
+                self._mtp_hidden_buffer[buffer_offset:next_offset].copy_(
+                    mtp_hidden,
+                )
+                buffer_offset = next_offset
 
         outputs: list[Any] = []
         for stage_idx, forward_context in enumerate(stage_contexts):

@@ -551,11 +551,12 @@ def test_npu_attention_syncs_uniform_decode_before_ubatch_decision(
 
     def all_reduce(packed_tensor, *, group):
         assert group == "cpu-group"
-        assert tuple(packed_tensor.shape) == (4, 4)
+        assert tuple(packed_tensor.shape) == (5, 4)
         packed_tensor[0, :] = torch.tensor([4, 4, 4, 4])
         packed_tensor[1, :] = torch.tensor([4, 4, 4, 4])
         packed_tensor[2, :] = CUDAGraphMode.NONE.value
         packed_tensor[3, :] = torch.tensor(uniform_decode_across_dp)
+        packed_tensor[4, :] = 1
 
     def check_enable_ubatch(*_args, uniform_decode, **_kwargs):
         observed.append(uniform_decode)
@@ -588,6 +589,85 @@ def test_npu_attention_syncs_uniform_decode_before_ubatch_decision(
     assert should_ubatch is expected
     assert observed == [expected]
     assert synced_graph_mode is CUDAGraphMode.NONE
+
+
+@pytest.mark.parametrize(
+    ("request_counts", "expected"),
+    [
+        ([2, 2, 2, 2], True),
+        ([2, 2, 1, 2], False),
+    ],
+)
+def test_npu_attention_syncs_mtp_request_boundary_gate(
+    monkeypatch,
+    request_counts,
+    expected,
+):
+    _require_npu_runtime()
+    from vllm.config import CUDAGraphMode
+
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    runner = _new_attention_runner()
+    runner.dp_size = 4
+    runner.dp_rank = 1
+    runner.connector = SimpleNamespace(control_plane=object())
+    runner.vllm_config = _vllm_config(
+        data_parallel_size=4,
+        data_parallel_rank=1,
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+        dbo_decode_token_threshold=2,
+        dbo_prefill_token_threshold=12,
+    )
+
+    def all_reduce(packed_tensor, *, group):
+        assert group == "cpu-group"
+        assert tuple(packed_tensor.shape) == (5, 4)
+        packed_tensor[0, :] = 4
+        packed_tensor[1, :] = 4
+        packed_tensor[2, :] = CUDAGraphMode.NONE.value
+        packed_tensor[3, :] = 1
+        packed_tensor[4, :] = torch.tensor(
+            [2 if count >= 2 else 0 for count in request_counts]
+        )
+
+    monkeypatch.setattr(
+        attention_model_runner,
+        "should_skip_allreduce_across_dp_group",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        attention_model_runner,
+        "get_dp_group",
+        lambda: SimpleNamespace(cpu_group="cpu-group"),
+    )
+    monkeypatch.setattr(attention_model_runner.dist, "all_reduce", all_reduce)
+    monkeypatch.setattr(
+        attention_model_runner,
+        "check_enable_ubatch",
+        lambda *_args, **_kwargs: True,
+    )
+
+    should_ubatch, _, _, _ = runner._sync_afd_metadata_across_dp(
+        num_tokens_unpadded=4,
+        num_tokens_padded=4,
+        uniform_decode=True,
+        cudagraph_mode=CUDAGraphMode.NONE,
+        request_boundary_stage0_tokens=(
+            2 if request_counts[runner.dp_rank] >= 2 else 0
+        ),
+    )
+
+    assert should_ubatch is expected
+    if expected:
+        stage_counts = runner._afd_request_boundary_stage_counts_across_dp
+        assert stage_counts is not None
+        assert stage_counts[0].tolist() == [2, 2, 2, 2]
+        assert stage_counts[1].tolist() == [2, 2, 2, 2]
+    else:
+        assert runner._afd_request_boundary_stage_counts_across_dp is None
 
 
 def _new_ffn_runner():
@@ -929,9 +1009,11 @@ def test_npu_attention_runner_installs_mla_graph_wrapper(
 
 
 @pytest.mark.parametrize("has_full_cudagraphs", [False, True])
+@pytest.mark.parametrize("requires_mtp", [False, True])
 def test_npu_attention_runner_enables_p2p_layer_major_eager_u2_warmup(
     monkeypatch,
     has_full_cudagraphs,
+    requires_mtp,
 ):
     _require_npu_runtime()
     from afd_plugin.v1.worker.npu import attention_model_runner
@@ -954,7 +1036,7 @@ def test_npu_attention_runner_enables_p2p_layer_major_eager_u2_warmup(
     )
     connector = object.__new__(attention_model_runner.P2pHcclAFDConnector)
     connector.stream_overlap_enabled = True
-    connector.requires_mtp = False
+    connector.requires_mtp = requires_mtp
     runner = object.__new__(attention_model_runner.AFDNPUAttentionModelRunner)
     runner.model = LayerMajorModel()
     runner.connector = connector
@@ -1204,6 +1286,48 @@ def test_npu_attention_runner_sends_global_nonuniform_ubatch_dp_metadata():
     dp_metadata_list = runner.connector.dp_metadata_updates[0][0]
     assert _tokens(dp_metadata_list[0]) == [18] * 8
     assert _tokens(dp_metadata_list[1]) == [17, 3, 5, 4, 19, 7, 18, 3]
+
+
+def test_npu_attention_runner_sends_synced_request_boundary_stage_counts():
+    runner = _new_attention_runner()
+    runner.vllm_config = _vllm_config(
+        role="attention",
+        data_parallel_size=4,
+        data_parallel_rank=1,
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+        ubatch_size=2,
+    )
+    runner.connector = _RecordingConnector()
+    runner._is_warmup = False
+    runner._afd_is_graph_capturing = False
+    runner._afd_unpadded_tokens_across_dp = torch.tensor(
+        [6, 5, 7, 4],
+        dtype=torch.int32,
+    )
+    runner._afd_request_boundary_stage_counts_across_dp = (
+        torch.tensor([2, 3, 4, 2], dtype=torch.int32),
+        torch.tensor([4, 2, 3, 2], dtype=torch.int32),
+    )
+    ubatch_slices = [
+        SimpleNamespace(
+            request_slice=slice(0, 1),
+            token_slice=slice(0, 3),
+            num_tokens=3,
+        ),
+        SimpleNamespace(
+            request_slice=slice(1, 2),
+            token_slice=slice(3, 5),
+            num_tokens=2,
+        ),
+    ]
+
+    runner._send_dp_metadata(None, ubatch_slices)
+
+    dp_metadata_list = runner.connector.dp_metadata_updates[0][0]
+    assert _tokens(dp_metadata_list[0]) == [2, 3, 4, 2]
+    assert _tokens(dp_metadata_list[1]) == [4, 2, 3, 2]
 
 
 def test_npu_attention_capture_microbatch_also_captures_single_stage():
@@ -1618,6 +1742,74 @@ def test_npu_ffn_runner_executes_decoder_then_mtp_phase(monkeypatch):
     assert runner.connector.ffn_outputs == [
         ("npu-ffn(decoder-hidden, layer=0)", decoder_metadata, {"ubatch_idx": 0}),
         ("npu-ffn(mtp-hidden, layer=0)", mtp_metadata, {"ubatch_idx": 0}),
+    ]
+
+
+def test_npu_ffn_runner_executes_u2_decoder_then_one_merged_mtp_phase(
+    monkeypatch,
+):
+    _patch_ffn_forward_context(monkeypatch)
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn",
+        connector="P2pHcclAFDConnector",
+        speculative_config=_mtp_speculative_config(enforce_eager=True),
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+    )
+    runner.connector = _FakeFFNConnector()
+    runner.model = _FakeModel()
+    runner.mtp_ffn_model = _FakeModel()
+    runner.num_layers = 1
+    runner.max_num_tokens = 3
+    runner.use_aclgraph = False
+    runner._acl_graphs = {}
+    decoder_metadata = [
+        AFDTransferMetadata.create_attention_metadata(
+            layer_idx=0,
+            stage_idx=stage_idx,
+            seq_len=stage_idx + 1,
+        )
+        for stage_idx in (0, 1)
+    ]
+    mtp_metadata = AFDTransferMetadata.create_attention_metadata(
+        layer_idx=0,
+        stage_idx=0,
+        seq_len=3,
+        phase="mtp",
+        speculative_step=0,
+    )
+    runner.connector.attn_outputs.extend(
+        [
+            ("decoder-stage-0", decoder_metadata[0]),
+            ("decoder-stage-1", decoder_metadata[1]),
+            ("mtp-merged", mtp_metadata),
+        ]
+    )
+    header_stages = []
+
+    def recv_mtp_header(*, stage_idx):
+        header_stages.append(stage_idx)
+        return SimpleNamespace(
+            num_tokens=3,
+            speculative_step=0,
+            num_tokens_across_dp=torch.tensor([3], dtype=torch.int32),
+        )
+
+    runner.connector.recv_mtp_header = recv_mtp_header
+
+    runner.execute_model(
+        dp_metadata_list={
+            0: _FakeDPMetadata([1]),
+            1: _FakeDPMetadata([2]),
+        }
+    )
+
+    assert header_stages == [0]
+    assert [item[1] for item in runner.connector.ffn_outputs] == [
+        *decoder_metadata,
+        mtp_metadata,
     ]
 
 
@@ -3103,6 +3295,19 @@ def test_dsv4_feature_validation_accepts_mtp_m1_eager_u1_hccl_p2p():
     fail_if_unsupported_npu_afd_features(config)
 
 
+def test_dsv4_feature_validation_accepts_mtp_m3_eager_u2_hccl_p2p():
+    config = _dsv4_config(
+        speculative_config=_mtp_speculative_config(),
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+        ubatch_size=2,
+    )
+    config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
 def test_dsv4_feature_validation_accepts_graph_target_with_eager_mtp_draft():
     config = _dsv4_config(
         cudagraph_mode="FULL_DECODE_ONLY",
@@ -3212,10 +3417,6 @@ def test_dsv4_feature_validation_rejects_unvalidated_modes(mutation, message):
             "MTP Graph/U1 currently requires draft enforce_eager=true",
         ),
         (
-            lambda config: setattr(config.parallel_config, "use_ubatching", True),
-            "MTP supports only U1",
-        ),
-        (
             lambda config: setattr(config.speculative_config, "method", "draft"),
             "supports only MTP speculative method",
         ),
@@ -3254,6 +3455,22 @@ def test_dsv4_feature_validation_rejects_unvalidated_mtp_m1_modes(
     mutation(config)
 
     with pytest.raises(RuntimeError, match=message):
+        fail_if_unsupported_npu_afd_features(config)
+
+
+def test_dsv4_feature_validation_rejects_mtp_target_graph_u2():
+    config = _dsv4_config(
+        cudagraph_mode="FULL_DECODE_ONLY",
+        speculative_config=_mtp_speculative_config(),
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+        ubatch_size=2,
+    )
+    config.model_config.enforce_eager = False
+    config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
+
+    with pytest.raises(RuntimeError, match="MTP target Graph/U2 is not validated"):
         fail_if_unsupported_npu_afd_features(config)
 
 

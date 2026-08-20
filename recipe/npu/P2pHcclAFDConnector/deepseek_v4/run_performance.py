@@ -407,7 +407,7 @@ def _runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
                 (
                     "A3-P7M2-P1"
                     if args.execution_mode == "full-decode-only"
-                    else "A3-P7M1-P1"
+                    else ("A3-P7M3-P1" if args.u_batches == 2 else "A3-P7M1-P1")
                 )
                 if args.enable_mtp
                 else "A3-P8"
@@ -415,6 +415,7 @@ def _runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "topology_label": "A8F8",
             "npu_count": TOTAL_NPUS,
             "mtp_draft_execution": "eager" if args.enable_mtp else None,
+            "mtp_phase_u_batches": 1 if args.enable_mtp else None,
             "reproducibility_files_sha256": {
                 str(path.relative_to(REPO_ROOT)): _file_sha256(path)
                 for path in REPRODUCIBILITY_FILES
