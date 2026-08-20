@@ -18,10 +18,10 @@ Supported execution boundary:
 - eager U1 or eager U2, including the integer-multiple topologies above;
 - `FULL_DECODE_ONLY` Graph U1 or U2 for equal Attention/FFN rank counts;
 - eager U1 or U2 + MTP for A8F8, one MTP layer, and one speculative token;
-- target Graph U1 + eager draft MTP for the same MTP boundary;
-- Graph with unequal Attention/FFN ranks, target Graph/U2 + MTP, full draft
-  Graph, unequal MTP, multiple speculative tokens, PD, sequence parallelism,
-  and Attention-side gate are disabled.
+- target Graph U1 or U2 + eager draft MTP for the same MTP boundary;
+- Graph with unequal Attention/FFN ranks, full draft Graph, unequal MTP,
+  multiple speculative tokens, PD, sequence parallelism, and Attention-side
+  gate are disabled.
 
 The public communication API remains synchronous: every eager transfer still
 calls blocking `torch.distributed.send/recv`. Eager U2 additionally uses
@@ -32,10 +32,13 @@ asynchronous custom HCCL op. U1 and Graph U1 retain their existing execution
 paths. Under MTP/U2 only the target decoder uses two stages; the merged MTP
 proposal remains one synchronous phase.
 
-Under Graph U1, torch-npu lowers the hidden-state `send/recv` calls into the
-ACL Graph. Input IDs remain on the one-shot HCCL side channel before capture or
-replay, so no host metadata or dynamically sized ID message is placed in the
-captured graph.
+Under Graph U1 or U2, torch-npu lowers the hidden-state `send/recv` calls into
+the ACL Graph. Input IDs remain on the one-shot HCCL side channel before capture
+or replay, so no host metadata or dynamically sized ID message is placed in the
+captured graph. Graph/U2 only replays stage-shape keys created by synchronized
+startup dummy runs. A previously unseen live shape falls back to the eager U2
+path for the whole target step on both roles; it is never captured by Attention
+alone after FFN has already selected eager execution.
 
 The MTP virtual layer has a separate phase and fixed header. Its learned gate
 does not consume input IDs: Attention sends the per-DP token counts followed by
@@ -82,6 +85,18 @@ cannot form two non-empty request stages, all ranks fall back to U1 for that
 step. With DP8, batch sizes below 16 therefore exercise the fallback; batch 16
 or 32 is required to validate a real two-stage MTP target run.
 
+Run the target Graph U2 + eager draft MTP gate:
+
+```bash
+source tools/dsv4/activate_v023_vllm_cann_runtime.sh
+python recipe/npu/P2pHcclAFDConnector/deepseek_v4/run_validation.py \
+  --enable-mtp --execution-mode full-decode-only --u-batches 2 \
+  --dbo-decode-token-threshold 2 --dbo-prefill-token-threshold 12 \
+  --golden /mnt/workspace/validation/dsv4_v023_vllm_cann_native_baseline/golden_results.json \
+  --cycles 1 --idle-seconds 0 --rounds 3 --batch-sizes 1 8 32 \
+  --output-dir /mnt/workspace/validation/dsv4_afd_v023_hccl_mtp_m4_<timestamp>
+```
+
 Run a U1 smoke validation:
 
 ```bash
@@ -104,11 +119,10 @@ python recipe/npu/P2pHcclAFDConnector/deepseek_v4/run_validation.py \
 ```
 
 The HCCL connector rejects Graph with unequal rank counts, Graph U3, `A < F`,
-and non-integer A/F ratios. MTP additionally rejects target Graph/U2, full draft
-Graph, unequal rank counts, and more than one speculative token. The shared
-validator records the selected connector in `runtime.json` and preserves the
-same golden, lifecycle, fatal-log, and NPU cleanup gates used by the CAMP2P
-baseline.
+and non-integer A/F ratios. MTP additionally rejects full draft Graph, unequal
+rank counts, and more than one speculative token. The shared validator records
+the selected connector in `runtime.json` and preserves the same golden,
+lifecycle, fatal-log, and NPU cleanup gates used by the CAMP2P baseline.
 
 The data path uses blocking HCCL point-to-point API calls. Under eager U2,
 events connect Attention compute, A2F send, F2A receive, FFN receive, FFN
@@ -192,14 +206,37 @@ NPU cleanup gates passed.
 
 The fixed C32 P1 completed 128/128 requests at 16.238 output token/s. This is
 42.583% below MTP/U1 and 1.423% below the MTP-off P8D U2 point. M3 is therefore
-a functional baseline only. Do not expand it to target Graph/U2 + MTP or a
-three-repeat P2 matrix before the U2 performance gap is diagnosed.
+a functional baseline only. The subsequent M4 milestone expanded the functional
+matrix to target Graph/U2 + MTP under an explicit functional-first decision;
+M3 still does not justify a three-repeat P2 matrix or a performance claim.
 
 Evidence:
 
 ```text
 /mnt/workspace/validation/dsv4_afd_v023_hccl_mtp_m3_f0_20260820_162944
 /mnt/workspace/validation/dsv4_afd_v023_hccl_mtp_m3_p1_20260820_164750
+```
+
+## A3-P7M4 target Graph U2 + eager draft MTP result
+
+M4 combines the already validated target Graph/U2 decoder with one eager MTP
+proposal phase. Startup capture is synchronized across Attention and FFN. A
+duplicate target graph key on FFN is replayed instead of being skipped, keeping
+the HCCL operation sequence paired with Attention. During live execution an
+uncaptured U2 stage shape is not dynamically captured: both roles execute that
+target step through eager U2, while captured keys continue to use Graph/U2.
+
+F0 passed 30/30 serial golden requests, batch 1/8/32, real two-stage execution,
+capture/replay, shutdown, fatal-log, and NPU cleanup gates. The fixed C32 P1
+completed 128/128 requests with no failures at 31.473 output token/s; MTP draft
+acceptance was 84.51%. This is a one-run functional guard, not a performance
+baseline or a proof of AFD/microbatch benefit.
+
+Evidence:
+
+```text
+/mnt/workspace/validation/dsv4_afd_v023_hccl_mtp_m4_f0_20260820_182146
+/mnt/workspace/validation/dsv4_afd_v023_hccl_mtp_m4_p1_final_20260820_192421
 ```
 
 ## A3-P4 performance reference
@@ -254,6 +291,10 @@ python recipe/npu/P2pHcclAFDConnector/deepseek_v4/run_performance.py \
 Use the same command with `--u-batches 2` for the M3 guard. It must observe two
 stages at C32, but its current 16.238 token/s result exceeds the 20% regression
 limit relative to MTP/U1; it is a diagnostic point, not a performance claim.
+
+For the M4 guard, also add `--execution-mode full-decode-only`. Its single-run
+31.473 token/s result only proves that the Graph/U2 + eager draft MTP path is
+stable under this workload; formal comparison still requires the P2 matrix.
 
 Collect profiler runs into different directories so profiler overhead never
 enters the formal throughput results:

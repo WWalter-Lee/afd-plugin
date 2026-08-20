@@ -689,10 +689,28 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         if input_ids_by_stage is None:
             input_ids_by_stage = self._receive_input_ids_before_model(dp_metadata_list)
 
+        # ### PATCH START: mirror duplicate target graph replay.
+        # MTP request-boundary U2 can fall back to the U1 graph key for the
+        # smallest capture shape. The Attention wrapper replays that existing
+        # graph instead of capturing it again, so FFN must replay its matching
+        # decoder graph as well. Skipping the duplicate key would leave the
+        # Attention graph's HCCL sends waiting for receives that never launch.
+        graph_key = self._make_graph_key(dp_metadata_list)
+        existing_graph_info = getattr(self, "_acl_graphs", {}).get(graph_key)
+        if not is_warmup and existing_graph_info is not None:
+            logger.debug(
+                "AFD NPU FFN replaying existing graph during duplicate "
+                "capture; key=%s",
+                graph_key,
+            )
+            existing_graph_info["graph"].replay()
+            return 0
+        # ### PATCH END: mirror duplicate target graph replay.
+
         logger.debug(
             "AFD NPU FFN capture_model start; key=%s is_warmup=%s "
             "is_attn_graph_capturing=%s",
-            self._make_graph_key(dp_metadata_list),
+            graph_key,
             is_warmup,
             is_attn_graph_capturing,
         )
@@ -725,7 +743,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         graph_size = max(0, int(start_free_memory - end_free_memory))
         logger.debug(
             "AFD NPU FFN capture_model end; key=%s graph_size=%d",
-            self._make_graph_key(dp_metadata_list),
+            graph_key,
             graph_size,
         )
         return graph_size

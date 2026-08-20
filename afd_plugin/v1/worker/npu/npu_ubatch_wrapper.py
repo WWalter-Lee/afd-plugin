@@ -211,6 +211,26 @@ class AscendUBatchWrapper(UBatchWrapper):
             )
         return True
 
+    def has_ubatch_full_graph(self, forward_context: ForwardContext) -> bool:
+        """Return whether a synchronized startup capture covers this U2 shape."""
+        ubatch_slices = forward_context.ubatch_slices
+        if (
+            ubatch_slices is None
+            or forward_context.cudagraph_runtime_mode is not CUDAGraphMode.FULL
+            or len(ubatch_slices) != AFD_NPU_NUM_UBATCHES
+        ):
+            return False
+        batch_descriptor = forward_context.batch_descriptor
+        graph_key = AscendNPUGraphKey(
+            (
+                ubatch_slices[0].num_tokens,
+                ubatch_slices[1].num_tokens,
+            ),
+            batch_descriptor.has_lora,
+            batch_descriptor.num_active_loras,
+        )
+        return graph_key in self.cudagraphs
+
     def __call__(self, *args, **kwargs):
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor

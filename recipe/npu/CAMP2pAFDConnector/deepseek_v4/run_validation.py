@@ -634,8 +634,6 @@ def _validate_execution_topology(
         raise ValueError("DeepSeek-V4 MTP requires P2pHcclAFDConnector")
     if execution_mode not in {"eager", "full-decode-only"}:
         raise ValueError("DeepSeek-V4 MTP requires eager or full-decode-only execution")
-    if execution_mode == "full-decode-only" and u_batches != 1:
-        raise ValueError("DeepSeek-V4 MTP target Graph/U2 is not validated")
     if topology["attention_ranks"] != topology["ffn_ranks"]:
         raise ValueError("DeepSeek-V4 MTP requires equal Attention/FFN ranks")
     if mtp_num_speculative_tokens != 1:

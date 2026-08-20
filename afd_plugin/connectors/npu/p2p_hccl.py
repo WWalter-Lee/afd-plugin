@@ -370,9 +370,16 @@ class P2pHcclAFDConnector(AFDConnectorBase):
             return False
         graph_ubatching = bool(getattr(forward_context, "afd_graph_ubatching", False))
         layer_major = bool(getattr(forward_context, "afd_layer_major_u2", False))
+        # FULL_DECODE_ONLY may capture a previously unseen U2 shape during live
+        # execution, after Dynamo compilation has finished. Keep the eager
+        # communication streams for graph warmup, but never enter them while
+        # torch-npu is recording the parent graph.
+        if graph_ubatching and (
+            not layer_major or torch.npu.is_current_stream_capturing()
+        ):
+            return False
         return bool(
-            (not graph_ubatching or layer_major)
-            and getattr(forward_context, "dbo_enabled", False)
+            getattr(forward_context, "dbo_enabled", False)
             and int(getattr(forward_context, "num_ubatches", 1)) > 1
         )
 
@@ -590,6 +597,10 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         tensor: torch.Tensor,
     ) -> None:
         """Make the current compute stream consume one deferred F2A receive."""
+        # Dynamic Graph/U2 capture uses graph-visible send/recv on the current
+        # capture stream, so there is no connector-owned receive event to join.
+        if not self._attention_stream_pipeline_active():
+            return
         dependency = self.attention_receive_dependencies.pop(stage_idx, None)
         if dependency is None:
             raise RuntimeError(
@@ -944,9 +955,17 @@ class P2pHcclAFDConnector(AFDConnectorBase):
 
     def _graph_transport_active(self) -> bool:
         """Use graph-visible HCCL ops while tracing or capturing a target graph."""
+        if torch.compiler.is_compiling() or (
+            self.is_graph_capturing and not self.is_warmup
+        ):
+            return True
+        try:
+            forward_context = get_forward_context()
+        except AssertionError:
+            return False
         return bool(
-            torch.compiler.is_compiling()
-            or (self.is_graph_capturing and not self.is_warmup)
+            getattr(forward_context, "afd_graph_ubatching", False)
+            and torch.npu.is_current_stream_capturing()
         )
 
     @staticmethod

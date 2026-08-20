@@ -360,6 +360,35 @@ def test_npu_graph_key_separates_stage_shapes_and_lora(monkeypatch):
     assert len(keys) == 4
 
 
+def test_ubatch_wrapper_checks_startup_graph_by_stage_shape_and_lora(monkeypatch):
+    wrapper_module = _load_ubatch_wrapper_module(monkeypatch)
+    wrapper = _new_wrapper_for_unit_test(
+        wrapper_module,
+        mla_full_graph_enabled=False,
+    )
+    captured_key = wrapper_module.AscendNPUGraphKey((3, 3), True, 1)
+    wrapper.cudagraphs[captured_key] = object()
+    context = SimpleNamespace(
+        ubatch_slices=_two_slices(3, 3),
+        cudagraph_runtime_mode=wrapper_module.CUDAGraphMode.FULL,
+        batch_descriptor=_batch_descriptor(
+            num_tokens=6,
+            has_lora=True,
+            num_active_loras=1,
+        ),
+    )
+
+    assert wrapper.has_ubatch_full_graph(context) is True
+
+    context.ubatch_slices = _two_slices(2, 4)
+    assert wrapper.has_ubatch_full_graph(context) is False
+    context.ubatch_slices = _two_slices(3, 3)
+    context.batch_descriptor.num_active_loras = 2
+    assert wrapper.has_ubatch_full_graph(context) is False
+    context.cudagraph_runtime_mode = wrapper_module.CUDAGraphMode.NONE
+    assert wrapper.has_ubatch_full_graph(context) is False
+
+
 def test_merge_mla_graph_params_is_layer_major_ubatch_minor(monkeypatch):
     mla_graph = _load_mla_graph_module(monkeypatch)
     workspace = object()

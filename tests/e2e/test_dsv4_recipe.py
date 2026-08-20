@@ -134,7 +134,7 @@ def test_dsv4_role_scripts_offer_u1_graph_and_eager_u2():
         assert '"enforce_eager":%s' in script
         assert '"${MTP_ARGS[@]}"' in script
         assert "MTP requires P2pHcclAFDConnector" in script
-        assert "MTP target Graph/U2 is not validated" in script
+        assert "MTP target Graph/U2 is not validated" not in script
         assert "MTP requires equal Attention/FFN ranks" in script
         assert "MTP supports exactly one speculative token" in script
         assert "graph U2 requires P2pHcclAFDConnector" in script
@@ -316,7 +316,7 @@ def test_dsv4_hccl_graph_topology_requires_equal_roles():
         )
 
 
-def test_dsv4_hccl_mtp_m2_topology_gate_and_environment(monkeypatch):
+def test_dsv4_hccl_mtp_m4_topology_gate_and_environment(monkeypatch):
     runner = _load_runner()
     topology = {"attention_ranks": 8, "ffn_ranks": 8}
     monkeypatch.setenv("ENABLE_MTP", "0")
@@ -346,6 +346,14 @@ def test_dsv4_hccl_mtp_m2_topology_gate_and_environment(monkeypatch):
         mtp_num_speculative_tokens=1,
         topology=topology,
     )
+    runner._validate_execution_topology(
+        connector="P2pHcclAFDConnector",
+        execution_mode="full-decode-only",
+        u_batches=2,
+        enable_mtp=True,
+        mtp_num_speculative_tokens=1,
+        topology=topology,
+    )
     runner._set_mtp_environment(
         enable_mtp=True,
         mtp_num_speculative_tokens=1,
@@ -355,10 +363,6 @@ def test_dsv4_hccl_mtp_m2_topology_gate_and_environment(monkeypatch):
 
     invalid_cases = [
         ({"connector": "CAMP2pAFDConnector"}, "P2pHcclAFDConnector"),
-        (
-            {"execution_mode": "full-decode-only", "u_batches": 2},
-            "target Graph/U2 is not validated",
-        ),
         (
             {"topology": {"attention_ranks": 8, "ffn_ranks": 4}},
             "equal Attention/FFN",
@@ -538,7 +542,7 @@ def test_dsv4_performance_defaults_to_validated_sync_scheduler(monkeypatch, tmp_
     assert args.async_scheduling == "off"
 
 
-def test_dsv4_performance_mtp_uses_m1_gate_and_environment(monkeypatch):
+def test_dsv4_performance_mtp_uses_functional_gate_and_environment(monkeypatch):
     runner = _load_performance_runner()
     args = SimpleNamespace(
         execution_mode="eager",
@@ -558,8 +562,7 @@ def test_dsv4_performance_mtp_uses_m1_gate_and_environment(monkeypatch):
     runner._validate_execution_args(args)
 
     args.execution_mode = "full-decode-only"
-    with pytest.raises(ValueError, match="target Graph/U2 is not validated"):
-        runner._validate_execution_args(args)
+    runner._validate_execution_args(args)
 
     args.execution_mode = "eager"
     args.u_batches = 1
@@ -638,6 +641,11 @@ def test_dsv4_performance_mtp_manifest_preserves_structured_topology(monkeypatch
     graph_manifest = runner._runtime_manifest(args)
     assert graph_manifest["stage"] == "A3-P7M2-P1"
     assert graph_manifest["execution_mode"] == "full-decode-only"
+
+    args.u_batches = 2
+    graph_u2_manifest = runner._runtime_manifest(args)
+    assert graph_u2_manifest["stage"] == "A3-P7M4-P1"
+    assert graph_u2_manifest["mtp_phase_u_batches"] == 1
 
 
 def test_dsv4_performance_detects_exited_service():

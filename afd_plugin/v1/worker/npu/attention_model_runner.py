@@ -310,6 +310,25 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             **model_kwargs,
         }
         run_model = partial(self.model, **model_inputs)
+        # ### PATCH START: synchronized Graph/U2 online cache-miss fallback.
+        # The Attention ubatch wrapper discovers a missing stage-shape key only
+        # after FFN has received the step metadata. Capturing at that point would
+        # put Attention in Graph mode while FFN is already running eager. Only
+        # startup dummy runs may create new U2 graphs; live misses execute the
+        # same layer-major eager path on both roles.
+        if (
+            bool(getattr(self, "_afd_live_execution", False))
+            and isinstance(self.model, AscendUBatchWrapper)
+            and forward_context.ubatch_slices is not None
+            and forward_context.cudagraph_runtime_mode is CUDAGraphMode.FULL
+            and not self.model.has_ubatch_full_graph(forward_context)
+        ):
+            logger.debug(
+                "AFD NPU Attention falling back to eager for uncaptured "
+                "Graph/U2 stage shape"
+            )
+            forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
+        # ### PATCH END: synchronized Graph/U2 online cache-miss fallback.
         wrapper_owns_full_graph_update = isinstance(
             self.model, AscendUBatchWrapper
         ) and self.model.owns_full_graph_update(forward_context)

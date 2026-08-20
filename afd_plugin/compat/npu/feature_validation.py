@@ -185,21 +185,13 @@ def _fail_if_unsupported_deepseek_v4_features(
             raise RuntimeError("DeepSeek-V4 AFD MTP supports num_speculative_tokens=1")
         draft_enforce_eager = bool(getattr(speculative_config, "enforce_eager", False))
         target_enforce_eager = bool(vllm_config.model_config.enforce_eager)
-        if (
-            bool(getattr(parallel_config, "use_ubatching", False))
-            and not target_enforce_eager
-        ):
-            raise RuntimeError(
-                "DeepSeek-V4 AFD MTP target Graph/U2 is not validated; "
-                "use eager/U2 or Graph/U1"
-            )
         if target_enforce_eager and not draft_enforce_eager:
             raise RuntimeError(
                 "DeepSeek-V4 AFD MTP eager execution requires draft enforce_eager=true"
             )
         if not target_enforce_eager and not draft_enforce_eager:
             raise RuntimeError(
-                "DeepSeek-V4 AFD MTP Graph/U1 currently requires draft "
+                "DeepSeek-V4 AFD MTP target Graph currently requires draft "
                 "enforce_eager=true; draft ACL Graph is not validated"
             )
         num_mtp_layers = int(

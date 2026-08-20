@@ -67,10 +67,6 @@ case "$ENABLE_MTP" in
       echo "DeepSeek-V4 MTP requires P2pHcclAFDConnector" >&2
       exit 2
     fi
-    if [[ "$EXECUTION_MODE" == "full-decode-only" && "$U_BATCHES" != "1" ]]; then
-      echo "DeepSeek-V4 MTP target Graph/U2 is not validated" >&2
-      exit 2
-    fi
     if [[ "$ATTENTION_RANKS" != "$FFN_RANKS" ]]; then
       echo "DeepSeek-V4 MTP requires equal Attention/FFN ranks" >&2
       exit 2
@@ -84,7 +80,8 @@ case "$ENABLE_MTP" in
         MTP_DRAFT_ENFORCE_EAGER=true
         ;;
       full-decode-only)
-        # Keep the one-layer MTP role eager while the target model uses Graph.
+        # Keep the one-layer MTP role eager while the target model uses Graph,
+        # including the validated U2 target path.
         MTP_DRAFT_ENFORCE_EAGER=true
         ;;
       *)

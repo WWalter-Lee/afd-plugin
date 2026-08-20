@@ -701,6 +701,11 @@ def test_p2p_hccl_attention_stream_pipeline_is_active_for_layer_major_graph(
     connector.f2a_recv_stream = object()
     connector.attention_pipeline_events = {(1, 0): object()}
     monkeypatch.setattr(
+        hccl_module.torch.npu,
+        "is_current_stream_capturing",
+        lambda: False,
+    )
+    monkeypatch.setattr(
         hccl_module,
         "get_forward_context",
         lambda: SimpleNamespace(
@@ -712,6 +717,61 @@ def test_p2p_hccl_attention_stream_pipeline_is_active_for_layer_major_graph(
     )
 
     assert connector._attention_stream_pipeline_active() is True
+
+
+def test_p2p_hccl_dynamic_graph_capture_disables_attention_stream_pipeline(
+    monkeypatch,
+):
+    connector = _connector(role="attention", num_ubatches=2)
+    connector.a2f_send_stream = object()
+    connector.f2a_recv_stream = object()
+    connector.attention_pipeline_events = {(1, 0): object()}
+    monkeypatch.setattr(
+        hccl_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            afd_graph_ubatching=True,
+            afd_layer_major_u2=True,
+            dbo_enabled=True,
+            num_ubatches=2,
+        ),
+    )
+    monkeypatch.setattr(
+        hccl_module.torch.npu,
+        "is_current_stream_capturing",
+        lambda: True,
+    )
+
+    assert connector._attention_stream_pipeline_active() is False
+
+
+def test_p2p_hccl_dynamic_graph_capture_skips_deferred_receive_wait(monkeypatch):
+    connector = _connector(role="attention", num_ubatches=2)
+    connector.a2f_send_stream = object()
+    connector.f2a_recv_stream = object()
+    connector.attention_pipeline_events = {(1, 0): object()}
+    monkeypatch.setattr(
+        hccl_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            afd_graph_ubatching=True,
+            afd_layer_major_u2=True,
+            dbo_enabled=True,
+            num_ubatches=2,
+        ),
+    )
+    monkeypatch.setattr(
+        hccl_module.torch.npu,
+        "is_current_stream_capturing",
+        lambda: True,
+    )
+
+    connector.wait_for_attention_stage_receive(
+        stage_idx=0,
+        tensor=torch.ones((2, 4), dtype=torch.bfloat16),
+    )
+
+    assert connector.attention_receive_dependencies == {}
 
 
 def test_p2p_hccl_attention_stream_pipeline_is_inactive_while_compiling(
@@ -764,6 +824,51 @@ def test_p2p_hccl_capture_uses_graph_send_recv(monkeypatch):
     connector.is_graph_capturing = True
     graph_calls = []
     monkeypatch.setattr(hccl_module.torch.compiler, "is_compiling", lambda: False)
+    monkeypatch.setattr(
+        hccl_module,
+        "_graph_hccl_send",
+        lambda tensor, *, dst, group: graph_calls.append(("send", tensor, dst, group)),
+    )
+    monkeypatch.setattr(
+        hccl_module,
+        "_graph_hccl_recv",
+        lambda tensor, *, src, group: graph_calls.append(("recv", tensor, src, group)),
+    )
+    monkeypatch.setattr(
+        hccl_module.dist,
+        "send",
+        lambda *_args, **_kwargs: pytest.fail("capture must not use dist.send"),
+    )
+    monkeypatch.setattr(
+        hccl_module.dist,
+        "recv",
+        lambda *_args, **_kwargs: pytest.fail("capture must not use dist.recv"),
+    )
+    tensor = torch.ones((2, 4), dtype=torch.bfloat16)
+
+    connector._send_tensor(tensor, dst=1, group=connector.data_pg_list[0])
+    connector._recv_tensor(tensor, src=1, group=connector.data_pg_list[0])
+
+    assert graph_calls == [
+        ("send", tensor, 1, connector.data_pg_list[0]),
+        ("recv", tensor, 1, connector.data_pg_list[0]),
+    ]
+
+
+def test_p2p_hccl_dynamic_ubatch_capture_uses_graph_send_recv(monkeypatch):
+    connector = _connector(role="attention", num_ubatches=2)
+    graph_calls = []
+    monkeypatch.setattr(hccl_module.torch.compiler, "is_compiling", lambda: False)
+    monkeypatch.setattr(
+        hccl_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(afd_graph_ubatching=True),
+    )
+    monkeypatch.setattr(
+        hccl_module.torch.npu,
+        "is_current_stream_capturing",
+        lambda: True,
+    )
     monkeypatch.setattr(
         hccl_module,
         "_graph_hccl_send",

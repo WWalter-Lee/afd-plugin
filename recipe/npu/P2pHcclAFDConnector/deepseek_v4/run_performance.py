@@ -405,7 +405,7 @@ def _runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
         {
             "stage": (
                 (
-                    "A3-P7M2-P1"
+                    ("A3-P7M4-P1" if args.u_batches == 2 else "A3-P7M2-P1")
                     if args.execution_mode == "full-decode-only"
                     else ("A3-P7M3-P1" if args.u_batches == 2 else "A3-P7M1-P1")
                 )
