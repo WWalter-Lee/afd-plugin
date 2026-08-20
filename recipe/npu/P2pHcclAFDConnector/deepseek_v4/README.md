@@ -22,10 +22,13 @@ Supported execution boundary:
   multiple speculative tokens, PD, sequence parallelism, and Attention-side
   gate are disabled.
 
-The current implementation deliberately remains synchronous: the data path
-uses blocking `torch.distributed.send/recv` and retains its explicit NPU
-synchronization boundary. It does not use `isend/irecv`, background transfer
-threads, or an asynchronous custom HCCL op.
+The public communication API remains synchronous: every eager transfer still
+calls blocking `torch.distributed.send/recv`. Eager U2 additionally uses
+connector-owned NPU send/receive/compute streams and events to order device
+work across the two stages. DeepSeek-V4 drives the stages from one layer-major
+host loop; it does not use `isend/irecv`, background transfer threads, or an
+asynchronous custom HCCL op. U1, Graph U1, and MTP retain their existing
+execution paths.
 
 Under Graph U1, torch-npu lowers the hidden-state `send/recv` calls into the
 ACL Graph. Input IDs remain on the one-shot HCCL side channel before capture or
@@ -86,12 +89,76 @@ and non-integer A/F ratios. The shared validator records the selected connector
 in `runtime.json` and preserves the same golden, lifecycle, fatal-log, and NPU
 cleanup gates used by the CAMP2P baseline.
 
-The data path uses blocking HCCL point-to-point operations. Under U2 the
-Attention scheduler switches stages after receiving the matching FFN output,
-which keeps both stage groups aligned with the FFN layer-major receive loop.
-Concurrent batch token exact counts are diagnostic; the batch gate checks
-request structure, while the serial 30-request golden gate checks deterministic
-token equality.
+The data path uses blocking HCCL point-to-point API calls. Under eager U2,
+events connect Attention compute, A2F send, F2A receive, FFN receive, FFN
+compute, and FFN send. The DeepSeek-V4 Attention model submits work in
+`layer -> stage` order from one host thread and waits for a stage's prior F2A
+event immediately before that stage enters the next layer. Concurrent batch
+token exact counts are diagnostic; the batch gate checks request structure,
+while the serial 30-request golden gate checks deterministic token equality.
+
+## A3-P8C synchronous-API comm-stream result
+
+The first comm-stream implementation passed CPU/Mock tests, the A2F1 two-stage
+HCCL component gate, and A8F8 eager U2 correctness. A batch-32 run confirmed
+`stage_count=2` on all eight Attention ranks and matched the target-stack golden
+result. The implementation still calls only synchronous `dist.send/recv`.
+
+The fixed C32 P1 workload (1024 input, exact 128 output, 128 requests) reached
+14.961 output token/s. This is 10.043% below the prior synchronous U2 point and
+51.133% below the async-scheduling-off U1 point, so it is not a performance
+candidate. A matching CANN 9.0.1 dual-side profile nevertheless proved real
+device overlap: Attention averaged 35.551 ms overlapped communication per step,
+versus 0 in the old U2 trace. The remaining 1669.388 ms of non-overlapped
+Attention communication and 949.095 ms of FFN free time dominate the result.
+
+Evidence:
+
+```text
+/mnt/workspace/validation/dsv4_afd_a3_comm_stream_component_a2f1_20260819_170945
+/mnt/workspace/validation/dsv4_afd_a3_comm_stream_u2_batch32_20260819_173904
+/mnt/workspace/validation/dsv4_afd_a3_comm_stream_u2_p1_c32_1k128_20260819_174750
+/mnt/workspace/validation/dsv4_afd_a3_comm_stream_u2_profile_20260819_181639
+```
+
+Do not expand this point to a three-repeat P2 matrix. The proposed replacement
+of DBO thread/yield host handoff is implemented and measured in the next
+section.
+
+## A3-P8D single-thread layer-major U2 result
+
+P8D replaces the two Attention ubatch threads and `dbo_yield` handoff with a
+plugin-owned single-thread `layer -> stage` loop. The connector defers each F2A
+compute-stream dependency until the same stage is about to enter the next
+layer. The decoder layer is split around remote MoE so FFN HC post-processing
+runs only after that dependency is satisfied. The wire protocol and all hidden
+state transfers remain synchronous `dist.send/recv`.
+
+CPU/Mock regressions, an A2F1 two-stage/two-step component run, and an A8F8
+eager U2 batch-32 run passed. All eight Attention ranks recorded two stages;
+the serial golden request, fatal-log, shutdown, and NPU cleanup gates passed.
+
+On the same C32 P1 workload, P8D reached 16.472 output token/s and p50 TPOT
+1960.470 ms. This is 10.099% faster than P8C, but 0.958% below the old blocking
+U2 point and 46.197% below U1 async-off. It therefore remains a failed
+performance candidate and is not expanded to three repeats.
+
+The matching 20-step dual-side profile shows the effect is real but incomplete:
+Attention non-overlapped communication falls from 1669.388 to 1398.570 ms,
+while FFN free time rises from 949.095 to 1273.094 ms. Kernel counts are
+unchanged; Attention HCCL send duration drops sharply, but the critical wait is
+shifted toward F2A receive and peer progress. The next candidate must reduce
+per-layer synchronization/host message frequency or cross-DP arrival skew;
+threshold scanning alone cannot remove this wait.
+
+Evidence:
+
+```text
+/mnt/workspace/validation/dsv4_afd_a3_layer_major_component_a2f1_20260819_193218
+/mnt/workspace/validation/dsv4_afd_a3_layer_major_u2_batch32_20260819_194535
+/mnt/workspace/validation/dsv4_afd_a3_layer_major_u2_p1_c32_1k128_20260819_195445
+/mnt/workspace/validation/dsv4_afd_a3_layer_major_u2_profile_20260819_202039
+```
 
 ## A3-P4 performance reference
 

@@ -14,6 +14,8 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-1024}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
+DATA_PARALLEL_RPC_PORT="${DATA_PARALLEL_RPC_PORT:-29350}"
+MASTER_PORT="${MASTER_PORT:-29351}"
 ENABLE_MTP="${ENABLE_MTP:-0}"
 MTP_NUM_SPECULATIVE_TOKENS="${MTP_NUM_SPECULATIVE_TOKENS:-1}"
 
@@ -62,6 +64,8 @@ exec vllm serve "${MODEL_PATH}" \
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
   --max-num-seqs "${MAX_NUM_SEQS}" \
   --data-parallel-size 8 \
+  --data-parallel-rpc-port "${DATA_PARALLEL_RPC_PORT}" \
+  --master-port "${MASTER_PORT}" \
   --tensor-parallel-size 1 \
   --enable-expert-parallel \
   --enforce-eager \

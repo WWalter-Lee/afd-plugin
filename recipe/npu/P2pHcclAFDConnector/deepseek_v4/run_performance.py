@@ -68,6 +68,8 @@ def _benchmark_command(
     u_batches: int,
     run_kind: str,
     repeat: int,
+    served_model: str = "dsv4-afd",
+    connector: str = "P2pHcclAFDConnector",
 ) -> list[str]:
     return [
         sys.executable,
@@ -84,7 +86,7 @@ def _benchmark_command(
         "--endpoint",
         "/v1/completions",
         "--model",
-        "dsv4-afd",
+        served_model,
         "--tokenizer",
         str(model_path),
         "--tokenizer-mode",
@@ -120,7 +122,7 @@ def _benchmark_command(
         "--result-filename",
         result_path.name,
         "--metadata",
-        "connector=P2pHcclAFDConnector",
+        f"connector={connector}",
         f"u_batches={u_batches}",
         f"run_kind={run_kind}",
         f"repeat={repeat}",
@@ -408,7 +410,7 @@ def _runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
                     else "A3-P7M1-P1"
                 )
                 if args.enable_mtp
-                else "A3-P4"
+                else "A3-P8"
             ),
             "topology_label": "A8F8",
             "npu_count": TOTAL_NPUS,
@@ -426,6 +428,7 @@ def _runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
                 "ffn_hccl_buffsize": 2048,
                 "attention_hccl_if_base_port": args.attention_hccl_base_port,
                 "ffn_hccl_if_base_port": args.ffn_hccl_base_port,
+                "async_scheduling": args.async_scheduling,
             },
             "workload": {
                 "input_len": args.input_len,
@@ -469,6 +472,7 @@ def _set_service_environment(args: argparse.Namespace) -> None:
             "ATTENTION_HCCL_IF_BASE_PORT": str(args.attention_hccl_base_port),
             "FFN_HCCL_IF_BASE_PORT": str(args.ffn_hccl_base_port),
             "TORCH_PROFILER_WITH_STACK": "0",
+            "AFD_ASYNC_SCHEDULING": args.async_scheduling,
         }
     )
     SHARED._set_mtp_environment(
@@ -771,6 +775,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--npu-sample-interval", type=float, default=2.0)
     parser.add_argument("--max-throughput-cv", type=float, default=0.10)
     parser.add_argument("--benchmark-timeout", type=float, default=1800)
+    parser.add_argument(
+        "--async-scheduling",
+        choices=("auto", "on", "off"),
+        default="off",
+        help=(
+            "Control vLLM host async scheduling for both AFD roles. "
+            "The A3-P8 performance default is off."
+        ),
+    )
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-concurrency", type=int, default=32)
     parser.add_argument("--profile-prompts", type=int, default=128)

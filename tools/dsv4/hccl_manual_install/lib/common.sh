@@ -32,8 +32,12 @@ export PATH="${SYSTEM_PATH}:${PATH:-}"
 
 : "${VLLM_COMMIT:=0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665}"
 : "${VLLM_ASCEND_COMMIT:=3da28f9414583d2d0b672a8f06d1fae142404bda}"
-: "${AFD_BASE_COMMIT:=afc5d2899e23fbe459954e348fa380d727ba099f}"
-: "${AFD_SNAPSHOT_ID:=unpackaged-working-tree}"
+: "${AFD_SOURCE_COMMIT:=d7aeb9b7554803931e42bf405623f212030ed60f}"
+: "${AFD_SOURCE_TREE:=15fb688b54339be6c7dbcb5c15826a3f4895553f}"
+: "${AFD_TARGET_COMMIT:=8f2e7c80d7b7c9c6fd3f350e314189bc9d4359ac}"
+: "${AFD_TARGET_TREE:=8f2dfdb1533353d424ccfd78d66d8647df37ac85}"
+: "${AFD_PATCH_SHA256:=d56906ae5587168b14abc913cb7baa08ed6e2e826578c84674c5c4a7c81e847b}"
+: "${AFD_SNAPSHOT_ID:=dsv4-afd-v023-hccl-mtp-m1-v1}"
 
 log() {
   printf '[hccl-install] %s\n' "$*"
@@ -124,6 +128,6 @@ assert_zero_or_one() {
 print_version_contract() {
   log "vLLM commit: ${VLLM_COMMIT}"
   log "vLLM-Ascend commit: ${VLLM_ASCEND_COMMIT}"
-  log "afd-plugin base: ${AFD_BASE_COMMIT}"
-  log "afd-plugin snapshot: ${AFD_SNAPSHOT_ID}"
+  log "afd-plugin download base: ${AFD_SOURCE_COMMIT}"
+  log "afd-plugin target: ${AFD_TARGET_COMMIT} (${AFD_SNAPSHOT_ID})"
 }

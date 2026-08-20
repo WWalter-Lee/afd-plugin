@@ -1,29 +1,72 @@
 # DeepSeek-V4 AFD HCCL P2P 手工安装包
 
-该包用于把固定的 vLLM 0.23、vLLM-Ascend `rfc/vllm_cann` 和
-`P2pHcclAFDConnector` 部署到另一台 Atlas A3。生成的 transfer archive 包含：
+该目录用于生成可复制到其他 Atlas A3 环境的安装脚本包。默认生成轻量包，
+包内只有安装脚本、固定版本清单和 afd-plugin MTP M1 补丁，不包含三个源码仓库、
+模型或 Python wheel。目标机安装时重新下载：
 
-- vLLM 固定源码；
-- vLLM-Ascend 固定源码及其递归 submodule；
-- afd-plugin 固定 MTP M1 release tag 源码；
-- 主机检查、建 venv、安装依赖、构建、验收、启停和请求 smoke 脚本；
-- 每个文件的 SHA256 和精确源码 manifest。
+- vLLM `0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665`；
+- vLLM-Ascend `3da28f9414583d2d0b672a8f06d1fae142404bda` 及递归 submodule；
+- afd-plugin 已发布基础提交 `d7aeb9b7554803931e42bf405623f212030ed60f`。
 
-Python 依赖 wheel 不默认放入包中。目标机可联网安装，或自行准备完整
-wheelhouse 后设置 `OFFLINE=1`。
+脚本随后校验并应用包内补丁，将 afd-plugin 恢复为
+`dsv4-afd-v023-hccl-mtp-m1-v1` 对应的精确源码树。下载提交、目标 tree、补丁
+SHA256 和包内文件 SHA256 均记录在 `manifest/` 中。
 
-## 1. 解包和配置
+## 0. 从交付 ZIP 开始
+
+如果收到的是 `dsv4-afd-hccl-install-delivery-*.zip`，ZIP 只是指导书和安装包的
+外层容器；其中的 `dsv4-afd-hccl-manual-install-slim-*.tar.gz` 才是需要在
+目标机解开的实际安装脚本包。按以下顺序操作：
 
 ```bash
-tar -xzf dsv4-afd-hccl-manual-install-*.tar.gz
-cd dsv4-afd-hccl-manual-install-*
+unzip dsv4-afd-hccl-install-delivery-*.zip
+cd dsv4-afd-hccl-install-delivery-*
+sha256sum -c SHA256SUMS
+sha256sum -c dsv4-afd-hccl-manual-install-slim-*.tar.gz.sha256
+tar -xzf dsv4-afd-hccl-manual-install-slim-*.tar.gz
+cd dsv4-afd-hccl-manual-install-slim-*
 vi config.env
+bash bin/install_all.sh
 ```
 
-解包前可在 transfer archive 所在目录校验外层文件：
+文件名中的 `*` 匹配构建时间戳。`slim` 表示包内没有完整源码、模型或 Python
+wheel；`bin/02_prepare_sources.sh` 会在目标机下载并校验固定源码。
+
+## 1. 生成轻量包
+
+在开发仓库根目录执行：
 
 ```bash
-sha256sum -c dsv4-afd-hccl-manual-install-*.tar.gz.sha256
+bash tools/dsv4/hccl_manual_install/build_bundle.sh /mnt/workspace/artifacts
+```
+
+生成物名称为：
+
+```text
+dsv4-afd-hccl-manual-install-slim-YYYYmmdd_HHMMSS.tar.gz
+dsv4-afd-hccl-manual-install-slim-YYYYmmdd_HHMMSS.tar.gz.sha256
+```
+
+## 2. 目标机前提
+
+- AArch64、16 张可用 Ascend NPU；
+- CANN 9.0.1 和 Python 3.12 已安装；
+- DeepSeek-V4-Flash W8A8 模型已放到目标机；
+- 可访问配置中的三个 Git 地址、vLLM-Ascend submodule 地址和 Python 包源；
+- 已安装 `git`、`tar`、`curl`、`iproute2`/`iproute` 等基础工具。
+
+如果目标环境使用内部 Git 镜像，可在 `config.env` 中改写三个 `*_GIT_URL`，
+但镜像必须包含清单指定的提交。
+
+## 3. 解包和配置
+
+先校验并解包：
+
+```bash
+sha256sum -c dsv4-afd-hccl-manual-install-slim-*.tar.gz.sha256
+tar -xzf dsv4-afd-hccl-manual-install-slim-*.tar.gz
+cd dsv4-afd-hccl-manual-install-slim-*
+vi config.env
 ```
 
 必须修改：
@@ -33,22 +76,18 @@ sha256sum -c dsv4-afd-hccl-manual-install-*.tar.gz.sha256
 - `PYTHON_BIN`：Python 3.12；
 - `SOC_VERSION`：目标机真实 SoC；
 - `NIC_NAME` 和 `HCCL_IF_IP`；
-- 安装、源码、日志目录。
+- 安装、源码、日志目录；
+- 必要时修改 Git 和 pip 镜像地址。
 
-不要把验证机的 IP 复制到其他机器，也不要在已经 source CANN 9.1.0 的
-shell 中直接继续。
+轻量包保持 `USE_BUNDLED_SOURCES="0"`。不要把验证机 IP 复制到其他机器，
+也不要在已经 source CANN 9.1.0 的 shell 中继续安装。
 
-## 2. 校验包
+## 4. 校验和安装
 
 ```bash
 sha256sum -c manifest/SHA256SUMS
 bash bin/00_print_config.sh
 bash bin/01_preflight.sh
-```
-
-## 3. 分步安装
-
-```bash
 bash bin/02_prepare_sources.sh
 bash bin/03_create_venv.sh
 bash bin/04_install_python_deps.sh
@@ -62,23 +101,35 @@ bash bin/06_verify_install.sh
 bash bin/install_all.sh
 ```
 
-这些脚本默认拒绝复用非空源码目录或已有 venv。确认目标正确后，分别设置
-`REUSE_SOURCES=1` 或 `REUSE_VENV=1`，不要通过删除未知目录绕过检查。
+`02_prepare_sources.sh` 会克隆固定提交、初始化 vLLM-Ascend submodule、校验
+afd-plugin 补丁并比对最终 Git tree。任一版本不匹配都会停止。
 
-## 4. 离线安装
+这些脚本默认拒绝复用非空源码目录或已有 venv。确认目录内容正确后，分别设置
+`REUSE_SOURCES=1` 或 `REUSE_VENV=1`。
 
-源码已在 transfer archive 中。Python wheel 需要在同架构、同 Python
-版本的联网机器上预先下载到一个目录，并随包拷贝到目标机。配置：
+## 5. Python wheel 离线安装
+
+轻量包的源码阶段需要访问 Git；`OFFLINE=1` 只控制 Python wheel 安装。先在
+同架构、同 Python 版本的机器上准备完整 wheelhouse，再配置：
 
 ```bash
 OFFLINE="1"
 WHEELHOUSE="/path/to/wheelhouse"
 ```
 
-离线脚本会强制使用 `--no-index --find-links`，缺少任何直接或间接依赖时
-立即失败，不会静默访问公网。
+脚本会使用 `--no-index --find-links`，缺少任何直接或间接依赖时立即失败。
 
-## 5. 启动和停止
+目标机完全不能下载源码时，可以显式生成完整源码包：
+
+```bash
+INCLUDE_SOURCES=1 \
+  bash tools/dsv4/hccl_manual_install/build_bundle.sh /mnt/workspace/artifacts
+```
+
+完整包名称包含 `with-sources`，体积会明显增大。要做到完全离线，还需通过
+`INCLUDE_WHEELHOUSE=/path/to/wheels` 同时加入完整 wheelhouse。
+
+## 6. 启动和停止
 
 默认配置启动已验证的 A8F8 Graph/U1：
 
@@ -88,9 +139,6 @@ bash bin/08_status.sh
 bash bin/10_smoke_request.sh
 bash bin/09_stop.sh
 ```
-
-`07_start.sh` 先启动 FFN，2 秒后启动 Attention，并等待 Attention health；
-不会探测 FFN HTTP。停止顺序固定为 Attention 后 FFN。
 
 运行 eager/U1 + MTP M1 时修改：
 
@@ -102,12 +150,6 @@ MTP_NUM_SPECULATIVE_TOKENS="1"
 ```
 
 MTP M1 只支持等量 A8F8、eager/U1、一个 MTP layer 和一个 speculative token。
-
-## 6. 当前 MTP 源码状态
-
-正式安装包固定使用 `dsv4-afd-v023-hccl-mtp-m1-v1`。打包器要求该 tag
-存在、当前 HEAD 与 tag 一致且工作树干净；不接受未提交的 runtime overlay。
-部署或审计时以 `manifest/versions.env` 和 `manifest/SHA256SUMS` 为准。
 
 ## 7. 运行边界
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import inspect
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -287,6 +288,126 @@ def test_attention_target_allocates_mtp_hidden_buffer_only_when_enabled(
 
     assert model._mtp_hidden_buffer.shape == (8, 32)
     assert model._mtp_hidden_buffer.dtype == torch.bfloat16
+
+
+def test_attention_layer_major_u2_runs_layer_then_stage(monkeypatch):
+    events = []
+    active_context = [None]
+
+    @contextmanager
+    def use_forward_context(forward_context):
+        previous = active_context[0]
+        active_context[0] = forward_context
+        try:
+            yield
+        finally:
+            active_context[0] = previous
+
+    class FakeConnector:
+        def require_attention_pipeline_idle(self):
+            events.append(("idle",))
+
+        def wait_for_attention_stage_receive(self, *, stage_idx, tensor):
+            events.append(("wait", stage_idx, tuple(tensor.shape)))
+
+        def reset_attention_pipeline_state(self):
+            events.append(("reset",))
+
+    class FakeEmbedding(nn.Module):
+        def forward(self, input_ids):
+            events.append(("embed", active_context[0].ubatch_idx))
+            return input_ids.float().unsqueeze(-1)
+
+    class FakeLayer(nn.Module):
+        def __init__(self, layer_idx):
+            super().__init__()
+            self.layer_idx = layer_idx
+
+        def forward_attention_to_remote_ffn(
+            self,
+            _positions,
+            hidden_states,
+            _residual,
+            _scaling,
+        ):
+            events.append(("layer", self.layer_idx, active_context[0].ubatch_idx))
+            continuation = (hidden_states, hidden_states, hidden_states)
+            return hidden_states + self.layer_idx + 1, continuation
+
+        def complete_remote_ffn(self, ffn_output, _continuation):
+            events.append(("complete", self.layer_idx, active_context[0].ubatch_idx))
+            return ffn_output
+
+    connector = FakeConnector()
+    model = object.__new__(adapter.AFDDeepseekV4Model)
+    nn.Module.__init__(model)
+    model.afd_role = "attention"
+    model.mtp_enabled = False
+    model.hc_mult = 1
+    model.start_layer = 0
+    model.end_layer = 2
+    model.layers = nn.ModuleList([FakeLayer(0), FakeLayer(1)])
+    model.embed_tokens = FakeEmbedding()
+    model.aux_hidden_state_layers = ()
+    model.hc_head = lambda hidden_states, *_args: hidden_states.squeeze(1)
+    model.hc_head_fn = None
+    model.hc_head_scale = None
+    model.hc_head_base = None
+    model.norm = nn.Identity()
+
+    def stage(input_ids, stage_idx):
+        forward_context = SimpleNamespace(
+            additional_kwargs={
+                "afd_metadata": SimpleNamespace(connector=connector),
+            },
+            ubatch_idx=stage_idx,
+        )
+        return SimpleNamespace(
+            context=SimpleNamespace(forward_context=forward_context),
+            input_ids=input_ids,
+            inputs_embeds=None,
+            intermediate_tensors=None,
+            positions=torch.arange(input_ids.shape[0]),
+        )
+
+    monkeypatch.setattr(adapter, "override_forward_context", use_forward_context)
+    monkeypatch.setattr(
+        adapter.native,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    metadata = [
+        stage(torch.tensor([1, 2]), 0),
+        stage(torch.tensor([10]), 1),
+    ]
+
+    outputs = model.forward_ubatches_layer_major(metadata)
+
+    assert [output.tolist() for output in outputs] == [
+        [[4.0], [5.0]],
+        [[13.0]],
+    ]
+    assert events == [
+        ("idle",),
+        ("embed", 0),
+        ("embed", 1),
+        ("layer", 0, 0),
+        ("layer", 0, 1),
+        ("wait", 0, (2, 1, 1)),
+        ("complete", 0, 0),
+        ("layer", 1, 0),
+        ("wait", 1, (1, 1, 1)),
+        ("complete", 0, 1),
+        ("layer", 1, 1),
+        ("wait", 0, (2, 1, 1)),
+        ("complete", 1, 0),
+        ("wait", 1, (1, 1, 1)),
+        ("complete", 1, 1),
+    ]
+    assert all(
+        metadata[stage_idx].context.forward_context.afd_layer_major_u2
+        for stage_idx in range(2)
+    )
 
 
 @pytest.mark.parametrize("role", ["attention", "ffn"])

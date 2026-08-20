@@ -1,5 +1,57 @@
 # DeepSeek-V4 AFD HCCL P2P 安装部署指南
 
+## 0. 交付包结构和安装入口
+
+收到的 `dsv4-afd-hccl-install-delivery-*.zip` 是外层交付包，用于把指导书、
+实际安装包和校验文件放在一起。解压后的结构如下：
+
+```text
+dsv4-afd-hccl-install-delivery-*/
+├── INSTALL_DEPLOYMENT_GUIDE_ZH.md
+├── PACKAGE_README_ZH.md
+├── dsv4-afd-hccl-manual-install-slim-*.tar.gz
+├── dsv4-afd-hccl-manual-install-slim-*.tar.gz.sha256
+└── SHA256SUMS
+```
+
+其中 `dsv4-afd-hccl-manual-install-slim-*.tar.gz` 是目标机真正要解开的安装
+脚本包。文件名中的 `*` 只是构建时间戳通配符，不代表还需要寻找其他文件。
+该包使用 `tar.gz` 是为了保留 Linux 目录结构和脚本执行权限；它包含：
+
+- `bin/`：环境检查、源码下载、依赖安装、构建、验收、启停和请求脚本；
+- `config.env`：目标机部署参数；
+- `manifest/`：固定版本、AFD MTP M1 补丁和 SHA256；
+- `README_ZH.md`：脚本包使用说明。
+
+`slim` 表示轻量包：不包含 vLLM、vLLM-Ascend、afd-plugin 完整源码，也不
+包含模型和 Python wheel。执行安装时，`bin/02_prepare_sources.sh` 会下载固定
+源码并校验版本。
+
+目标机从 ZIP 开始的推荐流程如下：
+
+```bash
+unzip dsv4-afd-hccl-install-delivery-*.zip
+cd dsv4-afd-hccl-install-delivery-*
+
+# 校验 ZIP 内全部交付文件和实际安装包。
+sha256sum -c SHA256SUMS
+sha256sum -c dsv4-afd-hccl-manual-install-slim-*.tar.gz.sha256
+
+# 解开实际安装脚本包。
+tar -xzf dsv4-afd-hccl-manual-install-slim-*.tar.gz
+cd dsv4-afd-hccl-manual-install-slim-*
+
+# 按目标机修改路径、网卡、SoC、Git/pip 镜像等参数。
+vi config.env
+
+# 完整安装从配置打印和环境门禁开始，门禁失败不会继续安装。
+bash bin/install_all.sh
+```
+
+`install_all.sh` 会运行配置打印和 preflight，然后依次完成源码准备、
+venv 创建、Python 依赖安装、vLLM/vLLM-Ascend/afd-plugin 安装及验收。需要逐步
+排障时，按脚本包 `README_ZH.md` 中的分步命令执行。
+
 ## 1. 适用范围
 
 本文给出 `P2pHcclAFDConnector` 的单机 Atlas A3 安装、启动和验收方法，
@@ -98,7 +150,12 @@ env | sort | rg '^(ASCEND|CANN|PATH|PYTHONPATH|LD_LIBRARY_PATH)='
 
 以下目录与仓库内现有激活、检查和 recipe 脚本一致。对已有工作区先执行`git status --short`，有本地改动时不要强制切换提交。
 
+使用轻量安装包时，推荐在修改 `config.env` 后直接执行
+`bash bin/02_prepare_sources.sh`，由脚本完成以下下载、补丁和 tree 校验。只有
+需要完全手工安装时才执行本节命令。手工方式必须先设置已解开的安装包目录：
+
 ```bash
+export INSTALL_BUNDLE_ROOT=/path/to/dsv4-afd-hccl-manual-install-slim-YYYYmmdd_HHMMSS
 export CODE_ROOT=/mnt/workspace/code
 mkdir -p "${CODE_ROOT}"
 
@@ -117,16 +174,35 @@ git -C "${CODE_ROOT}/vllm-ascend-rfc-vllm-cann" \
 git clone https://github.com/wenhow/afd-plugin.git \
   "${CODE_ROOT}/afd-plugin"
 git -C "${CODE_ROOT}/afd-plugin" checkout --detach \
-  dsv4-afd-v023-hccl-mtp-m1-v1
+  d7aeb9b7554803931e42bf405623f212030ed60f
+
+(
+  cd "${INSTALL_BUNDLE_ROOT}"
+  sha256sum -c manifest/SHA256SUMS
+)
+git -C "${CODE_ROOT}/afd-plugin" apply --index \
+  "${INSTALL_BUNDLE_ROOT}/manifest/afd-plugin-mtp-m1.patch"
+
+test "$(git -C "${CODE_ROOT}/afd-plugin" write-tree)" = \
+  8f2dfdb1533353d424ccfd78d66d8647df37ac85
 ```
+
+MTP M1 tag 尚未发布到远端，因此不能直接按 tag checkout。上述已发布基础提交
+加包内补丁会重建与 `dsv4-afd-v023-hccl-mtp-m1-v1` 完全相同的源码 tree。
 
 核对三个固定点：
 
 ```bash
 git -C "${CODE_ROOT}/vllm-release-v0.23.0" rev-parse HEAD
 git -C "${CODE_ROOT}/vllm-ascend-rfc-vllm-cann" rev-parse HEAD
-git -C "${CODE_ROOT}/afd-plugin" describe --tags --exact-match
+git -C "${CODE_ROOT}/afd-plugin" rev-parse HEAD
+git -C "${CODE_ROOT}/afd-plugin" write-tree
 ```
+
+预期依次为 vLLM `0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665`、
+vLLM-Ascend `3da28f9414583d2d0b672a8f06d1fae142404bda`、afd-plugin 基础提交
+`d7aeb9b7554803931e42bf405623f212030ed60f` 和 MTP M1 目标 tree
+`8f2dfdb1533353d424ccfd78d66d8647df37ac85`。
 
 ## 5. 创建 Python 环境
 
@@ -579,18 +655,21 @@ ss -ltnp | rg ':(8910|8911|29761|51000|52000)\b' || true
 tools/dsv4/hccl_manual_install/
 ```
 
-在开发机生成包含固定 vLLM、vLLM-Ascend、递归 submodule 和当前 afd-plugin
-MTP M1 运行时快照的 transfer archive：
+默认生成轻量 transfer archive。包内只包含脚本、固定版本清单和 afd-plugin
+MTP M1 补丁；目标机重新下载 vLLM、vLLM-Ascend（含递归 submodule）和
+afd-plugin 基础源码：
 
 ```bash
 bash tools/dsv4/hccl_manual_install/build_bundle.sh /mnt/workspace/artifacts
 ```
 
-生成物同时包含 `.tar.gz` 和 `.tar.gz.sha256`。Python 依赖 wheel 默认不进入
-包内；目标机可联网安装，或在构建时设置 `INCLUDE_WHEELHOUSE=/path/to/wheels`
-加入同架构、同 Python 版本的完整 wheelhouse。详细步骤见
+生成物名称包含 `slim`，同时提供 `.tar.gz.sha256`。源码、模型和 Python wheel
+均不进入轻量包。目标机可联网安装；若必须携带源码，可设置
+`INCLUDE_SOURCES=1` 生成名称包含 `with-sources` 的完整包。Python wheel 可在
+构建时设置 `INCLUDE_WHEELHOUSE=/path/to/wheels` 加入。详细步骤见
 [`hccl_manual_install/README_ZH.md`](../../tools/dsv4/hccl_manual_install/README_ZH.md)。
 
-正式包固定使用 `dsv4-afd-v023-hccl-mtp-m1-v1`。打包器要求该 tag 存在、
-当前 HEAD 与 tag 一致且工作树干净，并记录精确 commit 和 SHA256；它不会把
-未提交的工作树内容伪装成 release。
+正式包固定使用 `dsv4-afd-v023-hccl-mtp-m1-v1`。由于该 MTP M1 tag 尚未发布
+到远端，轻量包从已发布提交 `d7aeb9b7554803931e42bf405623f212030ed60f`
+下载 afd-plugin，再应用包内补丁。打包和目标机安装都会校验最终 Git tree、
+精确 commit 以及 SHA256。

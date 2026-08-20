@@ -41,6 +41,7 @@ from afd_plugin.connectors.npu.async_cam import (
     AFDAsyncTransferState,
     CAMAsyncAFDConnector,
 )
+from afd_plugin.connectors.npu.p2p_hccl import P2pHcclAFDConnector
 from afd_plugin.v1.worker.attention_model_runner import (
     _resolve_world_ranks,
 )
@@ -85,6 +86,18 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             self.afd_config,
         )
         self.num_layers = int(self.model_config.hf_config.num_hidden_layers)
+        self.ffn_stream_overlap_enabled = bool(
+            isinstance(self.connector, P2pHcclAFDConnector)
+            and self.connector.stream_overlap_enabled
+        )
+        self.ffn_recv_stream = None
+        self.ffn_compute_stream = None
+        self.ffn_send_stream = None
+        self.ffn_recv_events: dict[tuple[int, int], Any] = {}
+        self.ffn_compute_events: dict[tuple[int, int], Any] = {}
+        self.ffn_send_events: dict[tuple[int, int], Any] = {}
+        if self.ffn_stream_overlap_enabled:
+            self._initialize_ffn_stream_pipeline(device)
         self.use_aclgraph = _use_npu_aclgraph(vllm_config, self)
         self._acl_graphs: dict[tuple, dict[str, Any]] = {}
         self.graph_pool = (
@@ -94,6 +107,21 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self._is_shutdown = False
         self._ffn_input_ids_cache: dict[int, torch.Tensor] = {}
         self.mtp_ffn_model: torch.nn.Module | None = None
+
+    def _initialize_ffn_stream_pipeline(self, device: torch.device) -> None:
+        """Create eager U2 receive, compute, and send streams for FFN."""
+        self.ffn_recv_stream = torch.npu.Stream(device=device)
+        self.ffn_compute_stream = torch.npu.Stream(device=device)
+        self.ffn_send_stream = torch.npu.Stream(device=device)
+        stage_ids = range(int(self.vllm_config.parallel_config.num_ubatches))
+        event_keys = [
+            (layer_idx, stage_idx)
+            for layer_idx in range(self.num_layers)
+            for stage_idx in stage_ids
+        ]
+        self.ffn_recv_events = {key: torch.npu.Event() for key in event_keys}
+        self.ffn_compute_events = {key: torch.npu.Event() for key in event_keys}
+        self.ffn_send_events = {key: torch.npu.Event() for key in event_keys}
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
@@ -352,7 +380,10 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             tokens_lens=[],
             num_stages=num_stages,
         )
-        stage_ids = sorted(int(stage_idx) for stage_idx in dp_metadata_list) or [0]
+        stage_ids = tuple(sorted(int(stage_idx) for stage_idx in dp_metadata_list)) or (
+            0,
+        )
+        layer_indices = tuple(_ffn_layer_indices(self))
         stage_runtime: dict[int, tuple[int, torch.Tensor]] = {}
         dp_size = int(self.vllm_config.parallel_config.data_parallel_size)
         for stage_idx in stage_ids:
@@ -397,20 +428,49 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         if input_ids_cache is None:
             input_ids_cache = self._ffn_input_ids_cache = {}
         input_ids_cache.clear()
+        stream_overlap = bool(
+            getattr(self, "ffn_stream_overlap_enabled", False)
+            and len(stage_ids) > 1
+            and not is_graph_capturing
+            and aclgraph_runtime_mode in (None, CUDAGraphMode.NONE)
+        )
+        if stream_overlap:
+            assert isinstance(self.connector, P2pHcclAFDConnector)
+            assert self.ffn_recv_stream is not None
+            assert self.ffn_compute_stream is not None
+            assert self.ffn_send_stream is not None
         try:
-            for layer_idx in _ffn_layer_indices(self):
+            for layer_idx in layer_indices:
                 for stage_idx in stage_ids:
                     stage_input_ids = (
                         input_ids_by_stage.get(stage_idx)
                         if input_ids_by_stage is not None and layer_idx == 0
                         else None
                     )
-                    payload = self.connector.recv_attn_output(
-                        ubatch_idx=stage_idx,
-                        layer_idx=layer_idx,
-                        max_num_tokens=self.max_num_tokens,
-                        input_ids=stage_input_ids,
-                    )
+                    recv_event = None
+                    if stream_overlap:
+                        previous_send_event = (
+                            self.ffn_send_events[(layer_idx - 1, stage_idx)]
+                            if layer_idx > 0
+                            else None
+                        )
+                        recv_event = self.ffn_recv_events[(layer_idx, stage_idx)]
+                        payload, recv_event = self.connector.recv_attn_output_streamed(
+                            ubatch_idx=stage_idx,
+                            layer_idx=layer_idx,
+                            max_num_tokens=self.max_num_tokens,
+                            input_ids=stage_input_ids,
+                            recv_stream=self.ffn_recv_stream,
+                            wait_event=previous_send_event,
+                            done_event=recv_event,
+                        )
+                    else:
+                        payload = self.connector.recv_attn_output(
+                            ubatch_idx=stage_idx,
+                            layer_idx=layer_idx,
+                            max_num_tokens=self.max_num_tokens,
+                            input_ids=stage_input_ids,
+                        )
                     if layer_idx == 0 and num_hash_layers > 0:
                         if payload.input_ids is None:
                             raise RuntimeError(
@@ -440,17 +500,56 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                         compute_kwargs = {}
                         if hash_input_ids is not None:
                             compute_kwargs["input_ids"] = hash_input_ids
-                        rank_ffn_output = self.model.compute_ffn_output(
-                            hidden_states=hidden_states,
-                            layer_idx=layer_idx,
-                            **compute_kwargs,
-                        )
-                        _send_ffn_output(
-                            self.connector,
-                            rank_ffn_output,
-                            context,
-                            stage_idx=stage_idx,
-                        )
+                        if stream_overlap:
+                            assert recv_event is not None
+                            compute_event = self.ffn_compute_events[
+                                (layer_idx, stage_idx)
+                            ]
+                            with torch.npu.stream(self.ffn_compute_stream):
+                                recv_event.wait(self.ffn_compute_stream)
+                                _record_npu_stream(
+                                    hidden_states,
+                                    self.ffn_compute_stream,
+                                )
+                                if hash_input_ids is not None:
+                                    _record_npu_stream(
+                                        hash_input_ids,
+                                        self.ffn_compute_stream,
+                                    )
+                                rank_ffn_output = self.model.compute_ffn_output(
+                                    hidden_states=hidden_states,
+                                    layer_idx=layer_idx,
+                                    **compute_kwargs,
+                                )
+                                compute_event.record(self.ffn_compute_stream)
+                            send_event = self.ffn_send_events[(layer_idx, stage_idx)]
+                            self.connector.send_ffn_output_streamed(
+                                rank_ffn_output,
+                                context,
+                                ubatch_idx=stage_idx,
+                                send_stream=self.ffn_send_stream,
+                                wait_event=compute_event,
+                                done_event=send_event,
+                            )
+                        else:
+                            rank_ffn_output = self.model.compute_ffn_output(
+                                hidden_states=hidden_states,
+                                layer_idx=layer_idx,
+                                **compute_kwargs,
+                            )
+                            _send_ffn_output(
+                                self.connector,
+                                rank_ffn_output,
+                                context,
+                                stage_idx=stage_idx,
+                            )
+            if stream_overlap:
+                current_stream = torch.npu.current_stream()
+                final_layer_idx = layer_indices[-1]
+                for stage_idx in stage_ids:
+                    self.ffn_send_events[(final_layer_idx, stage_idx)].wait(
+                        current_stream
+                    )
         finally:
             input_ids_cache.clear()
         return rank_ffn_output
@@ -707,6 +806,11 @@ def _send_ffn_output(
         context,
         **kwargs,
     )
+
+
+def _record_npu_stream(tensor: torch.Tensor, stream) -> None:
+    if tensor.device.type == "npu":
+        tensor.record_stream(stream)
 
 
 def _ffn_layer_indices(runner: AFDNPUFFNModelRunner) -> range | list[int]:

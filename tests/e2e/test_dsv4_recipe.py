@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ VALIDATOR_PATH = (
 )
 HCCL_RECIPE_DIR = REPO_ROOT / "recipe/npu/P2pHcclAFDConnector/deepseek_v4"
 PERFORMANCE_RUNNER_PATH = HCCL_RECIPE_DIR / "run_performance.py"
+NATIVE_PERFORMANCE_RUNNER_PATH = HCCL_RECIPE_DIR / "run_native_performance.py"
 MTP_AUDIT_PATH = REPO_ROOT / "tools/dsv4/audit_mtp_contract.py"
 
 
@@ -41,6 +43,17 @@ def _load_performance_runner():
     spec = importlib.util.spec_from_file_location(
         "dsv4_run_performance",
         PERFORMANCE_RUNNER_PATH,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_native_performance_runner():
+    spec = importlib.util.spec_from_file_location(
+        "dsv4_run_native_performance",
+        NATIVE_PERFORMANCE_RUNNER_PATH,
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -110,6 +123,10 @@ def test_dsv4_role_scripts_offer_u1_graph_and_eager_u2():
         assert 'MTP_NUM_SPECULATIVE_TOKENS="${MTP_NUM_SPECULATIVE_TOKENS:-1}"' in (
             script
         )
+        assert 'AFD_ASYNC_SCHEDULING="${AFD_ASYNC_SCHEDULING:-auto}"' in script
+        assert "SCHEDULING_ARGS=(--async-scheduling)" in script
+        assert "SCHEDULING_ARGS=(--no-async-scheduling)" in script
+        assert '"${SCHEDULING_ARGS[@]}"' in script
         assert '"method":"mtp"' in script
         assert '"num_speculative_tokens":1' in script
         assert "MTP_DRAFT_ENFORCE_EAGER=true" in script
@@ -371,6 +388,106 @@ def test_dsv4_performance_command_locks_workload_and_fixed_python(tmp_path):
     assert "u_batches=2" in command
 
 
+def test_dsv4_native_pair_splits_total_load_without_changing_budget():
+    runner = _load_native_performance_runner()
+
+    assert runner._split_load(1, 8) == [(1, 8), (0, 0)]
+    assert runner._split_load(8, 32) == [(4, 16), (4, 16)]
+    assert runner._split_load(32, 128) == [(16, 64), (16, 64)]
+    with pytest.raises(ValueError, match="cover total concurrency"):
+        runner._split_load(8, 7)
+
+
+def test_dsv4_native_pair_uses_disjoint_devices_ports_and_no_afd_plugin(tmp_path):
+    runner = _load_native_performance_runner()
+    args = SimpleNamespace(
+        model=tmp_path / "model",
+        api_ports=[8920, 8921],
+        dp_rpc_ports=[29350, 29450],
+        master_ports=[29351, 29451],
+        hccl_base_ports=[53000, 54000],
+        max_model_len=4096,
+        max_num_batched_tokens=1024,
+        max_num_seqs=8,
+        gpu_memory_utilization=0.9,
+        enable_mtp=False,
+        mtp_num_speculative_tokens=1,
+    )
+
+    env0 = runner._service_environment(args, 0)
+    env1 = runner._service_environment(args, 1)
+
+    assert env0["ASCEND_RT_VISIBLE_DEVICES"] == "0,1,2,3,4,5,6,7"
+    assert env1["ASCEND_RT_VISIBLE_DEVICES"] == "8,9,10,11,12,13,14,15"
+    assert env0["DATA_PARALLEL_RPC_PORT"] != env1["DATA_PARALLEL_RPC_PORT"]
+    assert env0["MASTER_PORT"] != env1["MASTER_PORT"]
+    assert env0["HCCL_IF_BASE_PORT"] != env1["HCCL_IF_BASE_PORT"]
+    assert env0["VLLM_PLUGINS"] == runner.NATIVE_PLUGINS
+    assert ",afd" not in env0["VLLM_PLUGINS"]
+
+    service_script = runner.NATIVE_SERVICE_SCRIPT.read_text(encoding="utf-8")
+    assert '--data-parallel-rpc-port "${DATA_PARALLEL_RPC_PORT}"' in service_script
+    assert '--master-port "${MASTER_PORT}"' in service_script
+
+
+def test_dsv4_native_pair_merges_shared_request_window_and_latencies():
+    runner = _load_native_performance_runner()
+    common = {
+        "completed": 1,
+        "failed": 0,
+        "total_input_tokens": 4,
+        "total_output_tokens": 2,
+        "input_lens": [4],
+        "output_lens": [2],
+        "errors": [""],
+        "duration": 2.5,
+    }
+    first = {
+        **common,
+        "ttfts": [1.0],
+        "itls": [[1.0]],
+        "start_times": [10.0],
+    }
+    second = {
+        **common,
+        "ttfts": [0.5],
+        "itls": [[2.0]],
+        "start_times": [10.5],
+    }
+
+    merged = runner._merge_results([first, second])
+
+    assert merged["duration"] == 3.0
+    assert merged["completed"] == 2
+    assert merged["total_input_tokens"] == 8
+    assert merged["total_output_tokens"] == 4
+    assert merged["output_throughput"] == pytest.approx(4 / 3)
+    assert merged["p50_ttft_ms"] == 750.0
+    assert merged["p50_tpot_ms"] == 1500.0
+    assert merged["p99_e2el_ms"] == pytest.approx(2495.0)
+
+
+def test_dsv4_native_pair_ignores_thread_exception_only_after_shutdown(tmp_path):
+    runner = _load_native_performance_runner()
+    for index in range(2):
+        (tmp_path / f"native{index}.log").write_text(
+            "service ready\n[shutdown] stopping\nException in thread Thread-2:\n",
+            encoding="utf-8",
+        )
+
+    ignored = runner._service_log_gate(tmp_path)
+    assert ignored["passed"] is True
+    assert ignored["roles"]["native0"]["ignored_shutdown_thread_exceptions"] == 1
+
+    (tmp_path / "native1.log").write_text(
+        "Exception in thread Thread-2:\n[shutdown] stopping\n",
+        encoding="utf-8",
+    )
+    fatal = runner._service_log_gate(tmp_path)
+    assert fatal["passed"] is False
+    assert fatal["roles"]["native1"]["fatal_markers"] == ["Exception in thread"]
+
+
 def test_dsv4_performance_reproducibility_files_are_hashed():
     runner = _load_performance_runner()
 
@@ -378,6 +495,25 @@ def test_dsv4_performance_reproducibility_files_are_hashed():
         digest = runner._file_sha256(path)
         assert len(digest) == 64
         assert digest == runner.hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_dsv4_performance_defaults_to_validated_sync_scheduler(monkeypatch, tmp_path):
+    runner = _load_performance_runner()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(PERFORMANCE_RUNNER_PATH),
+            "--output-dir",
+            str(tmp_path),
+            "--u-batches",
+            "1",
+        ],
+    )
+
+    args = runner._parse_args()
+
+    assert args.async_scheduling == "off"
 
 
 def test_dsv4_performance_mtp_uses_m1_gate_and_environment(monkeypatch):
@@ -416,11 +552,13 @@ def test_dsv4_performance_mtp_uses_m1_gate_and_environment(monkeypatch):
             gpu_memory_utilization=0.9,
             attention_hccl_base_port=51000,
             ffn_hccl_base_port=52000,
+            async_scheduling="off",
             profile=False,
         )
     )
     assert runner.os.environ["ENABLE_MTP"] == "1"
     assert runner.os.environ["MTP_NUM_SPECULATIVE_TOKENS"] == "1"
+    assert runner.os.environ["AFD_ASYNC_SCHEDULING"] == "off"
 
 
 def test_dsv4_performance_mtp_manifest_preserves_structured_topology(monkeypatch):
@@ -445,6 +583,7 @@ def test_dsv4_performance_mtp_manifest_preserves_structured_topology(monkeypatch
         gpu_memory_utilization=0.9,
         attention_hccl_base_port=51000,
         ffn_hccl_base_port=52000,
+        async_scheduling="off",
         input_len=1024,
         output_len=128,
         concurrencies=[32],
@@ -466,6 +605,7 @@ def test_dsv4_performance_mtp_manifest_preserves_structured_topology(monkeypatch
     assert manifest["enable_mtp"] is True
     assert manifest["mtp_num_speculative_tokens"] == 1
     assert manifest["mtp_draft_execution"] == "eager"
+    assert manifest["service"]["async_scheduling"] == "off"
     assert manifest["topology"] == runner._a8f8_topology(1024)
 
     args.execution_mode = "full-decode-only"

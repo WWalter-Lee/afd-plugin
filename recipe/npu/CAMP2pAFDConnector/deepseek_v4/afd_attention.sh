@@ -28,6 +28,7 @@ MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-8}"
 CUDAGRAPH_CAPTURE_SIZES="${CUDAGRAPH_CAPTURE_SIZES:-1 2 4 8}"
 ENABLE_MTP="${ENABLE_MTP:-0}"
 MTP_NUM_SPECULATIVE_TOKENS="${MTP_NUM_SPECULATIVE_TOKENS:-1}"
+AFD_ASYNC_SCHEDULING="${AFD_ASYNC_SCHEDULING:-auto}"
 
 export ASCEND_RT_VISIBLE_DEVICES="${ATTENTION_DEVICES:-${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}}"
 export HCCL_IF_IP="${HCCL_IF_IP:-192.169.91.106}"
@@ -145,6 +146,22 @@ case "$U_BATCHES" in
     ;;
 esac
 
+case "$AFD_ASYNC_SCHEDULING" in
+  auto)
+    SCHEDULING_ARGS=()
+    ;;
+  on)
+    SCHEDULING_ARGS=(--async-scheduling)
+    ;;
+  off)
+    SCHEDULING_ARGS=(--no-async-scheduling)
+    ;;
+  *)
+    echo "AFD_ASYNC_SCHEDULING must be auto, on, or off" >&2
+    exit 2
+    ;;
+esac
+
 exec vllm serve "$MODEL_PATH" \
   --host "$API_HOST" \
   --port "$API_PORT" \
@@ -164,6 +181,7 @@ exec vllm serve "$MODEL_PATH" \
   --quantization ascend \
   --block-size 128 \
   --additional-config "$ADDITIONAL_CONFIG" \
+  "${SCHEDULING_ARGS[@]}" \
   "${MTP_ARGS[@]}" \
   "${UBATCH_ARGS[@]}" \
   "${EXECUTION_ARGS[@]}"

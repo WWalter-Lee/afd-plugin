@@ -94,6 +94,7 @@ from afd_plugin.connectors import (
     AFDForwardContextMetadata,
 )
 from afd_plugin.connectors.npu.async_cam import AFDAsyncExtraInfo
+from afd_plugin.connectors.npu.p2p_hccl import P2pHcclAFDConnector
 from afd_plugin.model_executor.models import ASYNC_MOE_UBATCH_METADATA_KEY
 from afd_plugin.v1.worker.attention_model_runner import (
     _forward_context_num_tokens,
@@ -318,15 +319,28 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         # the Python runner so every graph replay sees the current IDs while the
         # model-side layer-0 proxy only launches the hidden-state custom op.
         connector = getattr(self, "connector", None)
+        uses_hccl_stream_pipeline = bool(
+            isinstance(connector, P2pHcclAFDConnector)
+            and connector.attention_stream_pipeline_ready
+            and self.ubatch_slices is not None
+        )
         pretransfer_input_ids = bool(
             connector is not None
             and getattr(connector, "requires_input_ids", False)
-            and self.ubatch_slices is None
+            and (self.ubatch_slices is None or uses_hccl_stream_pipeline)
         )
         if pretransfer_input_ids:
             if input_ids is None:
                 raise RuntimeError("DSV4 Attention model forward requires input_ids")
-            connector.send_input_ids(input_ids, ubatch_idx=0)
+            if uses_hccl_stream_pipeline:
+                assert self.ubatch_slices is not None
+                for stage_idx, ubatch_slice in enumerate(self.ubatch_slices):
+                    connector.send_input_ids(
+                        input_ids[ubatch_slice.token_slice],
+                        ubatch_idx=stage_idx,
+                    )
+            else:
+                connector.send_input_ids(input_ids, ubatch_idx=0)
         previous_pretransfer = getattr(
             forward_context,
             "afd_input_ids_pretransferred",
@@ -1650,6 +1664,16 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             runtime_mode = CUDAGraphMode.FULL
         elif self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             runtime_mode = CUDAGraphMode.FULL
+        connector = getattr(self, "connector", None)
+        enable_layer_major_eager_u2 = bool(
+            isinstance(connector, P2pHcclAFDConnector)
+            and connector.stream_overlap_enabled
+            and not connector.requires_mtp
+            and runtime_mode is CUDAGraphMode.NONE
+            and callable(
+                getattr(model, "forward_ubatches_layer_major", None),
+            )
+        )
         self.model = AscendUBatchWrapper(
             model,
             self.vllm_config,
@@ -1660,6 +1684,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             ),
             full_graph_params_updater=self._update_full_graph_params_if_needed,
             enable_enpu=self.enable_enpu,
+            enable_layer_major_eager_u2=enable_layer_major_eager_u2,
         )
 
     def get_model(self) -> nn.Module:

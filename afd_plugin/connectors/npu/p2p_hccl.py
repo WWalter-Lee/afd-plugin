@@ -9,10 +9,15 @@ DeepSeek-V4 input IDs are transferred with ``torch.distributed.send`` and
 the CAMP2P A2E/E2A custom operators.
 
 The connector supports one or more consecutive Attention peers per FFN rank
-(``A = k * F``). Each DBO stage owns an independent HCCL group so two stage
-threads cannot consume each other's messages. A Gloo control group carries
-stage token counts before the FFN side posts receives and prepares its
-aggregate receive buffers.
+(``A = k * F``). Each DBO stage owns an independent HCCL group so stages cannot
+consume each other's messages. A Gloo control group carries stage token counts
+before the FFN side posts receives and prepares its aggregate receive buffers.
+
+Eager U2 keeps the same synchronous ``send/recv`` API but orders decoder
+transfers with connector-owned NPU streams and events. DeepSeek-V4 drives its
+two stages from one layer-major host loop, avoiding cross-thread DBO handoff
+without changing the HCCL message protocol or introducing ``isend/irecv``. U1,
+Graph U1, and MTP retain their existing paths.
 """
 
 from __future__ import annotations
@@ -129,6 +134,31 @@ class HCCLMTPHeader:
     num_tokens_across_dp: torch.Tensor
 
 
+@dataclass(frozen=True, slots=True)
+class HCCLAttentionPipelineEvents:
+    """NPU events ordering one Attention compute/send/receive exchange."""
+
+    compute_done: Any
+    send_done: Any
+    recv_done: Any
+
+
+@dataclass(frozen=True, slots=True)
+class HCCLPendingAttentionTransfer:
+    """Attention stream state retained between proxy send and receive calls."""
+
+    layer_idx: int
+    events: HCCLAttentionPipelineEvents
+
+
+@dataclass(frozen=True, slots=True)
+class HCCLAttentionReceiveDependency:
+    """F2A receive that a layer-major Attention stage has not consumed yet."""
+
+    tensor: torch.Tensor
+    event: Any
+
+
 _MTP_HEADER_MAGIC = 0x4D545031
 _MTP_HEADER_PREFIX_SIZE = 4
 
@@ -189,6 +219,11 @@ class P2pHcclAFDConnector(AFDConnectorBase):
             and getattr(speculative_config, "method", None) == "mtp"
         )
         self.vocab_size = int(vllm_config.model_config.hf_config.vocab_size)
+        self.num_stages = max(
+            1,
+            int(vllm_config.parallel_config.num_ubatches),
+        )
+        self.stream_overlap_enabled = self.num_stages > 1
 
         self.data_pg_list: list[ProcessGroup] = []
         self.ids_pg_list: list[ProcessGroup] = []
@@ -201,6 +236,15 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         self.stage_layouts: dict[int, HCCLP2PStageLayout] = {}
         self.is_graph_capturing = False
         self.is_warmup = False
+        self.a2f_send_stream = None
+        self.f2a_recv_stream = None
+        self.attention_pipeline_events: dict[
+            tuple[int, int], HCCLAttentionPipelineEvents
+        ] = {}
+        self.pending_attention_transfers: dict[int, HCCLPendingAttentionTransfer] = {}
+        self.attention_receive_dependencies: dict[
+            int, HCCLAttentionReceiveDependency
+        ] = {}
         self.control_plane = P2pHcclAFDControlPlane(self)
 
     @property
@@ -216,10 +260,9 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         # not import or require the afd_ascend custom-op extension.
         import torch_npu  # noqa: F401
 
-        num_stages = max(1, int(self.vllm_config.parallel_config.num_ubatches))
         timeout = timedelta(minutes=30)
         try:
-            for stage_idx in range(num_stages):
+            for stage_idx in range(self.num_stages):
                 suffix = "" if stage_idx == 0 else f"_{stage_idx}"
                 data_group = init_afd_process_group(
                     backend="hccl",
@@ -268,6 +311,8 @@ class P2pHcclAFDConnector(AFDConnectorBase):
                 group_name="afd_hccl_p2p_control",
                 timeout=timeout,
             )
+            if self.stream_overlap_enabled and self.afd_config.role == "attention":
+                self._initialize_attention_stream_pipeline()
         except BaseException:
             self.close()
             raise
@@ -292,7 +337,60 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         self.mtp_hidden_recv_buffers = {}
         self.dp_metadata_list = {}
         self.stage_layouts = {}
+        self.a2f_send_stream = None
+        self.f2a_recv_stream = None
+        self.attention_pipeline_events = {}
+        self.pending_attention_transfers = {}
+        self.attention_receive_dependencies = {}
         self._initialized = False
+
+    @property
+    def attention_stream_pipeline_ready(self) -> bool:
+        return bool(
+            self.stream_overlap_enabled
+            and self.afd_config.role == "attention"
+            and self.a2f_send_stream is not None
+            and self.f2a_recv_stream is not None
+            and self.attention_pipeline_events
+        )
+
+    def _attention_stream_pipeline_active(self) -> bool:
+        if not self.attention_stream_pipeline_ready:
+            return False
+        try:
+            forward_context = get_forward_context()
+        except AssertionError:
+            # Standalone connector component tests intentionally run without
+            # a vLLM model forward context and must retain the synchronous path.
+            return False
+        return bool(
+            getattr(forward_context, "dbo_enabled", False)
+            and int(getattr(forward_context, "num_ubatches", 1)) > 1
+        )
+
+    @staticmethod
+    def _layer_major_attention_pipeline_active() -> bool:
+        try:
+            forward_context = get_forward_context()
+        except AssertionError:
+            return False
+        return bool(getattr(forward_context, "afd_layer_major_u2", False))
+
+    def _initialize_attention_stream_pipeline(self) -> None:
+        """Create the eager U2 Attention communication streams and events."""
+        device = torch.device("npu", self.local_rank)
+        self.a2f_send_stream = torch.npu.Stream(device=device)
+        self.f2a_recv_stream = torch.npu.Stream(device=device)
+        num_layers = int(self.vllm_config.model_config.hf_config.num_hidden_layers)
+        self.attention_pipeline_events = {
+            (layer_idx, stage_idx): HCCLAttentionPipelineEvents(
+                compute_done=torch.npu.Event(),
+                send_done=torch.npu.Event(),
+                recv_done=torch.npu.Event(),
+            )
+            for layer_idx in range(num_layers)
+            for stage_idx in range(self.num_stages)
+        }
 
     def send_attn_output(
         self,
@@ -342,12 +440,26 @@ class P2pHcclAFDConnector(AFDConnectorBase):
                     ),
                 )
                 if not pretransferred:
+                    if self._attention_stream_pipeline_active():
+                        raise RuntimeError(
+                            "HCCL P2P stream overlap requires input_ids to be "
+                            "pretransferred before the Attention ubatch threads"
+                        )
                     self.send_input_ids(input_ids, ubatch_idx=metadata.stage_idx)
                     maybe_apply_dbo_yield(input_ids, role="attention")
             elif input_ids is not None:
                 raise RuntimeError("DSV4 HCCL P2P sends input_ids only at layer 0")
 
         group = self._data_group(metadata.stage_idx)
+        if self._attention_stream_pipeline_active() and metadata.phase == "decoder":
+            self._enqueue_attention_send(
+                hidden_states,
+                layer_idx=metadata.layer_idx,
+                stage_idx=metadata.stage_idx,
+                dst=self.mapping.subgroup_index,
+                group=group,
+            )
+            return
         self._send_tensor(
             hidden_states,
             dst=self.mapping.subgroup_index,
@@ -362,6 +474,13 @@ class P2pHcclAFDConnector(AFDConnectorBase):
     ) -> torch.Tensor:
         self._require_initialized()
         group = self._data_group(ubatch_idx)
+        if self._attention_stream_pipeline_active():
+            return self._enqueue_attention_receive(
+                ref_tensor,
+                stage_idx=ubatch_idx,
+                src=self.mapping.subgroup_index,
+                group=group,
+            )
         self._recv_tensor(
             ref_tensor,
             src=self.mapping.subgroup_index,
@@ -374,6 +493,135 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         maybe_apply_dbo_yield(ref_tensor, role="attention")
         return ref_tensor
 
+    def _enqueue_attention_send(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        layer_idx: int,
+        stage_idx: int,
+        dst: int,
+        group: ProcessGroup,
+    ) -> None:
+        if stage_idx in self.pending_attention_transfers:
+            raise RuntimeError(
+                "HCCL P2P Attention stage already has a pending receive: "
+                f"stage={stage_idx}"
+            )
+        events = self._attention_events(layer_idx, stage_idx)
+        compute_stream = torch.npu.current_stream()
+        events.compute_done.record(compute_stream)
+        assert self.a2f_send_stream is not None
+        with torch.npu.stream(self.a2f_send_stream):
+            events.compute_done.wait(self.a2f_send_stream)
+            self._send_tensor(
+                hidden_states,
+                dst=dst,
+                group=group,
+                stream=self.a2f_send_stream,
+            )
+            events.send_done.record(self.a2f_send_stream)
+        self.pending_attention_transfers[stage_idx] = HCCLPendingAttentionTransfer(
+            layer_idx=layer_idx,
+            events=events,
+        )
+
+    def _enqueue_attention_receive(
+        self,
+        ref_tensor: torch.Tensor,
+        *,
+        stage_idx: int,
+        src: int,
+        group: ProcessGroup,
+    ) -> torch.Tensor:
+        pending = self.pending_attention_transfers.pop(stage_idx, None)
+        if pending is None:
+            raise RuntimeError(
+                "HCCL P2P Attention receive has no matching streamed send: "
+                f"stage={stage_idx}"
+            )
+        recv_tensor = torch.empty_like(ref_tensor)
+        assert self.f2a_recv_stream is not None
+        with torch.npu.stream(self.f2a_recv_stream):
+            pending.events.send_done.wait(self.f2a_recv_stream)
+            self._recv_tensor(
+                recv_tensor,
+                src=src,
+                group=group,
+                stream=self.f2a_recv_stream,
+            )
+            pending.events.recv_done.record(self.f2a_recv_stream)
+
+        if self._layer_major_attention_pipeline_active():
+            if stage_idx in self.attention_receive_dependencies:
+                raise RuntimeError(
+                    "HCCL P2P Attention stage has an unconsumed F2A receive: "
+                    f"stage={stage_idx}"
+                )
+            self.attention_receive_dependencies[stage_idx] = (
+                HCCLAttentionReceiveDependency(
+                    tensor=recv_tensor,
+                    event=pending.events.recv_done,
+                )
+            )
+            return recv_tensor
+
+        # Let the peer ubatch enqueue its Attention work while this receive is
+        # progressing on the connector-owned stream.
+        maybe_apply_dbo_yield(recv_tensor, role="attention")
+        compute_stream = torch.npu.current_stream()
+        pending.events.recv_done.wait(compute_stream)
+        self._record_stream(recv_tensor, compute_stream)
+        return recv_tensor
+
+    def wait_for_attention_stage_receive(
+        self,
+        *,
+        stage_idx: int,
+        tensor: torch.Tensor,
+    ) -> None:
+        """Make the current compute stream consume one deferred F2A receive."""
+        dependency = self.attention_receive_dependencies.pop(stage_idx, None)
+        if dependency is None:
+            raise RuntimeError(
+                "HCCL P2P Attention stage has no deferred F2A receive: "
+                f"stage={stage_idx}"
+            )
+        if dependency.tensor is not tensor:
+            raise RuntimeError(
+                "HCCL P2P Attention stage received an unexpected tensor: "
+                f"stage={stage_idx}"
+            )
+        compute_stream = torch.npu.current_stream()
+        dependency.event.wait(compute_stream)
+        self._record_stream(tensor, compute_stream)
+
+    def require_attention_pipeline_idle(self) -> None:
+        """Reject a new layer-major step when a prior step left stale state."""
+        if self.pending_attention_transfers or self.attention_receive_dependencies:
+            raise RuntimeError(
+                "HCCL P2P Attention pipeline is not idle: "
+                f"pending={tuple(self.pending_attention_transfers)} "
+                f"deferred={tuple(self.attention_receive_dependencies)}"
+            )
+
+    def reset_attention_pipeline_state(self) -> None:
+        """Discard per-step stream bookkeeping after a failed model forward."""
+        self.pending_attention_transfers.clear()
+        self.attention_receive_dependencies.clear()
+
+    def _attention_events(
+        self,
+        layer_idx: int,
+        stage_idx: int,
+    ) -> HCCLAttentionPipelineEvents:
+        try:
+            return self.attention_pipeline_events[(layer_idx, stage_idx)]
+        except KeyError as exc:
+            raise RuntimeError(
+                "HCCL P2P Attention pipeline event is not initialized: "
+                f"layer={layer_idx} stage={stage_idx}"
+            ) from exc
+
     def recv_attn_output(
         self,
         ubatch_idx: int = 0,
@@ -383,6 +631,7 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         layer_idx = int(kwargs.get("layer_idx", 0))
         phase = str(kwargs.get("phase", "decoder"))
         speculative_step = int(kwargs.get("speculative_step", 0))
+        stream = kwargs.get("_stream")
         if phase == "mtp":
             explicit_num_tokens = int(kwargs.get("num_tokens", 0))
             metadata_probe = AFDTransferMetadata.create_ffn_metadata(
@@ -423,7 +672,12 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         group = self._data_group(ubatch_idx)
         for source_rank, start, end in layout.peer_slices:
             peer_slice = hidden_states[start:end]
-            self._recv_tensor(peer_slice, src=source_rank, group=group)
+            self._recv_tensor(
+                peer_slice,
+                src=source_rank,
+                group=group,
+                stream=stream,
+            )
         metadata = AFDTransferMetadata.create_ffn_metadata(
             layer_idx=layer_idx,
             stage_idx=ubatch_idx,
@@ -462,6 +716,7 @@ class P2pHcclAFDConnector(AFDConnectorBase):
                 f"metadata token count {metadata.total_tokens}",
             )
         stage_idx = int(kwargs.get("ubatch_idx", metadata.stage_idx))
+        stream = kwargs.get("_stream")
         state = context.states
         if not isinstance(state, HCCLP2PTransferState):
             raise RuntimeError(
@@ -486,7 +741,59 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         )
         for destination_rank, start, end in peer_slices:
             peer_slice = ffn_output[start:end]
-            self._send_tensor(peer_slice, dst=destination_rank, group=group)
+            self._send_tensor(
+                peer_slice,
+                dst=destination_rank,
+                group=group,
+                stream=stream,
+            )
+
+    def recv_attn_output_streamed(
+        self,
+        *,
+        ubatch_idx: int,
+        recv_stream,
+        wait_event,
+        done_event,
+        **kwargs: Any,
+    ) -> tuple[AFDA2FTransferPayload, Any]:
+        """Enqueue an FFN-side receive while retaining synchronous recv APIs."""
+        with torch.npu.stream(recv_stream):
+            if wait_event is not None:
+                wait_event.wait(recv_stream)
+            payload = self.recv_attn_output(
+                ubatch_idx=ubatch_idx,
+                _stream=recv_stream,
+                **kwargs,
+            )
+            self._record_stream(payload.hidden_states, recv_stream)
+            if payload.input_ids is not None:
+                self._record_stream(payload.input_ids, recv_stream)
+            done_event.record(recv_stream)
+        return payload, done_event
+
+    def send_ffn_output_streamed(
+        self,
+        ffn_output: torch.Tensor,
+        context: AFDTransferContext,
+        *,
+        ubatch_idx: int,
+        send_stream,
+        wait_event,
+        done_event,
+    ) -> Any:
+        """Enqueue an FFN-side send while retaining synchronous send APIs."""
+        with torch.npu.stream(send_stream):
+            wait_event.wait(send_stream)
+            self._record_stream(ffn_output, send_stream)
+            self.send_ffn_output(
+                ffn_output,
+                context,
+                ubatch_idx=ubatch_idx,
+                _stream=send_stream,
+            )
+            done_event.record(send_stream)
+        return done_event
 
     def send_input_ids(
         self,
@@ -600,11 +907,14 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         *,
         dst: int,
         group: ProcessGroup,
+        stream=None,
     ) -> None:
         send_tensor = tensor if tensor.is_contiguous() else tensor.contiguous()
         if torch.compiler.is_compiling():
             _graph_hccl_send(send_tensor, dst=dst, group=group)
             return
+        if stream is not None:
+            self._record_stream(send_tensor, stream)
         dist.send(send_tensor, dst=dst, group=group)
 
     def _recv_tensor(
@@ -613,11 +923,19 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         *,
         src: int,
         group: ProcessGroup,
+        stream=None,
     ) -> None:
         if torch.compiler.is_compiling():
             _graph_hccl_recv(tensor, src=src, group=group)
             return
+        if stream is not None:
+            self._record_stream(tensor, stream)
         dist.recv(tensor, src=src, group=group)
+
+    @staticmethod
+    def _record_stream(tensor: torch.Tensor, stream) -> None:
+        if tensor.device.type == "npu":
+            tensor.record_stream(stream)
 
     def _hidden_recv_buffer(
         self,

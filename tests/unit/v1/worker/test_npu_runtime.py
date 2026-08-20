@@ -367,7 +367,9 @@ def _new_attention_runner():
         AFDNPUAttentionModelRunner,
     )
 
-    return object.__new__(AFDNPUAttentionModelRunner)
+    runner = object.__new__(AFDNPUAttentionModelRunner)
+    runner._afd_transaction_counter = 0
+    return runner
 
 
 def test_npu_ubatch_dsa_ratio_metadata_is_stage_local():
@@ -600,6 +602,8 @@ def _new_ffn_runner():
     runner._is_shutdown = False
     runner.afd_config = AFDConfig(role="ffn")
     runner._ffn_input_ids_cache = {}
+    runner.ffn_stream_overlap_enabled = False
+    runner.max_num_tokens = 1
     return runner
 
 
@@ -771,6 +775,65 @@ def test_npu_attention_runner_defers_dsv4_ids_to_each_ubatch_layer_zero(
     assert forward_context.afd_input_ids_pretransferred is False
 
 
+def test_npu_attention_runner_pretransfers_hccl_stream_ids_by_stage(monkeypatch):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    events = []
+    forward_context = SimpleNamespace(
+        dbo_enabled=False,
+        flash_comm_v1_enabled=False,
+    )
+
+    class FakeModel:
+        def __call__(self, **_model_inputs):
+            events.append(
+                ("model", forward_context.afd_input_ids_pretransferred),
+            )
+            return "hidden_states"
+
+    connector = object.__new__(attention_model_runner.P2pHcclAFDConnector)
+    connector.stream_overlap_enabled = True
+    connector.afd_config = SimpleNamespace(role="attention")
+    connector.a2f_send_stream = object()
+    connector.f2a_recv_stream = object()
+    connector.attention_pipeline_events = {(0, 0): object()}
+    connector.requires_input_ids = True
+    connector.send_input_ids = lambda input_ids, *, ubatch_idx: events.append(
+        ("ids", input_ids.clone(), ubatch_idx),
+    )
+
+    monkeypatch.setattr(
+        attention_model_runner,
+        "get_forward_context",
+        lambda: forward_context,
+    )
+    runner = object.__new__(attention_model_runner.AFDNPUAttentionModelRunner)
+    runner.enable_enpu = False
+    runner.model = FakeModel()
+    runner.connector = connector
+    runner.ubatch_slices = [
+        SimpleNamespace(token_slice=slice(0, 2), num_tokens=2),
+        SimpleNamespace(token_slice=slice(2, 5), num_tokens=3),
+    ]
+    runner._install_afd_metadata_on_forward_context = lambda _context: None
+    runner._install_async_moe_ubatch_metadata_on_forward_context = lambda _context: None
+    runner._update_full_graph_params_if_needed = lambda *_args: None
+    input_ids = torch.tensor([10, 11, 20, 21, -1], dtype=torch.int32)
+
+    result = runner._model_forward(5, input_ids=input_ids)
+
+    assert result == "hidden_states"
+    assert events[0][0] == "ids"
+    assert events[0][1].tolist() == [10, 11]
+    assert events[0][2] == 0
+    assert events[1][0] == "ids"
+    assert events[1][1].tolist() == [20, 21, -1]
+    assert events[1][2] == 1
+    assert events[2] == ("model", True)
+    assert forward_context.afd_input_ids_pretransferred is False
+
+
 def test_npu_attention_u1_ids_pretransfer_failure_preserves_context(monkeypatch):
     _require_npu_runtime()
     from afd_plugin.v1.worker.npu import attention_model_runner
@@ -845,8 +908,50 @@ def test_npu_attention_runner_installs_mla_graph_wrapper(monkeypatch):
     assert captured["args"][:2] == ("model", runner.vllm_config)
     assert captured["kwargs"]["mla_full_graph_enabled"] is True
     assert captured["kwargs"]["enable_enpu"] is False
+    assert captured["kwargs"]["enable_layer_major_eager_u2"] is False
     updater = captured["kwargs"]["full_graph_params_updater"]
     assert updater.__self__ is runner
+
+
+def test_npu_attention_runner_enables_p2p_layer_major_eager_u2(monkeypatch):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    captured = {}
+
+    class RecordingUBatchWrapper:
+        def __init__(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+    class LayerMajorModel:
+        def forward_ubatches_layer_major(self, _metadata):
+            raise AssertionError("installation must not execute the model")
+
+    monkeypatch.setattr(
+        attention_model_runner,
+        "AscendUBatchWrapper",
+        RecordingUBatchWrapper,
+    )
+    connector = object.__new__(attention_model_runner.P2pHcclAFDConnector)
+    connector.stream_overlap_enabled = True
+    connector.requires_mtp = False
+    runner = object.__new__(attention_model_runner.AFDNPUAttentionModelRunner)
+    runner.model = LayerMajorModel()
+    runner.connector = connector
+    runner.device = "npu"
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(use_mla=True),
+    )
+    runner.compilation_config = SimpleNamespace(
+        cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False),
+    )
+    runner.use_sparse = False
+    runner.enable_enpu = False
+
+    runner._install_ascend_ubatch_wrapper()
+
+    assert captured["kwargs"]["enable_layer_major_eager_u2"] is True
 
 
 def test_npu_attention_runner_builds_and_sets_metadata():
@@ -1632,6 +1737,161 @@ def test_npu_ffn_runner_computes_stage_token_layout_once_per_step(monkeypatch):
 
     assert calls == [(0, 16), (1, 16)]
     assert len(runner.connector.ffn_outputs) == 6
+
+
+def test_npu_ffn_runner_stream_pipeline_orders_each_layer_and_stage(monkeypatch):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    _patch_ffn_forward_context(monkeypatch)
+    calls = []
+    active_stream = [None]
+    recv_stream = object()
+    compute_stream = object()
+    send_stream = object()
+    default_stream = object()
+
+    class FakeEvent:
+        def __init__(self, name):
+            self.name = name
+
+        def record(self, stream):
+            calls.append((self.name, "record", stream))
+
+        def wait(self, stream):
+            calls.append((self.name, "wait", stream))
+
+    @contextmanager
+    def use_stream(stream):
+        previous = active_stream[0]
+        active_stream[0] = stream
+        try:
+            yield
+        finally:
+            active_stream[0] = previous
+
+    class StreamConnector(_FakeFFNConnector):
+        stream_overlap_enabled = True
+
+        def recv_attn_output_streamed(
+            self,
+            *,
+            ubatch_idx,
+            recv_stream,
+            wait_event,
+            done_event,
+            **kwargs,
+        ):
+            with use_stream(recv_stream):
+                if wait_event is not None:
+                    wait_event.wait(recv_stream)
+                calls.append(("recv", kwargs["layer_idx"], ubatch_idx, recv_stream))
+                payload = self.recv_attn_output(ubatch_idx=ubatch_idx, **kwargs)
+                done_event.record(recv_stream)
+            return payload, done_event
+
+        def send_ffn_output_streamed(
+            self,
+            ffn_output,
+            context,
+            *,
+            ubatch_idx,
+            send_stream,
+            wait_event,
+            done_event,
+        ):
+            with use_stream(send_stream):
+                wait_event.wait(send_stream)
+                calls.append(
+                    ("send", context.metadata.layer_idx, ubatch_idx, send_stream),
+                )
+                self.send_ffn_output(
+                    ffn_output,
+                    context,
+                    ubatch_idx=ubatch_idx,
+                )
+                done_event.record(send_stream)
+            return done_event
+
+    class StreamModel:
+        def compute_ffn_output(self, hidden_states, layer_idx, **_kwargs):
+            stage_idx = int(hidden_states[0, 0].item())
+            calls.append(("compute", layer_idx, stage_idx, active_stream[0]))
+            return hidden_states + 1
+
+    monkeypatch.setattr(ffn_model_runner, "P2pHcclAFDConnector", StreamConnector)
+    monkeypatch.setattr(ffn_model_runner.torch.npu, "stream", use_stream)
+    monkeypatch.setattr(
+        ffn_model_runner.torch.npu,
+        "current_stream",
+        lambda: default_stream,
+    )
+
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn",
+        connector="P2pHcclAFDConnector",
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+    )
+    runner.connector = StreamConnector(attn_size=2, ffn_size=2)
+    runner.model = StreamModel()
+    runner.num_layers = 2
+    runner.max_num_tokens = 2
+    runner.ffn_stream_overlap_enabled = True
+    runner.ffn_recv_stream = recv_stream
+    runner.ffn_compute_stream = compute_stream
+    runner.ffn_send_stream = send_stream
+    event_keys = [
+        (layer_idx, stage_idx) for layer_idx in range(2) for stage_idx in range(2)
+    ]
+    runner.ffn_recv_events = {
+        key: FakeEvent(f"recv-{key[0]}-{key[1]}") for key in event_keys
+    }
+    runner.ffn_compute_events = {
+        key: FakeEvent(f"compute-{key[0]}-{key[1]}") for key in event_keys
+    }
+    runner.ffn_send_events = {
+        key: FakeEvent(f"send-{key[0]}-{key[1]}") for key in event_keys
+    }
+    for layer_idx in range(2):
+        for stage_idx in range(2):
+            metadata = AFDTransferMetadata.create_attention_metadata(
+                layer_idx=layer_idx,
+                stage_idx=stage_idx,
+                seq_len=1,
+            )
+            runner.connector.attn_outputs.append(
+                _ffn_payload(
+                    torch.full((1, 1), stage_idx, dtype=torch.float32),
+                    metadata,
+                ),
+            )
+
+    runner._ffn_forward(
+        dp_metadata_list={
+            0: _FakeDPMetadata([1]),
+            1: _FakeDPMetadata([1]),
+        },
+    )
+
+    for layer_idx in range(2):
+        for stage_idx in range(2):
+            recv_marker = ("recv", layer_idx, stage_idx, recv_stream)
+            compute_marker = ("compute", layer_idx, stage_idx, compute_stream)
+            send_marker = ("send", layer_idx, stage_idx, send_stream)
+            assert calls.index(recv_marker) < calls.index(compute_marker)
+            assert calls.index(compute_marker) < calls.index(send_marker)
+            if layer_idx > 0:
+                previous_send_wait = (
+                    f"send-{layer_idx - 1}-{stage_idx}",
+                    "wait",
+                    recv_stream,
+                )
+                assert calls.index(previous_send_wait) < calls.index(recv_marker)
+    assert ("send-1-0", "wait", default_stream) in calls
+    assert ("send-1-1", "wait", default_stream) in calls
 
 
 def test_dsv4_ffn_eager_receives_ids_and_hidden_stage_by_stage(monkeypatch):

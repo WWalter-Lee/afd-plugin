@@ -106,6 +106,7 @@ def _worker(
                 hf_config=SimpleNamespace(
                     architectures=["DeepseekV4ForCausalLM"],
                     hidden_size=16,
+                    num_hidden_layers=2,
                     vocab_size=128,
                 ),
             ),
