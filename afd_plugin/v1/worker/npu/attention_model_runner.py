@@ -1669,10 +1669,15 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             isinstance(connector, P2pHcclAFDConnector)
             and connector.stream_overlap_enabled
             and not connector.requires_mtp
-            and runtime_mode is CUDAGraphMode.NONE
             and callable(
                 getattr(model, "forward_ubatches_layer_major", None),
             )
+        )
+        model_config = self.vllm_config.model_config
+        uses_sparse_attention = bool(
+            getattr(self, "use_sparse", False)
+            or hasattr(getattr(model_config, "hf_text_config", None), "index_topk")
+            or hasattr(getattr(model_config, "hf_config", None), "index_topk")
         )
         self.model = AscendUBatchWrapper(
             model,
@@ -1680,7 +1685,9 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             runtime_mode,
             self.device,
             mla_full_graph_enabled=(
-                self.vllm_config.model_config.use_mla and not self.use_sparse
+                model_config.use_mla
+                and not uses_sparse_attention
+                and not getattr(self, "use_compress", False)
             ),
             full_graph_params_updater=self._update_full_graph_params_if_needed,
             enable_enpu=self.enable_enpu,

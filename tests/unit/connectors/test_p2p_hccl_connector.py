@@ -627,6 +627,145 @@ def test_p2p_hccl_attention_stream_pipeline_is_inactive_without_forward_context(
     assert connector.pending_attention_transfers == {}
 
 
+def test_p2p_hccl_attention_stream_pipeline_is_inactive_for_graph_ubatching(
+    monkeypatch,
+):
+    connector = _connector(role="attention", num_ubatches=2)
+    connector.a2f_send_stream = object()
+    connector.f2a_recv_stream = object()
+    connector.attention_pipeline_events = {(1, 0): object()}
+    monkeypatch.setattr(
+        hccl_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            afd_graph_ubatching=True,
+            dbo_enabled=True,
+            num_ubatches=2,
+        ),
+    )
+    sent = []
+    monkeypatch.setattr(
+        hccl_module.dist,
+        "send",
+        lambda tensor, *, dst, group: sent.append((tensor, dst, group)),
+    )
+
+    hidden = torch.ones((2, 4), dtype=torch.bfloat16)
+    connector.send_attn_output(
+        hidden,
+        _attention_context(layer_idx=1, stage_idx=0, num_tokens=2),
+    )
+
+    assert sent == [(hidden, 0, connector.data_pg_list[0])]
+    assert connector.pending_attention_transfers == {}
+
+
+def test_p2p_hccl_attention_stream_pipeline_is_active_for_layer_major_graph(
+    monkeypatch,
+):
+    connector = _connector(role="attention", num_ubatches=2)
+    connector.a2f_send_stream = object()
+    connector.f2a_recv_stream = object()
+    connector.attention_pipeline_events = {(1, 0): object()}
+    monkeypatch.setattr(
+        hccl_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            afd_graph_ubatching=True,
+            afd_layer_major_u2=True,
+            dbo_enabled=True,
+            num_ubatches=2,
+        ),
+    )
+
+    assert connector._attention_stream_pipeline_active() is True
+
+
+def test_p2p_hccl_attention_stream_pipeline_is_inactive_while_compiling(
+    monkeypatch,
+):
+    connector = _connector(role="attention", num_ubatches=2)
+    connector.a2f_send_stream = object()
+    connector.f2a_recv_stream = object()
+    connector.attention_pipeline_events = {(1, 0): object()}
+    monkeypatch.setattr(hccl_module.torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(
+        hccl_module,
+        "get_forward_context",
+        lambda: (_ for _ in ()).throw(AssertionError("must not inspect context")),
+    )
+
+    assert connector._attention_stream_pipeline_active() is False
+
+
+@pytest.mark.parametrize(
+    ("is_compiling", "is_graph_capturing", "is_warmup", "uses_graph_ops"),
+    [
+        (False, False, False, False),
+        (False, True, True, False),
+        (False, True, False, True),
+        (True, False, False, True),
+    ],
+)
+def test_p2p_hccl_graph_transport_activation(
+    monkeypatch,
+    is_compiling,
+    is_graph_capturing,
+    is_warmup,
+    uses_graph_ops,
+):
+    connector = _connector(role="attention")
+    connector.is_graph_capturing = is_graph_capturing
+    connector.is_warmup = is_warmup
+    monkeypatch.setattr(
+        hccl_module.torch.compiler,
+        "is_compiling",
+        lambda: is_compiling,
+    )
+
+    assert connector._graph_transport_active() is uses_graph_ops
+
+
+def test_p2p_hccl_capture_uses_graph_send_recv(monkeypatch):
+    connector = _connector(role="ffn")
+    connector.is_graph_capturing = True
+    graph_calls = []
+    monkeypatch.setattr(hccl_module.torch.compiler, "is_compiling", lambda: False)
+    monkeypatch.setattr(
+        hccl_module,
+        "_graph_hccl_send",
+        lambda tensor, *, dst, group: graph_calls.append(
+            ("send", tensor, dst, group)
+        ),
+    )
+    monkeypatch.setattr(
+        hccl_module,
+        "_graph_hccl_recv",
+        lambda tensor, *, src, group: graph_calls.append(
+            ("recv", tensor, src, group)
+        ),
+    )
+    monkeypatch.setattr(
+        hccl_module.dist,
+        "send",
+        lambda *_args, **_kwargs: pytest.fail("capture must not use dist.send"),
+    )
+    monkeypatch.setattr(
+        hccl_module.dist,
+        "recv",
+        lambda *_args, **_kwargs: pytest.fail("capture must not use dist.recv"),
+    )
+    tensor = torch.ones((2, 4), dtype=torch.bfloat16)
+
+    connector._send_tensor(tensor, dst=1, group=connector.data_pg_list[0])
+    connector._recv_tensor(tensor, src=1, group=connector.data_pg_list[0])
+
+    assert graph_calls == [
+        ("send", tensor, 1, connector.data_pg_list[0]),
+        ("recv", tensor, 1, connector.data_pg_list[0]),
+    ]
+
+
 def test_p2p_hccl_attention_uses_mapped_ffn_rank(monkeypatch):
     connector = _connector(
         role="attention",

@@ -599,6 +599,15 @@ class AscendUBatchWrapper(UBatchWrapper):
         results: list[tuple[int, AscendModelOutput]] = []
         compute_stream = ubatch_metadata[0].context.compute_stream
 
+        if self.enable_layer_major_eager_u2:
+            return self._capture_ubatches_layer_major(
+                ubatch_metadata,
+                model,
+                graph_key=graph_key,
+                mla_graph_params=mla_graph_params,
+                compute_stream=compute_stream,
+            )
+
         with override_forward_context(None):
             ubatch_threads = []
             for metadata in ubatch_metadata:
@@ -629,6 +638,47 @@ class AscendUBatchWrapper(UBatchWrapper):
                     ubatch_metadata,
                 )
             self.cudagraphs[graph_key] = cudagraph_metadata
+        get_forward_context().dbo_enabled = True
+        assert cudagraph_metadata.outputs is not None
+        return cudagraph_metadata.outputs
+
+    def _capture_ubatches_layer_major(
+        self,
+        ubatch_metadata: list[AscendUbatchMetadata],
+        model,
+        *,
+        graph_key: AscendNPUGraphKey,
+        mla_graph_params: tuple[GraphParams, GraphParams] | None,
+        compute_stream,
+    ) -> AscendModelOutput:
+        """Capture HCCL U2 in the same layer-major order used by its warmup."""
+        forward = getattr(model, "forward_ubatches_layer_major", None)
+        if not callable(forward):
+            raise RuntimeError("Ascend layer-major Graph U2 requires model support")
+        cudagraph_metadata = AscendNPUGraphMetaData(
+            aclgraph=torch.npu.NPUGraph(),
+            ubatch_metadata=ubatch_metadata,
+            mla_graph_params=mla_graph_params,
+        )
+        with (
+            override_forward_context(None),
+            torch.npu.graph(
+                cudagraph_metadata.aclgraph,
+                stream=compute_stream,
+                pool=self.graph_pool,
+            ),
+        ):
+            sorted_results = forward(ubatch_metadata)
+            if len(sorted_results) != len(ubatch_metadata):
+                raise RuntimeError(
+                    "Ascend layer-major Graph U2 returned an invalid stage count: "
+                    f"{len(sorted_results)} != {len(ubatch_metadata)}"
+                )
+            cudagraph_metadata.outputs = self._merge_outputs(
+                sorted_results,
+                ubatch_metadata,
+            )
+        self.cudagraphs[graph_key] = cudagraph_metadata
         get_forward_context().dbo_enabled = True
         assert cudagraph_metadata.outputs is not None
         return cudagraph_metadata.outputs

@@ -873,7 +873,21 @@ def test_npu_attention_u1_ids_pretransfer_failure_preserves_context(monkeypatch)
     assert forward_context.afd_input_ids_pretransferred is False
 
 
-def test_npu_attention_runner_installs_mla_graph_wrapper(monkeypatch):
+@pytest.mark.parametrize(
+    ("model_fields", "use_compress", "expected_mla_full_graph"),
+    [
+        ({}, False, True),
+        ({"hf_config": SimpleNamespace(index_topk=8)}, False, False),
+        ({"hf_text_config": SimpleNamespace(index_topk=8)}, False, False),
+        ({}, True, False),
+    ],
+)
+def test_npu_attention_runner_installs_mla_graph_wrapper(
+    monkeypatch,
+    model_fields,
+    use_compress,
+    expected_mla_full_graph,
+):
     _require_npu_runtime()
     from afd_plugin.v1.worker.npu import attention_model_runner
 
@@ -895,25 +909,30 @@ def test_npu_attention_runner_installs_mla_graph_wrapper(monkeypatch):
     runner.model = "model"
     runner.device = "npu"
     runner.vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(use_mla=True),
+        model_config=SimpleNamespace(use_mla=True, **model_fields),
     )
     runner.compilation_config = SimpleNamespace(
         cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: True),
     )
     runner.use_sparse = False
+    runner.use_compress = use_compress
     runner.enable_enpu = False
 
     runner._install_ascend_ubatch_wrapper()
 
     assert captured["args"][:2] == ("model", runner.vllm_config)
-    assert captured["kwargs"]["mla_full_graph_enabled"] is True
+    assert captured["kwargs"]["mla_full_graph_enabled"] is expected_mla_full_graph
     assert captured["kwargs"]["enable_enpu"] is False
     assert captured["kwargs"]["enable_layer_major_eager_u2"] is False
     updater = captured["kwargs"]["full_graph_params_updater"]
     assert updater.__self__ is runner
 
 
-def test_npu_attention_runner_enables_p2p_layer_major_eager_u2(monkeypatch):
+@pytest.mark.parametrize("has_full_cudagraphs", [False, True])
+def test_npu_attention_runner_enables_p2p_layer_major_eager_u2_warmup(
+    monkeypatch,
+    has_full_cudagraphs,
+):
     _require_npu_runtime()
     from afd_plugin.v1.worker.npu import attention_model_runner
 
@@ -944,7 +963,9 @@ def test_npu_attention_runner_enables_p2p_layer_major_eager_u2(monkeypatch):
         model_config=SimpleNamespace(use_mla=True),
     )
     runner.compilation_config = SimpleNamespace(
-        cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False),
+        cudagraph_mode=SimpleNamespace(
+            has_full_cudagraphs=lambda: has_full_cudagraphs,
+        ),
     )
     runner.use_sparse = False
     runner.enable_enpu = False
@@ -1421,7 +1442,18 @@ def test_npu_request_boundary_ubatch_slices_balance_tokens(monkeypatch):
             sys.modules[module_name] = original_module
 
 
-def test_npu_create_ascend_forward_context_marks_current_ubatch(monkeypatch):
+@pytest.mark.parametrize(
+    ("parent_graph_mode", "expected_graph_ubatching"),
+    [
+        (None, False),
+        (SimpleNamespace(name="FULL"), True),
+    ],
+)
+def test_npu_create_ascend_forward_context_marks_current_ubatch(
+    monkeypatch,
+    parent_graph_mode,
+    expected_graph_ubatching,
+):
     _require_npu_runtime()
     import torch
 
@@ -1471,6 +1503,7 @@ def test_npu_create_ascend_forward_context_marks_current_ubatch(monkeypatch):
         sinks=False,
         input_ids=torch.tensor([10, 11, 12, 13, 20, 21, 22]),
         afd_input_ids_pretransferred=True,
+        cudagraph_runtime_mode=parent_graph_mode,
         eplb_heat_collection_status=False,
         is_padding=None,
         mc2_mask=None,
@@ -1505,6 +1538,7 @@ def test_npu_create_ascend_forward_context_marks_current_ubatch(monkeypatch):
     assert new_forward_context.num_tokens == 3
     assert new_forward_context.input_ids.tolist() == [20, 21, 22]
     assert new_forward_context.afd_input_ids_pretransferred is True
+    assert new_forward_context.afd_graph_ubatching is expected_graph_ubatching
     assert child_metadata.stage_idx == 1
 
 
@@ -3048,6 +3082,20 @@ def test_dsv4_feature_validation_accepts_hccl_p2p_full_decode_only_u1():
     fail_if_unsupported_npu_afd_features(config)
 
 
+def test_dsv4_feature_validation_accepts_hccl_p2p_full_decode_only_u2():
+    config = _dsv4_config(
+        cudagraph_mode="FULL_DECODE_ONLY",
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+        ubatch_size=2,
+    )
+    config.model_config.enforce_eager = False
+    config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
 def test_dsv4_feature_validation_accepts_mtp_m1_eager_u1_hccl_p2p():
     config = _dsv4_config(speculative_config=_mtp_speculative_config())
     config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
@@ -3218,7 +3266,7 @@ def test_dsv4_feature_validation_rejects_other_graph_modes(cudagraph_mode):
         fail_if_unsupported_npu_afd_features(config)
 
 
-def test_dsv4_feature_validation_rejects_graph_u2():
+def test_dsv4_feature_validation_rejects_camp2p_graph_u2():
     config = _dsv4_config(
         cudagraph_mode="FULL_DECODE_ONLY",
         enable_dbo=True,
@@ -3228,7 +3276,7 @@ def test_dsv4_feature_validation_rejects_graph_u2():
     )
     config.model_config.enforce_eager = False
 
-    with pytest.raises(RuntimeError, match="only eager execution"):
+    with pytest.raises(RuntimeError, match="graph U2 supports only P2pHccl"):
         fail_if_unsupported_npu_afd_features(config)
 
 

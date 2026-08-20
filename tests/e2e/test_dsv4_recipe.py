@@ -137,6 +137,8 @@ def test_dsv4_role_scripts_offer_u1_graph_and_eager_u2():
         assert "MTP requires U1" in script
         assert "MTP requires equal Attention/FFN ranks" in script
         assert "MTP supports exactly one speculative token" in script
+        assert "graph U2 requires P2pHcclAFDConnector" in script
+        assert "U2 currently supports only EXECUTION_MODE=eager" not in script
 
     attention_script = (recipe_dir / "afd_attention.sh").read_text(encoding="utf-8")
     assert 'HCCL_IF_BASE_PORT="${ATTENTION_HCCL_IF_BASE_PORT:-51000}"' in (
@@ -289,6 +291,7 @@ def test_dsv4_hccl_graph_topology_requires_equal_roles():
     runner._validate_execution_topology(
         connector="P2pHcclAFDConnector",
         execution_mode="full-decode-only",
+        u_batches=2,
         topology={"attention_ranks": 8, "ffn_ranks": 8},
     )
     with pytest.raises(ValueError, match="requires equal Attention and FFN"):
@@ -303,6 +306,14 @@ def test_dsv4_hccl_graph_topology_requires_equal_roles():
         execution_mode="eager",
         topology={"attention_ranks": 8, "ffn_ranks": 4},
     )
+
+    with pytest.raises(ValueError, match="graph U2 requires P2pHccl"):
+        runner._validate_execution_topology(
+            connector="CAMP2pAFDConnector",
+            execution_mode="full-decode-only",
+            u_batches=2,
+            topology={"attention_ranks": 8, "ffn_ranks": 8},
+        )
 
 
 def test_dsv4_hccl_mtp_m2_topology_gate_and_environment(monkeypatch):

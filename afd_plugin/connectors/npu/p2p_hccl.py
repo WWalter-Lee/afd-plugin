@@ -16,8 +16,9 @@ before the FFN side posts receives and prepares its aggregate receive buffers.
 Eager U2 keeps the same synchronous ``send/recv`` API but orders decoder
 transfers with connector-owned NPU streams and events. DeepSeek-V4 drives its
 two stages from one layer-major host loop, avoiding cross-thread DBO handoff
-without changing the HCCL message protocol or introducing ``isend/irecv``. U1,
-Graph U1, and MTP retain their existing paths.
+without changing the HCCL message protocol or introducing ``isend/irecv``.
+Graph U2 captures the two stages into one FULL graph and deliberately bypasses
+the eager-only communication streams. U1 and MTP retain their existing paths.
 """
 
 from __future__ import annotations
@@ -355,6 +356,10 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         )
 
     def _attention_stream_pipeline_active(self) -> bool:
+        # Compiled Graph U2 lowers the synchronous HCCL path into graph ops.
+        # Do not let Dynamo inspect the eager stream/event objects below.
+        if torch.compiler.is_compiling():
+            return False
         if not self.attention_stream_pipeline_ready:
             return False
         try:
@@ -363,8 +368,13 @@ class P2pHcclAFDConnector(AFDConnectorBase):
             # Standalone connector component tests intentionally run without
             # a vLLM model forward context and must retain the synchronous path.
             return False
+        graph_ubatching = bool(
+            getattr(forward_context, "afd_graph_ubatching", False)
+        )
+        layer_major = bool(getattr(forward_context, "afd_layer_major_u2", False))
         return bool(
-            getattr(forward_context, "dbo_enabled", False)
+            (not graph_ubatching or layer_major)
+            and getattr(forward_context, "dbo_enabled", False)
             and int(getattr(forward_context, "num_ubatches", 1)) > 1
         )
 
@@ -910,7 +920,7 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         stream=None,
     ) -> None:
         send_tensor = tensor if tensor.is_contiguous() else tensor.contiguous()
-        if torch.compiler.is_compiling():
+        if self._graph_transport_active():
             _graph_hccl_send(send_tensor, dst=dst, group=group)
             return
         if stream is not None:
@@ -925,12 +935,19 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         group: ProcessGroup,
         stream=None,
     ) -> None:
-        if torch.compiler.is_compiling():
+        if self._graph_transport_active():
             _graph_hccl_recv(tensor, src=src, group=group)
             return
         if stream is not None:
             self._record_stream(tensor, stream)
         dist.recv(tensor, src=src, group=group)
+
+    def _graph_transport_active(self) -> bool:
+        """Use graph-visible HCCL ops while tracing or capturing a target graph."""
+        return bool(
+            torch.compiler.is_compiling()
+            or (self.is_graph_capturing and not self.is_warmup)
+        )
 
     @staticmethod
     def _record_stream(tensor: torch.Tensor, stream) -> None:

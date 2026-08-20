@@ -92,6 +92,12 @@ def create_ascend_forward_context(
     new_forward_context.afd_input_ids_pretransferred = bool(
         getattr(cur_forward_context, "afd_input_ids_pretransferred", False)
     )
+    parent_graph_mode = getattr(cur_forward_context, "cudagraph_runtime_mode", None)
+    parent_graph_mode_name = getattr(parent_graph_mode, "name", str(parent_graph_mode))
+    # Child contexts execute with mode NONE while their two interleaved forwards
+    # are captured into one parent FULL graph. Preserve that parent state so the
+    # HCCL connector does not enter its eager-only communication-stream path.
+    new_forward_context.afd_graph_ubatching = parent_graph_mode_name == "FULL"
     new_forward_context.flash_comm_v1_enabled = (
         cur_forward_context.flash_comm_v1_enabled
     )

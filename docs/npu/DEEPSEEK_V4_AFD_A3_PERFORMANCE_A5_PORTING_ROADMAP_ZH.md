@@ -2,9 +2,9 @@
 
 ## 1. 文档定位
 
-本文用于固化 DeepSeek-V4 AFD 在完成 CAMP2P eager/U1、Graph/U1，以及标准 HCCL P2P eager/U1、U2 和 Graph/U1 正确性基线后的目标、开发顺序和验收门禁，供后续开发、验证、性能分析和 A5 迁移时直接使用。
+本文用于固化 DeepSeek-V4 AFD 在完成 CAMP2P eager/U1、Graph/U1，以及标准 HCCL P2P eager/U1、U2、Graph/U1 和 Graph/U2 正确性基线后的目标、开发顺序和验收门禁，供后续开发、验证、性能分析和 A5 迁移时直接使用。
 
-文档状态：`2026-08-19`。CAMP2P eager/U2 已冻结为 `dsv4-afd-a3-eager-u2-v1`；标准 HCCL send/recv connector 已在提交 `9578dd2cb70f9f8db54673a70e8f45fde6479245` 完成 A3 A8F8 eager/U1、U2 正确性闭环。A3-P4 的 A8F8 未调优性能参照与 U1/U2 双侧 profile 已完成：三轮重复性通过，但 U2 在 C32 比 U1 回退 37.570%，因此当前只冻结参照协议，不冻结 U2 性能基线。
+文档状态：`2026-08-20`。CAMP2P eager/U2 已冻结为 `dsv4-afd-a3-eager-u2-v1`；标准 HCCL send/recv connector 已在提交 `9578dd2cb70f9f8db54673a70e8f45fde6479245` 完成 A3 A8F8 eager/U1、U2 正确性闭环。A3-P4 的 A8F8 未调优性能参照与 U1/U2 双侧 profile 已完成：三轮重复性通过，但 U2 在 C32 比 U1 回退 37.570%，因此当前只冻结参照协议，不冻结 U2 性能基线。
 
 A3-P5 的 `A = k x F` 非等量协议和 A2F1/A4F2 NPU 组件验证已经完成。A3-P6 的 A8F4 实模加载在 64 GiB A3 上因 FFN EP4 专家权重峰值 HBM 不足而停止；A10F5 容量代理又被固定 vLLM-Ascend 的 256 experts/EP5 非均匀放置检查拒绝。该结论是当前硬件与固定栈组合的 E2E 门禁，不否定 connector 的非等量语义。A8F4 E2E 移到高 HBM 的 A5 实机验证；A3 保留现有 A8F8 同步 HCCL 性能参照，完成 MTP 功能门禁后再恢复新的调优和公平对照。
 
@@ -14,7 +14,7 @@ A3-P5 的 `A = k x F` 非等量协议和 A2F1/A4F2 NPU 组件验证已经完成�
 
 目标栈功能迁移已经完成：同栈原生模型的 10 条 prompt 连续 3 轮稳定，AFD eager/U2 对同栈 golden 达到 30/30 逐 token 一致，并通过 batch 1/8/32 结构、真实双 stage、Attention 先停、FFN 后退、fatal 日志和 NPU 清理门禁。目标栈同参数 C32 性能复测也已完成：U1 三轮均值为 17.082 output token/s，U2 为 12.582 output token/s，U2 回退 26.342%。因此本阶段只冻结功能兼容性，不创建目标栈性能 tag。
 
-标准 HCCL P2P Graph/U1 功能适配也已在目标栈完成。当前支持范围严格限定为 A/F 等量、`FULL_DECODE_ONLY` 和 U1；hidden/output 的 HCCL send/recv 进入 ACL Graph，input IDs 仍通过 graph 外的一次性 HCCL side channel 传输。A8F8 完整门禁达到 30/30 golden token IDs 一致，batch 1/8/32、两次成功冷启动、graph capture/replay、正常退出和 NPU 清理均通过。Graph/U2、Graph/U3 和 Graph 非等量拓扑仍然 fail-fast。完整报告见 `DEEPSEEK_V4_AFD_HCCL_P2P_GRAPH_U1_VALIDATION_REPORT_ZH.md`。
+标准 HCCL P2P Graph/U1 和 Graph/U2 功能适配均已在目标栈完成。支持范围严格限定为 A/F 等量和 `FULL_DECODE_ONLY`；U2 固定为两个 microbatch。hidden/output 的 HCCL send/recv 进入 ACL Graph，input IDs 仍通过 graph 外的一次性 HCCL side channel 传输。Graph/U2 的 F0 在两次冷启动中各达到 30/30 golden token IDs 一致，batch 1/8/32、双 stage、capture/replay、正常退出和 NPU 清理均通过。单轮 P1 为 107.189 token/s，只是强候选信号，不是性能收益结论。Graph/U3 和 Graph 非等量拓扑仍然 fail-fast。完整报告见 `DEEPSEEK_V4_AFD_HCCL_P2P_GRAPH_U1_VALIDATION_REPORT_ZH.md` 和 `DEEPSEEK_V4_AFD_HCCL_P2P_GRAPH_U2_VALIDATION_REPORT_ZH.md`。
 
 MTP/speculative decoding 已纳入必交付范围。A3-P7M0 原生 MTP 基线和角色/权重契约、A3-P7M1 HCCL P2P eager/U1 + MTP，以及 A3-P7M2 target Graph/U1 + draft eager MTP 均已完成。M2 达到 30/30 golden、batch 1/8/32、两轮生命周期和 P1 单点 guard；完整 draft ACL Graph 因正式 golden 仅 6/30 而继续 fail-fast。A3-P8 同步 HCCL 第一轮门禁已完成：关闭 vLLM async scheduling 后 U1 C32 单轮从此前三轮均值 17.082 提升到 30.615 token/s，但 U2 只有 16.631 token/s，相对新的 U1 回退 45.676%，因此不创建性能 tag，也不进入 MTP-on 正式性能矩阵。完整结论见 `DEEPSEEK_V4_AFD_A3_P8_SYNC_HCCL_PERFORMANCE_REPORT_ZH.md`。首版固定模型已有的 1 个 MTP layer 和 `num_speculative_tokens=1`；U2、非等量拓扑和更多 speculative token 数作为 M3 后续扩展，不阻塞 P8。
 
@@ -55,9 +55,11 @@ A3 当前阶段
   CAMP2P U1/U2 correctness 已完成并冻结
   -> 标准 HCCL P2P connector U1/U2 correctness 已完成
   -> 目标栈标准 HCCL P2P Graph/U1 correctness 已完成
+  -> 目标栈标准 HCCL P2P Graph/U2 correctness 已完成
   -> 目标栈原生 MTP 基线和协议冻结（已完成）
   -> 目标栈 HCCL P2P eager/U1 + MTP correctness（M1 已完成）
-  -> 目标栈 HCCL P2P Graph/U1 + MTP correctness
+  -> 目标栈 HCCL P2P target Graph/U1 + draft eager MTP correctness（M2 已完成）
+  -> 目标栈 HCCL P2P eager/U2 + MTP correctness
   -> 锁定 A8F8 U1/U2 性能参照和请求矩阵
   -> HCCL P2P A=kF 非等量 fan-in/fan-out 组件闭环（已完成）
   -> A8F4 实模容量预检（A3 EP4 HBM 不足，转 A5）
@@ -161,7 +163,7 @@ U1 三轮原始吞吐为 17.004、16.229、18.012 token/s；U2 为 10.892、13.6
 
 目标栈 U1 比旧栈同参数、同同步优化的 57.724 token/s 低 70.408%。这说明切换上游栈后必须重新建立绝对性能基线，不能继承旧数字；它不推翻同步优化在旧栈 P4/P7 A/B 中已证明的 +17.521% 收益。若要量化该优化在目标栈上的独立贡献，仍需在目标栈做一次开启/关闭优化的同提交 A/B。
 
-当前性能结论是“功能迁移通过、U2 收益失败、目标栈 eager 绝对性能需要定位”。HCCL P2P Graph/U1、eager/U1 + MTP 和 target Graph/U1 + draft eager MTP 已作为独立功能里程碑完成，不改变这一性能结论。M1 的 P1 单轮为 28.280 output token/s，相对最近同模式 MTP-off 三轮均值 17.082 高 65.560%；M2 P1 为 22.835 token/s，相对 M1 回退 19.253%。两者都只是轻量 guard，不能作为正式收益结论。A3-P8 已定位 async scheduling 与完全串行 U2 的问题；P8C 已在保持同步 `send/recv` 的前提下引入 NPU comm stream，并由 trace 证明存在真实 overlap。P8D 又将两个 DBO Python 线程/`dbo_yield` 改为插件内单线程 `layer -> stage` loop，P1 相对 P8C 提升 10.099%，但仍比 U1 回退 46.197%。下一步先减少逐层同步消息/等待并定位跨 DP 最慢 rank，再恢复三轮性能矩阵；仍不引入异步 HCCL，也不进入 PD 或 A5 性能外推。
+当前性能结论是“eager/U2 收益失败，Graph/U2 出现强候选信号但尚未正式验收”。HCCL P2P Graph/U1、Graph/U2、eager/U1 + MTP 和 target Graph/U1 + draft eager MTP 已作为独立功能里程碑完成。M1、M2 的 P1 分别为 28.280 和 22.835 output token/s，都只是轻量 guard。P8C/P8D 在保持同步 `send/recv` 的前提下完成 comm stream 和单线程 `layer -> stage`，但 eager/U2 P1 仍比 U1 回退 46.197%。Graph/U2 P1 达到 107.189 token/s，相对 eager/U1 单点高 250.116%，但只有一轮且执行模式改变，不能宣称性能收益。按“先功能、后统一性能”继续完成 MTP/U2；随后以 Graph/U1、Graph/U2 和同预算 native Graph 三轮 P2 关闭或继续定位 `P8D-PERF-001`。仍不引入异步 HCCL，也不进入 PD 或 A5 性能外推。
 
 ### 3.4 当前 profiling 观察基线
 
@@ -239,9 +241,9 @@ AFD world        -> [F0 ... F(F-1), A0 ... A(A-1)]
 
 ### 4.3 当前未验证能力
 
-标准 HCCL P2P eager/U1、U2、等量 A/F 的 Graph/U1、等量 A8F8 eager/U1 + MTP，以及 target Graph/U1 + draft eager MTP 已完成当前正确性门禁，但还没有形成性能 tag。以下能力仍不属于 HCCL 主线基线：
+标准 HCCL P2P eager/U1、U2、等量 A/F 的 Graph/U1、Graph/U2、等量 A8F8 eager/U1 + MTP，以及 target Graph/U1 + draft eager MTP 已完成当前正确性门禁，但还没有形成性能 tag。以下能力仍不属于 HCCL 主线基线：
 
-- Graph/U2、Graph/U3 和 Graph 非等量拓扑；
+- Graph/U3 和 Graph 非等量拓扑；
 - Attention 侧 gate；
 - MTP draft ACL Graph、eager/U2 + MTP、非等量拓扑 + MTP 和多 speculative token；
 - Mooncake PD；
@@ -270,7 +272,7 @@ P2 才回答最终问题“开启 AFD 和 microbatch 后是否有性能收益”
 
 - `HCCL P2P AFD U2` 对 `HCCL P2P AFD U1`：隔离 microbatch 的增量收益，并证明 U2 实际执行双 stage；
 - `HCCL P2P AFD U2` 对同总 NPU 预算的非 AFD：证明 AFD + microbatch 组合的整体收益；
-- eager 与 Graph 分开归因；Graph/U2 未完成前，只能声明 eager AFD + microbatch 的结论；
+- eager 与 Graph 分开归因；Graph/U2 已完成功能门禁，但正式结论仍要求 Graph/U1、Graph/U2 和 native Graph 分别完成 P2；
 - MTP off 先完成主结论，MTP on/off 作为独立维度报告 acceptance rate，不能把 speculative decoding 收益归因于 microbatch。
 
 P2 使用第 6 章的 concurrency、长度、三轮波动、延迟、HBM 和 `tokens/s/NPU` 门禁。128K 继续作为容量、TTFT 和 HBM 专项，不混入短输入 decode/microbatch 收益结论。
@@ -287,12 +289,13 @@ P2 使用第 6 章的 concurrency、长度、三轮波动、延迟、HBM 和 `to
 | A3-P7 | A8F8 同步 HCCL profiling、调优和公平性能验收 | 已取得 C32 +17.521% 旧栈候选收益；后续调优等待 MTP-M1/M2，之后补 C1/C8、冷服务重复与非 AFD 公平对照 |
 | A3-P7T | 迁移 vLLM 0.23 + `rfc/vllm_cann` | 功能已通过；U1/U2 三轮稳定，但 U2 回退 26.342%，只冻结功能兼容性 |
 | A3-P7G | 目标栈标准 HCCL P2P Graph/U1 | 已通过：A8F8、等量 A/F、`FULL_DECODE_ONLY`、30/30 golden、batch 1/8/32、两次冷启动、capture/replay、退出和清理通过 |
+| A3-P7G2 | 目标栈标准 HCCL P2P Graph/U2 | 已通过 F0 + P1：两次冷启动各 30/30 golden、batch 1/8/32、双 stage、capture/replay、退出和清理通过；P1 107.189 token/s 是单轮候选信号，不创建性能 tag |
 | A3-P7M0 | 目标栈原生 MTP 基线与 AFD 协议设计 | 已通过：原生 MTP 启动，30/30 token IDs 与 MTP-off 一致，acceptance 198/264，真实 key/HBM/target hidden 和 AFD phase/message 契约已冻结；未解除 AFD 门禁 |
 | A3-P7M1 | HCCL P2P eager/U1 + MTP | 已通过：A8F8 等量、`num_speculative_tokens=1`、30/30 golden、proposal/accept、batch 1/8/32、五次冷启动、30 分钟空闲恢复、退出/清理和 P1 单点 guard |
 | A3-P7M2 | HCCL P2P target Graph/U1 + draft eager MTP | 已通过：30/30 golden、batch 1/8/32、两轮生命周期和 P1 guard；full draft Graph 因仅 6/30 被 fail-fast 禁用 |
 | A3-P8 | 正式性能验收并冻结目标栈 A3 HCCL 基线 | 第一轮未通过：async scheduling off 修复 U1 host 调度退化，但同步 U2 相对 U1 回退 45.676%；停止扩大三轮和 MTP-on 矩阵，不创建性能 tag |
-| A3-P8C/P8D | comm stream 与单线程 layer-major U2 | 功能门禁通过，P8D 相对 P8C 提升 10.099%，但相对 U1 仍回退 46.197%；继续停在 P1，不创建性能 tag |
-| A3-P7M3 | MTP 能力扩展，不阻塞 P8 | 每个扩展分别通过 F0 + P1；按更多 speculative token、eager/U2 + MTP、eager 非等量 + MTP 顺序逐项解除门禁，分别追加 P2 对照 |
+| A3-P8C/P8D | comm stream 与单线程 layer-major U2 | eager 功能门禁通过，P8D 相对 P8C 提升 10.099%，但相对 U1 仍回退 46.197%；问题保持 Open，Graph/U2 候选另按 P7G2 验收 |
+| A3-P7M3 | MTP 能力扩展，不阻塞 P8 | 当前下一阶段为 eager/U2 + MTP；每个扩展分别通过 F0 + P1，再推进 target Graph/U2 + draft eager、eager 非等量 + MTP 和更多 speculative token |
 
 ### 5.1 A3-P0：固定性能实验协议
 
@@ -334,7 +337,7 @@ P2 使用第 6 章的 concurrency、长度、三轮波动、延迟、HBM 和 `to
 feat/dsv4-afd-eager-u2
 ```
 
-本阶段已经完成。DSV4 只在 eager 下解除 U2 门禁，Graph/U2 继续显式拒绝；Attention 按 stage 的 token slice 发送 IDs，FFN 在单主线程中按 stage 预接收并限定 cache 生命周期。
+本阶段已经完成。A3-P1 当时只在 eager 下解除 U2 门禁，Graph/U2 保持拒绝；该门禁后来由 A3-P7G2 独立解除。Attention 按 stage 的 token slice 发送 IDs，FFN 在单主线程中按 stage 预接收并限定 cache 生命周期。
 
 本阶段需要完成：
 
@@ -643,7 +646,7 @@ HCCL_BUFFSIZE: 在固定请求矩阵下做小范围扫描
 
 ### 5.10 A3-P7G：标准 HCCL P2P Graph/U1
 
-本阶段已经完成，且没有沿用 CAMP2P Graph 的实现结论。支持边界为 A8F8 等量拓扑、`FULL_DECODE_ONLY` 和 U1；Graph/U2、Graph/U3 与 Graph 非等量拓扑继续显式拒绝。
+本阶段已经完成，且没有沿用 CAMP2P Graph 的实现结论。P7G 冻结时的支持边界为 A8F8 等量拓扑、`FULL_DECODE_ONLY` 和 U1；Graph/U2 后来由 P7G2 独立解除，Graph/U3 与 Graph 非等量拓扑继续显式拒绝。
 
 Graph 路径只在 `torch.compiler.is_compiling()` 时调用 torch-npu 注册的 HCCL `_send/_recv` op。shape 参数传 `None`，由输入/输出 tensor 决定 shape，避免符号 token 维度在编译时被专门化为首次请求长度。非编译路径仍是标准阻塞式 `torch.distributed.send/recv`。DSV4 input IDs 在 graph 外通过一次性 HCCL side channel 预传，FFN 的 layer 0/1/2 复用和 layer 3 后清理语义不变。
 
@@ -662,7 +665,42 @@ Graph 路径只在 `torch.compiler.is_compiling()` 时调用 torch-npu 注册的
 /mnt/workspace/validation/dsv4_afd_v023_hccl_graph_u1_full_20260818
 ```
 
-Graph/U1 功能基线已经由 tag `dsv4-afd-v023-hccl-graph-u1-v1` 冻结，A3-P7M1/M2 也已分别完成 eager 和 target Graph 下的 MTP 功能门禁。下一步进入独立的 A3-P8 性能阶段；不得把当前 U1 的通过外推为 U2/U3、draft ACL Graph 或非等量 Graph 已支持。
+Graph/U1 功能基线已经由 tag `dsv4-afd-v023-hccl-graph-u1-v1` 冻结，A3-P7M1/M2 也已分别完成 eager 和 target Graph 下的 MTP 功能门禁。Graph/U2 已由下一小节独立解除门禁；不得把 U1/U2 的通过外推为 U3、full draft ACL Graph 或非等量 Graph 已支持。
+
+#### A3-P7G2：标准 HCCL P2P Graph/U2
+
+本阶段已经完成，范围严格限定为 `P2pHcclAFDConnector`、A8F8 等量拓扑、
+`FULL_DECODE_ONLY` 和两个 microbatch。Graph warmup 和真实 capture 都改为单线程
+`layer -> stage 0 -> stage 1`，与 FFN connector loop 保持完全相同的 HCCL op 顺序；两个 stage
+合并到同一个 NPUGraph。编译和真实 capture 使用 graph-visible HCCL `_send/_recv`，graph 外
+仍是标准同步 `torch.distributed.send/recv`，未引入异步 HCCL。
+
+DSV4 DSA compressed attention 显式跳过不适用的普通 MLA FIA workspace 预分配，但正常 ACL
+Graph capture 仍启用。子 forward context 保存父 FULL Graph 状态，connector 的 stream/event
+依赖在 capture 主 stream 上闭合，避免 stage-major 两线程造成 communicator 顺序不一致和
+capture stream 未加入。
+
+F0 连续两次冷启动均为 30/30 golden token exact，batch 1/8/32 有效，双 stage、capture
+size 1/2/4/8、fatal、两侧 rc=0 和 NPU cleanup 全部通过。startup 分别为 414.229s 和
+400.233s。验证产物：
+
+```text
+/mnt/workspace/validation/dsv4_afd_v023_hccl_graph_u2_f0_20260820
+```
+
+P1 固定 C32、输入 1024、精确输出 128、128 请求，单轮 128/128 成功，output throughput
+107.189 token/s、p50 TPOT 217.268 ms；Attention/FFN 最大 HBM 分别为 61,819/44,391 MiB。
+相对 eager/U1 单点 30.615 token/s 高 250.116%，但执行模式不同且只有一轮，所以只记录为强
+候选信号，不创建性能 tag、不宣称 AFD + microbatch 已有正式收益，也不固定采集 profiler。
+
+```text
+/mnt/workspace/validation/dsv4_afd_v023_hccl_graph_u2_p1_20260820
+```
+
+完整实现原因、失败路径和证据见
+`DEEPSEEK_V4_AFD_HCCL_P2P_GRAPH_U2_VALIDATION_REPORT_ZH.md`。下一功能阶段是 eager/U2 +
+MTP，再评估 target Graph/U2 + draft eager MTP；Graph/U3、Graph 非等量和 full draft Graph
+继续 fail-fast。功能组合闭环后统一执行 Graph/U1、Graph/U2 和同预算 native Graph 的三轮 P2。
 
 ### 5.11 A3-P7M：HCCL P2P MTP 功能路线
 
@@ -735,11 +773,11 @@ Attention 和 FFN 在 target capture 时都只执行 target。原因是上游同
 /mnt/workspace/validation/dsv4_afd_v023_hccl_mtp_m2_final_smoke_retry2_20260819
 ```
 
-M2 只冻结功能基线，不创建性能 tag。下一步进入 A3-P8：先以 MTP-off 完成同步 HCCL U1/U2 和同预算非 AFD 的 P2 公平对照，再把 MTP-on eager/target Graph 作为独立维度报告。target Graph + eager draft 的 19.253% 回退是 P2 的重点定位项；在三轮和 profile 完成前不得宣称 Graph 或 MTP 带来收益。
+M2 只冻结功能基线，不创建性能 tag。随后 A3-P8/P8C/P8D 已完成 eager MTP-off 的第一轮性能定位，Graph/U2 也已完成独立 F0 + P1。target Graph + eager draft 的 19.253% 回退仍是后续 P2 的重点定位项；在三轮和公平对照完成前不得宣称 Graph 或 MTP 带来收益。
 
 #### A3-P7M3：后续扩展和性能恢复
 
-首版通过后，按“更多 speculative token -> eager/U2 -> eager 非等量拓扑 -> Graph/U2/非等量 Graph”的顺序分别立项；每项独立解除门禁，不能一次性泛化。模型当前只有 1 个 MTP layer，更多 speculative token 是否通过迭代 proposer 支持，必须以目标上游能力和 NPU 正确性实测为准。
+首版通过后，当前按“eager/U2 -> target Graph/U2 + draft eager -> eager 非等量拓扑 -> 更多 speculative token”的顺序分别立项；每项独立解除门禁，不能一次性泛化。模型当前只有 1 个 MTP layer，更多 speculative token 是否通过迭代 proposer 支持，必须以目标上游能力和 NPU 正确性实测为准。full draft Graph 和 Graph 非等量继续作为更后的独立里程碑。
 
 M1/M2 功能闭环后再恢复性能优化。性能矩阵新增同参数 native MTP on/off、HCCL P2P eager/U1 MTP on/off、HCCL P2P Graph/U1 MTP on/off；除吞吐、TTFT、TPOT 和 HBM 外，必须报告 proposal tokens/s、acceptance rate、accepted tokens/s 和每个最终 token 的 HCCL/计算成本。只有最终输出 token 吞吐收益超过三轮波动，才能宣称 MTP 带来性能收益。
 
@@ -794,12 +832,12 @@ P8D 定向功能门禁已通过目标 CPU/Mock 回归、A2F1 两阶段/两 step 
 
 20-step 双侧 profile 显示 Attention 未重叠通信从 P8C 的 1669.388 降至 1398.570 ms，但 FFN free 从 949.095 增至 1273.094 ms，Attention bubble 也升至 1430.170 ms。kernel 数没有减少；Attention send wait 明显下降，但 F2A receive wait 上升，证明线程/GIL 交接不是剩余主瓶颈，等待被移动而未被消除。
 
-下一候选继续保持同步 API，优先完成两项定向工作：
+eager/U2 的后续性能优化继续保持同步 API，并保留两项定向待办：
 
 1. 对 DP0-7 同时采集/对齐 layer-stage 到达时间，定位每轮最慢 Attention/FFN rank 和等待传播链；
 2. 设计更粗粒度的同步状态机，减少逐 layer/stage 控制消息、host `send/recv` 调用和 event wait 次数，但不改变 IDs/hidden/output 顺序、精确 shape、cache 生命周期和异常清理。
 
-仍不扫描 threshold、不启动 P2 三轮、不恢复 MTP-on 性能矩阵。新候选先跑 F0、同口径 P1；只有至少达到 U1 且无稳定性回退，才进入 P2。
+在功能扩展期间不扫描 eager threshold、不单独启动 eager P2 三轮。Graph/U2 已作为独立功能候选通过 F0 + P1，下一步先完成 MTP/U2；功能组合闭环后统一恢复 Graph/U1、Graph/U2、native Graph 和 MTP on/off 的 P2。
 
 性能缺口登记为 `P8D-PERF-001`，在功能扩展期间保持 Open。允许冻结 functional snapshot 供后续 Graph/U2、MTP/U2 等能力开发复用，但该 tag 不是性能基线；关闭问题仍以同口径 U1、三轮 P2 和同预算 native 门禁为准。
 
@@ -1009,7 +1047,7 @@ A5 必须先生成同平台非 AFD golden，不能只拿 A3 token 文件代替 A
 4. eager/U2；
 5. `A = k x F` 非等量 eager/U1、U2；
 6. 冷启动、二次启动、batch、空闲恢复和严格关闭；
-7. 等量 A/F 的 HCCL P2P Graph/U1 回归；Graph/U2、U3 与非等量 Graph 另立里程碑。
+7. 等量 A/F 的 HCCL P2P Graph/U1 和 Graph/U2 回归；Graph/U3 与非等量 Graph 另立里程碑。
 8. 先生成 A5 原生 MTP golden，再回归 HCCL P2P eager/U1 + MTP 和 Graph/U1 + MTP；不得直接复用 A3 MTP token 文件。
 
 若 A5 单机有 16 个 NPU，先验证 A8F8，再在 HBM 允许时验证 A8F4；若只有 8 个 NPU，先验证 A4F4，再评估 A4F2。非等量候选必须满足 `A >= F` 且 `A % F == 0`。实际角色映射必须根据 `npu-smi` 拓扑和 NUMA/NIC 关系决定，不能只按 device ordinal 对半切分，也不能在未测 HBM 前假定更少 FFN rank 一定可行。
@@ -1113,14 +1151,14 @@ Mooncake PD 不进入当前 A3 standalone AF 性能开发的关键路径。
 5. A3-P5 已完成；恢复时先核对 A2F1/A4F2 `summary.json` 和相关回归，不重复改写 topology 协议；
 6. A3-P6 的 A8F4 已确认受 EP4 HBM 阻塞，A10F5 受固定栈 EP5 放置阻塞；不要通过超卖或 EPLB 改变语义绕过；
 7. 旧栈 C32 同步优化和 A3-P7T 目标栈 U1/U2 复测均已完成；目标栈 U2 回退 26.342%，明确禁止打性能 tag；
-8. 目标栈 HCCL P2P Graph/U1 功能已经通过；恢复时先核对完整验证的 `validation_summary.json` 和 graph replay 日志，不重复修改已通过的 lowering；
+8. 目标栈 HCCL P2P Graph/U1 和 Graph/U2 功能已经通过；恢复时先核对两个专项报告、Graph/U2 F0/P1 汇总和 graph replay 日志，不重复修改已通过的 lowering 与 layer-major capture；
 9. A3-P7M0 已完成；恢复时先核对 M0 报告、`mtp_weight_contract.json` 和 30/30 对照，不重复生成原生基线；
-10. A3-P7M1 和 M2 已完成；恢复时核对 M1/M2 报告、30/30 golden、两轮 lifecycle 和 P1 证据；M2 仅支持 target Graph + draft eager，full draft Graph、U2、非等量和更多 speculative token 继续 fail-fast；
-11. A3-P8 同步 HCCL 第一轮门禁未通过；恢复时先核对 P8 报告、native 双实例基线、async scheduling off 的 U1/U2 P1 和双侧 profile，不重复跑已被否决的 U2 三轮矩阵；下一步先决定冻结同步 U1，或立项 NPU 通信流重叠；
+10. A3-P7M1 和 M2 已完成；恢复时核对 M1/M2 报告、30/30 golden、两轮 lifecycle 和 P1 证据；下一功能阶段是 eager/U2 + MTP，M2 仍只支持 target Graph/U1 + draft eager，full draft Graph、MTP/U2、非等量和更多 speculative token 继续 fail-fast；
+11. A3-P8/P8C/P8D 的 eager 性能缺口 `P8D-PERF-001` 仍为 Open；Graph/U2 P1 的 107.189 token/s 不能直接关闭该问题。功能组合闭环后再做 Graph/U1、Graph/U2 和同预算 native Graph 三轮 P2；
 12. A3 性能 tag 冻结后再进入 PD 或 A5 硬件差异开发；
 13. A5 到位后从硬件审计和独立工具链开始，不复用 A3 二进制，并重新生成原生 MTP golden；
 14. 每次阶段完成都保存日志、原始数据、解析结果和清理证据。
 
 ## 13. 一句话路线
 
-在 vLLM 0.23 + `rfc/vllm_cann` 目标栈已经完成 HCCL P2P eager U1/U2、等量 Graph/U1、原生 MTP/M0、eager/U1 + MTP/M1 和 target Graph/U1 + draft eager MTP/M2；A3-P8 第一轮证明关闭 async scheduling 可以修复 U1 host 调度退化，但完全阻塞式 HCCL 的 U2 仍比 U1 回退 45.676%，所以不创建性能 tag。下一步要么冻结同步 U1 功能基线，要么单独立项 NPU 通信流重叠后再恢复 P2。A8F4 因 A3 EP4 HBM 不足转到高 HBM A5 完成 E2E、资源效率和 MTP 回归；任何通信流方案都必须作为独立里程碑重新验收。
+在 vLLM 0.23 + `rfc/vllm_cann` 目标栈已经完成 HCCL P2P eager U1/U2、等量 Graph/U1/U2、原生 MTP/M0、eager/U1 + MTP/M1 和 target Graph/U1 + draft eager MTP/M2。eager/U2 的 P8D 性能缺口仍为 Open；Graph/U2 单轮 P1 107.189 token/s 是强候选信号，但三轮 P2 和同预算 native Graph 公平对照前不创建性能 tag。下一步先完成 eager/U2 + MTP 功能，再评估 target Graph/U2 + draft eager，之后统一恢复正式性能矩阵。A8F4 因 A3 EP4 HBM 不足转到高 HBM A5 完成 E2E、资源效率和 MTP 回归；A3 数字不得直接外推到 A5。

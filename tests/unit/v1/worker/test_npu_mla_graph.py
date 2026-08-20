@@ -685,6 +685,60 @@ def test_full_graph_capture_passes_shape_key_and_mla_registries(monkeypatch):
     assert captured["capture_params"][1].workspaces[4] is workspace
 
 
+def test_full_graph_capture_uses_layer_major_hccl_schedule(monkeypatch):
+    wrapper_module = _load_ubatch_wrapper_module(monkeypatch)
+    wrapper = _new_wrapper_for_unit_test(
+        wrapper_module,
+        mla_full_graph_enabled=False,
+    )
+    wrapper.enable_layer_major_eager_u2 = True
+    calls = []
+
+    @contextmanager
+    def graph_context(graph, *, stream, pool):
+        calls.append(("graph", graph, stream, pool))
+        yield
+
+    monkeypatch.setattr(wrapper_module.torch.npu, "graph", graph_context, raising=False)
+    parent_context = SimpleNamespace(dbo_enabled=False)
+    monkeypatch.setattr(
+        wrapper_module,
+        "get_forward_context",
+        lambda: parent_context,
+    )
+    metadata = [
+        SimpleNamespace(context=SimpleNamespace(compute_stream="compute")),
+        SimpleNamespace(context=SimpleNamespace(compute_stream="unused")),
+    ]
+
+    class LayerMajorModel:
+        def forward_ubatches_layer_major(self, value):
+            calls.append(("forward", value))
+            return ["stage-0", "stage-1"]
+
+    wrapper._merge_outputs = lambda outputs, value: calls.append(
+        ("merge", outputs, value)
+    ) or "merged"
+    graph_key = wrapper_module.AscendNPUGraphKey((4, 4), False, 0)
+
+    result = wrapper._capture_ubatches(
+        metadata,
+        LayerMajorModel(),
+        graph_key=graph_key,
+        mla_graph_params=None,
+    )
+
+    assert result == "merged"
+    assert calls[0][0] == "graph"
+    assert calls[0][2:] == ("compute", None)
+    assert calls[1:] == [
+        ("forward", metadata),
+        ("merge", ["stage-0", "stage-1"], metadata),
+    ]
+    assert wrapper.cudagraphs[graph_key].outputs == "merged"
+    assert parent_context.dbo_enabled is True
+
+
 def test_mla_graph_replay_updates_child_params_each_time_in_runtime_order(monkeypatch):
     wrapper_module = _load_ubatch_wrapper_module(monkeypatch)
     wrapper = _new_wrapper_for_unit_test(

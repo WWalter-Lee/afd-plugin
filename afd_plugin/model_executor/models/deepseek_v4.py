@@ -493,14 +493,14 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         self,
         ubatch_metadata: list[Any],
     ) -> list[Any]:
-        """Run eager U2 in layer-major, stage-minor order on one host thread."""
+        """Run HCCL U2 in layer-major, stage-minor order on one host thread."""
         if self.afd_role != "attention":
             raise RuntimeError("DSV4 FFN model execution is connector-driven")
         if self.mtp_enabled:
-            raise RuntimeError("DSV4 layer-major eager U2 does not support MTP")
+            raise RuntimeError("DSV4 layer-major U2 does not support MTP")
         if len(ubatch_metadata) != 2:
             raise RuntimeError(
-                "DSV4 layer-major eager execution requires exactly two stages; "
+                "DSV4 layer-major execution requires exactly two stages; "
                 f"got {len(ubatch_metadata)}"
             )
 
@@ -513,7 +513,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
             connector = getattr(afd_metadata, "connector", None)
             if connector is None:
                 raise RuntimeError(
-                    "DSV4 layer-major eager U2 requires AFD connector metadata"
+                    "DSV4 layer-major U2 requires AFD connector metadata"
                 )
             if int(getattr(forward_context, "ubatch_idx", -1)) != stage_idx:
                 raise RuntimeError(
@@ -528,7 +528,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         connector = connectors[0]
         if any(stage_connector is not connector for stage_connector in connectors[1:]):
             raise RuntimeError(
-                "DSV4 layer-major eager U2 stages must share one connector"
+                "DSV4 layer-major U2 stages must share one connector"
             )
         require_idle = getattr(connector, "require_attention_pipeline_idle", None)
         wait_for_receive = getattr(
@@ -539,7 +539,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         reset_pipeline = getattr(connector, "reset_attention_pipeline_state", None)
         if not all(callable(method) for method in (require_idle, wait_for_receive)):
             raise RuntimeError(
-                "DSV4 layer-major eager U2 requires the HCCL stream connector"
+                "DSV4 layer-major U2 requires the HCCL stream connector"
             )
 
         hidden_ubatches: list[torch.Tensor] = []

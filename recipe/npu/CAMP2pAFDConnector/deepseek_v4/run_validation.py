@@ -598,6 +598,14 @@ def _validate_execution_topology(
     topology: dict[str, Any],
 ) -> None:
     if (
+        u_batches == 2
+        and execution_mode == "full-decode-only"
+        and connector != "P2pHcclAFDConnector"
+    ):
+        raise ValueError(
+            "DeepSeek-V4 graph U2 requires P2pHcclAFDConnector",
+        )
+    if (
         connector == "P2pHcclAFDConnector"
         and execution_mode == "full-decode-only"
         and topology["attention_ranks"] != topology["ffn_ranks"]
@@ -683,8 +691,6 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.u_batches == 2 and args.execution_mode != "eager":
-        parser.error("DeepSeek-V4 U2 currently supports only eager execution")
     if args.dbo_decode_token_threshold < 0:
         parser.error("--dbo-decode-token-threshold must be non-negative")
     if args.dbo_prefill_token_threshold < 0:

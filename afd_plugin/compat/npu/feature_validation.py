@@ -140,7 +140,7 @@ def _fail_if_unsupported_deepseek_v4_features(
     vllm_config: VllmConfig,
     afd_config: AFDConfig,
 ) -> None:
-    """Keep DSV4 AFD inside its validated eager/U2 and graph/U1 boxes."""
+    """Keep DSV4 AFD inside its validated eager and graph feature boxes."""
     parallel_config = vllm_config.parallel_config
     supported_connectors = {
         "CAMP2pAFDConnector",
@@ -222,9 +222,12 @@ def _fail_if_unsupported_deepseek_v4_features(
             raise RuntimeError(
                 "DeepSeek-V4 AFD graph execution supports only FULL_DECODE_ONLY"
             )
-        if parallel_config.use_ubatching:
+        if (
+            parallel_config.use_ubatching
+            and afd_config.connector != "P2pHcclAFDConnector"
+        ):
             raise RuntimeError(
-                "DeepSeek-V4 AFD DBO/ubatching currently supports only eager execution"
+                "DeepSeek-V4 AFD graph U2 supports only P2pHcclAFDConnector"
             )
     if getattr(vllm_config, "kv_transfer_config", None) is not None:
         raise RuntimeError("DeepSeek-V4 AFD standalone baseline does not support PD")
