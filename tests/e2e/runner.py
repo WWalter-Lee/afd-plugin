@@ -477,7 +477,11 @@ def build_env(
     else:
         env["CUDA_VISIBLE_DEVICES"] = visible_devices
         env["VLLM_USE_V2_MODEL_RUNNER"] = "0"
-    env["VLLM_PLUGINS"] = "ascend,afd" if args.device_backend == "npu" else "afd"
+    env["VLLM_PLUGINS"] = (
+        "ascend,ascend_model,ascend_model_loader,ascend_kv_connector,afd"
+        if args.device_backend == "npu"
+        else "afd"
+    )
     env["PYTHONUNBUFFERED"] = "1"
     if (
         args.device_backend == "npu"

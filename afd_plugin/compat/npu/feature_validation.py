@@ -34,6 +34,9 @@ def fail_if_unsupported_npu_afd_features(
         vllm_config,
     )
 
+    if _is_deepseek_v4(vllm_config):
+        _fail_if_unsupported_deepseek_v4_features(vllm_config, afd_config)
+
     if afd_config.connector == AFD_ASYNC_CONNECTOR:
         _fail_if_unsupported_npu_afd_async_features(
             vllm_config,
@@ -122,6 +125,109 @@ def _fail_if_unsupported_npu_afd_async_features(
         raise RuntimeError(
             "CAMAsyncAFDConnector currently supports only dynamicQuant 0 or 1",
         )
+
+
+def _is_deepseek_v4(vllm_config: VllmConfig) -> bool:
+    hf_config = getattr(vllm_config.model_config, "hf_config", None)
+    architectures = getattr(hf_config, "architectures", None) or []
+    return any(
+        architecture in {"DeepseekV4ForCausalLM", "AFDDeepseekV4ForCausalLM"}
+        for architecture in architectures
+    )
+
+
+def _fail_if_unsupported_deepseek_v4_features(
+    vllm_config: VllmConfig,
+    afd_config: AFDConfig,
+) -> None:
+    """Keep DSV4 AFD inside its validated eager/U2 and graph/U1 boxes."""
+    parallel_config = vllm_config.parallel_config
+    supported_connectors = {
+        "CAMP2pAFDConnector",
+        "P2pHcclAFDConnector",
+    }
+    if afd_config.connector not in supported_connectors:
+        raise RuntimeError(
+            "DeepSeek-V4 AFD supports only CAMP2pAFDConnector or P2pHcclAFDConnector"
+        )
+    if (
+        afd_config.connector == "CAMP2pAFDConnector"
+        and afd_config.num_attention_ranks != afd_config.num_ffn_ranks
+    ):
+        raise RuntimeError(
+            "DeepSeek-V4 CAMP2pAFDConnector requires equal Attention and FFN ranks"
+        )
+    if parallel_config.tensor_parallel_size != 1:
+        raise RuntimeError("DeepSeek-V4 AFD supports only tensor_parallel_size=1")
+    if parallel_config.pipeline_parallel_size != 1:
+        raise RuntimeError("DeepSeek-V4 AFD supports only pipeline_parallel_size=1")
+    if parallel_config.prefill_context_parallel_size != 1:
+        raise RuntimeError(
+            "DeepSeek-V4 AFD supports only prefill context parallel size 1"
+        )
+    if parallel_config.decode_context_parallel_size != 1:
+        raise RuntimeError(
+            "DeepSeek-V4 AFD supports only decode context parallel size 1"
+        )
+    if parallel_config.use_sequence_parallel_moe:
+        raise RuntimeError("DeepSeek-V4 AFD does not support sequence-parallel MoE")
+    if afd_config.compute_gate_on_attention:
+        raise RuntimeError("DeepSeek-V4 AFD requires FFN-side gate computation")
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is not None:
+        if afd_config.connector != "P2pHcclAFDConnector":
+            raise RuntimeError("DeepSeek-V4 AFD MTP supports only P2pHcclAFDConnector")
+        if afd_config.num_attention_ranks != afd_config.num_ffn_ranks:
+            raise RuntimeError("DeepSeek-V4 AFD MTP requires equal A/F ranks")
+        if bool(getattr(parallel_config, "use_ubatching", False)):
+            raise RuntimeError("DeepSeek-V4 AFD MTP supports only U1")
+        if getattr(speculative_config, "method", None) != "mtp":
+            raise RuntimeError("DeepSeek-V4 AFD supports only MTP speculative method")
+        if int(getattr(speculative_config, "num_speculative_tokens", 0)) != 1:
+            raise RuntimeError("DeepSeek-V4 AFD MTP supports num_speculative_tokens=1")
+        draft_enforce_eager = bool(getattr(speculative_config, "enforce_eager", False))
+        target_enforce_eager = bool(vllm_config.model_config.enforce_eager)
+        if target_enforce_eager and not draft_enforce_eager:
+            raise RuntimeError(
+                "DeepSeek-V4 AFD MTP eager execution requires draft enforce_eager=true"
+            )
+        if not target_enforce_eager and not draft_enforce_eager:
+            raise RuntimeError(
+                "DeepSeek-V4 AFD MTP Graph/U1 currently requires draft "
+                "enforce_eager=true; draft ACL Graph is not validated"
+            )
+        num_mtp_layers = int(
+            getattr(vllm_config.model_config.hf_config, "num_nextn_predict_layers", 1)
+        )
+        if num_mtp_layers != 1:
+            raise RuntimeError("DeepSeek-V4 AFD MTP supports exactly one MTP layer")
+    if not vllm_config.model_config.enforce_eager:
+        if (
+            afd_config.connector == "P2pHcclAFDConnector"
+            and afd_config.num_attention_ranks != afd_config.num_ffn_ranks
+        ):
+            raise RuntimeError(
+                "DeepSeek-V4 P2pHcclAFDConnector graph execution requires equal "
+                "Attention and FFN ranks"
+            )
+        cudagraph_mode = getattr(
+            getattr(vllm_config, "compilation_config", None),
+            "cudagraph_mode",
+            None,
+        )
+        mode_name = getattr(cudagraph_mode, "name", None)
+        if not isinstance(mode_name, str):
+            mode_name = str(cudagraph_mode).rsplit(".", 1)[-1]
+        if mode_name != "FULL_DECODE_ONLY":
+            raise RuntimeError(
+                "DeepSeek-V4 AFD graph execution supports only FULL_DECODE_ONLY"
+            )
+        if parallel_config.use_ubatching:
+            raise RuntimeError(
+                "DeepSeek-V4 AFD DBO/ubatching currently supports only eager execution"
+            )
+    if getattr(vllm_config, "kv_transfer_config", None) is not None:
+        raise RuntimeError("DeepSeek-V4 AFD standalone baseline does not support PD")
 
 
 def _fail_if_unsupported_npu_async_moe_ubatching_features(

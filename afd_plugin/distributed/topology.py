@@ -52,14 +52,23 @@ def topology_from_config(config: AFDConfig) -> tuple[int, int]:
 
 def validate_p2p_topology(config: AFDConfig) -> None:
     attention_size, ffn_size = topology_from_config(config)
+    if attention_size <= 0:
+        raise ValueError(
+            "P2P AFD connectors require num_attention_ranks to be positive, "
+            f"got {attention_size}",
+        )
+    if ffn_size <= 0:
+        raise ValueError(
+            f"P2P AFD connectors require num_ffn_ranks to be positive, got {ffn_size}",
+        )
     if attention_size < ffn_size:
         raise ValueError(
-            "P2pNcclAFDConnector currently requires num_attention_ranks >= "
+            "P2P AFD connectors require num_attention_ranks >= "
             f"num_ffn_ranks, got {attention_size} < {ffn_size}",
         )
     if attention_size % ffn_size != 0:
         raise ValueError(
-            "P2pNcclAFDConnector currently requires num_attention_ranks to be a "
+            "P2P AFD connectors require num_attention_ranks to be a "
             "multiple of num_ffn_ranks, got "
             f"{attention_size} and {ffn_size}",
         )

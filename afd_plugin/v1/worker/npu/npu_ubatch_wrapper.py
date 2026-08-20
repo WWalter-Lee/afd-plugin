@@ -151,6 +151,7 @@ class AscendUBatchWrapper(UBatchWrapper):
         mla_full_graph_enabled: bool = False,
         full_graph_params_updater: FullGraphParamsUpdater | None = None,
         enable_enpu: bool = False,
+        enable_layer_major_eager_u2: bool = False,
     ):
         assert not enable_enpu, "AscendUBatchWrapper does not support ENPU"
         self.runnable = runnable
@@ -170,6 +171,7 @@ class AscendUBatchWrapper(UBatchWrapper):
         self.device = device
         self.mla_full_graph_enabled = mla_full_graph_enabled
         self.full_graph_params_updater = full_graph_params_updater
+        self.enable_layer_major_eager_u2 = enable_layer_major_eager_u2
 
     @property
     def graph_pool(self):
@@ -546,6 +548,8 @@ class AscendUBatchWrapper(UBatchWrapper):
         ubatch_metadata: list[AscendUbatchMetadata],
         model,
     ) -> AscendModelOutput:
+        if self.enable_layer_major_eager_u2:
+            return self._run_ubatches_layer_major(ubatch_metadata, model)
         results: list[tuple[int, AscendModelOutput]] = []
         with override_forward_context(None):
             ubatch_threads = []
@@ -562,6 +566,25 @@ class AscendUBatchWrapper(UBatchWrapper):
                 thread.join()
 
         sorted_results = [value for _, value in sorted(results)]
+        get_forward_context().dbo_enabled = True
+        return self._merge_outputs(sorted_results, ubatch_metadata)
+
+    @torch.inference_mode()
+    def _run_ubatches_layer_major(
+        self,
+        ubatch_metadata: list[AscendUbatchMetadata],
+        model,
+    ) -> AscendModelOutput:
+        forward = getattr(model, "forward_ubatches_layer_major", None)
+        if not callable(forward):
+            raise RuntimeError("Ascend layer-major eager U2 requires model support")
+        with override_forward_context(None):
+            sorted_results = forward(ubatch_metadata)
+        if len(sorted_results) != len(ubatch_metadata):
+            raise RuntimeError(
+                "Ascend layer-major eager U2 returned an invalid stage count: "
+                f"{len(sorted_results)} != {len(ubatch_metadata)}"
+            )
         get_forward_context().dbo_enabled = True
         return self._merge_outputs(sorted_results, ubatch_metadata)
 

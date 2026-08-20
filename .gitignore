@@ -9,6 +9,12 @@ __pycache__/
 # C extensions
 *.so
 
+# Ascend custom-op build and runtime diagnostics
+afd_plugin/_cann_ops_custom/
+csrc/npu/output/
+extra-info/
+kernel_meta/
+
 # Distribution / packaging
 .Python
 build/
@@ -18,6 +24,8 @@ downloads/
 eggs/
 .eggs/
 lib/
+!tools/dsv4/hccl_manual_install/lib/
+!tools/dsv4/hccl_manual_install/lib/common.sh
 lib64/
 parts/
 sdist/

@@ -69,11 +69,15 @@ def afd_npu_profiler_config(role: AFDNPUProfilerRole) -> AFDNPUProfilerConfig:
     )
 
 
-def create_afd_npu_profiler(role: AFDNPUProfilerRole) -> AFDNPUProfiler | None:
-    """Create a torch-npu profiler when the plugin-owned env enables it."""
+def create_afd_npu_profiler(
+    role: AFDNPUProfilerRole,
+    *,
+    role_rank: int = 0,
+) -> AFDNPUProfiler | None:
+    """Create a torch-npu profiler for role-local DP0 when enabled."""
 
     config = afd_npu_profiler_config(role)
-    if not config.enabled:
+    if not config.enabled or int(role_rank) != 0:
         return None
 
     import torch_npu

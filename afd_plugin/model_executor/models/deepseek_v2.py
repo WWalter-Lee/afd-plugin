@@ -38,6 +38,20 @@ _DeepseekAdapterConfig: TypeAlias = (
 )
 
 
+def _get_moe_router_dtype(config: _DeepseekAdapterConfig) -> torch.dtype | None:
+    """Use the native v0.26 helper, with its behavior for v0.23 runtimes."""
+
+    native_helper = getattr(native, "_get_moe_router_dtype", None)
+    if native_helper is not None:
+        return native_helper(config)
+    if (
+        getattr(config, "model_type", None) == "glm_moe_dsa"
+        or getattr(config, "moe_router_dtype", None) == "float32"
+    ):
+        return torch.float32
+    return None
+
+
 def _is_moe_layer(config: _DeepseekAdapterConfig, layer_idx: int) -> bool:
     moe_layer_freq = getattr(config, "moe_layer_freq", 1)
     return (
@@ -112,9 +126,21 @@ def _iter_role_weights(
 class RemoteFFNProxy(nn.Module):
     """Parameter-free FFN stage executed through the AFD connector."""
 
-    def __init__(self, *, layer_idx: int) -> None:
+    def __init__(
+        self,
+        *,
+        layer_idx: int,
+        phase: str = "decoder",
+    ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
+        self.phase = phase
+        self.speculative_step = 0
+        self._fallback_connector = None
+
+    def attach_connector(self, connector: object) -> None:
+        """Attach the runner-owned connector for draft-only forward contexts."""
+        self._fallback_connector = connector
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self._send_and_receive(hidden_states)
@@ -125,29 +151,58 @@ class RemoteFFNProxy(nn.Module):
         **send_kwargs: torch.Tensor,
     ) -> torch.Tensor:
         afd_metadata = get_afd_metadata_from_forward_context()
-        if afd_metadata is None:
-            raise RuntimeError("RemoteFFNProxy requires AFD forward metadata")
         forward_context = get_forward_context()
-        stage_idx = int(
-            getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx),
-        )
-        afd_metadata.stage_idx = stage_idx
+        if afd_metadata is None and (
+            self.phase != "mtp" or self._fallback_connector is None
+        ):
+            raise RuntimeError("RemoteFFNProxy requires AFD forward metadata")
+        if afd_metadata is None:
+            connector = self._fallback_connector
+            stage_idx = 0
+        else:
+            connector = afd_metadata.connector
+            stage_idx = int(
+                getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx),
+            )
+            afd_metadata.stage_idx = stage_idx
         metadata = AFDTransferMetadata.create_attention_metadata(
             layer_idx=self.layer_idx,
             stage_idx=stage_idx,
             seq_len=int(hidden_states.shape[0]),
+            phase=self.phase,
+            speculative_step=self.speculative_step,
         )
         context = AFDTransferContext(metadata=metadata)
-        afd_metadata.connector.send_attn_output(
+        if self.phase == "mtp":
+            dp_metadata = getattr(forward_context, "dp_metadata", None)
+            num_tokens_across_dp = getattr(
+                dp_metadata,
+                "num_tokens_across_dp_cpu",
+                None,
+            )
+            if num_tokens_across_dp is None:
+                ffn_size = int(getattr(connector, "ffn_size", 1))
+                if ffn_size != 1:
+                    raise RuntimeError(
+                        "DSV4 MTP forward requires DP token counts for A8F8"
+                    )
+                num_tokens_across_dp = torch.tensor(
+                    [int(hidden_states.shape[0])],
+                    dtype=torch.int32,
+                    device="cpu",
+                )
+            send_kwargs["num_tokens_across_dp"] = num_tokens_across_dp
+        connector.send_attn_output(
             hidden_states,
             context,
             **send_kwargs,
         )
-        hidden_states = maybe_apply_dbo_yield(
-            hidden_states,
-            role="attention",
-        )
-        return afd_metadata.connector.recv_ffn_output(
+        if connector.yield_after_attn_send:
+            hidden_states = maybe_apply_dbo_yield(
+                hidden_states,
+                role="attention",
+            )
+        return connector.recv_ffn_output(
             ref_tensor=hidden_states,
             ubatch_idx=stage_idx,
         )
@@ -258,7 +313,7 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
         nn.Module.__init__(self)
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
-        router_dtype = native._get_moe_router_dtype(config)
+        router_dtype = _get_moe_router_dtype(config)
         if compute_gate_on_attention:
             self.gate = native.GateLinear(
                 config.hidden_size,

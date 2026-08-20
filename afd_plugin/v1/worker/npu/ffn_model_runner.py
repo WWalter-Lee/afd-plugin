@@ -9,10 +9,15 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.forward_context import DPMetadata
+from vllm.forward_context import DPMetadata, override_forward_context
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner, graph_capture
+from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
+from vllm_ascend.worker.model_runner_v1 import (
+    NPUModelRunner,
+    get_tp_context,
+    graph_capture,
+)
 
 from afd_plugin.compat.npu import (
     ascend_forward_context,
@@ -36,6 +41,7 @@ from afd_plugin.connectors.npu.async_cam import (
     AFDAsyncTransferState,
     CAMAsyncAFDConnector,
 )
+from afd_plugin.connectors.npu.p2p_hccl import P2pHcclAFDConnector
 from afd_plugin.v1.worker.attention_model_runner import (
     _resolve_world_ranks,
 )
@@ -80,13 +86,42 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             self.afd_config,
         )
         self.num_layers = int(self.model_config.hf_config.num_hidden_layers)
+        self.ffn_stream_overlap_enabled = bool(
+            isinstance(self.connector, P2pHcclAFDConnector)
+            and self.connector.stream_overlap_enabled
+        )
+        self.ffn_recv_stream = None
+        self.ffn_compute_stream = None
+        self.ffn_send_stream = None
+        self.ffn_recv_events: dict[tuple[int, int], Any] = {}
+        self.ffn_compute_events: dict[tuple[int, int], Any] = {}
+        self.ffn_send_events: dict[tuple[int, int], Any] = {}
+        if self.ffn_stream_overlap_enabled:
+            self._initialize_ffn_stream_pipeline(device)
         self.use_aclgraph = _use_npu_aclgraph(vllm_config, self)
         self._acl_graphs: dict[tuple, dict[str, Any]] = {}
         self.graph_pool = (
             current_platform.get_global_graph_pool() if self.use_aclgraph else None
         )
-        self.prof = create_afd_npu_profiler("ffn")
+        self.prof = create_afd_npu_profiler("ffn", role_rank=rank)
         self._is_shutdown = False
+        self._ffn_input_ids_cache: dict[int, torch.Tensor] = {}
+        self.mtp_ffn_model: torch.nn.Module | None = None
+
+    def _initialize_ffn_stream_pipeline(self, device: torch.device) -> None:
+        """Create eager U2 receive, compute, and send streams for FFN."""
+        self.ffn_recv_stream = torch.npu.Stream(device=device)
+        self.ffn_compute_stream = torch.npu.Stream(device=device)
+        self.ffn_send_stream = torch.npu.Stream(device=device)
+        stage_ids = range(int(self.vllm_config.parallel_config.num_ubatches))
+        event_keys = [
+            (layer_idx, stage_idx)
+            for layer_idx in range(self.num_layers)
+            for stage_idx in stage_ids
+        ]
+        self.ffn_recv_events = {key: torch.npu.Event() for key in event_keys}
+        self.ffn_compute_events = {key: torch.npu.Event() for key in event_keys}
+        self.ffn_send_events = {key: torch.npu.Event() for key in event_keys}
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
@@ -104,16 +139,47 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
     def profile_run(self) -> None:
         return None
 
+    def load_model(self) -> None:
+        if self.speculative_config is None:
+            super().load_model()
+            return
+        if self.speculative_config.method != "mtp" or self.drafter is None:
+            raise RuntimeError("DSV4 AFD FFN requires an initialized MTP drafter")
+
+        # The FFN service owns no scheduler-side proposer or sampler. Load the
+        # target model normally, then construct only the role-filtered MTP MoE.
+        drafter = self.drafter
+        self.drafter = None
+        try:
+            super().load_model()
+        finally:
+            self.drafter = drafter
+        if self.vllm_config.quant_config is not None:
+            patch_load_weights(self.vllm_config)
+        with get_tp_context(drafter):
+            drafter.model = drafter._get_model()
+        self.mtp_ffn_model = drafter.get_model()
+
     def execute_ffn_step(
         self,
         *,
         dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
         is_graph_capturing: bool = False,
         is_warmup: bool = False,
+        connector_state_prepared: bool = False,
     ) -> None:
         if dp_metadata_list is None:
             raise RuntimeError("AFD NPU FFN requires dp_metadata_list")
+        if not connector_state_prepared:
+            self._prepare_connector_step(
+                dp_metadata_list,
+                is_graph_capturing=is_graph_capturing,
+                is_warmup=is_warmup,
+            )
         if bool(self.use_aclgraph) and (is_graph_capturing or is_warmup):
+            input_ids_by_stage = self._receive_input_ids_before_model(
+                dp_metadata_list,
+            )
             logger.debug(
                 "AFD NPU FFN execute_ffn_step enters capture_model; "
                 "key=%s is_graph_capturing=%s is_warmup=%s",
@@ -125,9 +191,18 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 dp_metadata_list=dp_metadata_list,
                 is_warmup=is_warmup,
                 is_attn_graph_capturing=is_graph_capturing,
+                input_ids_by_stage=input_ids_by_stage,
+                connector_state_prepared=True,
             )
             return None
-        self.execute_model(dp_metadata_list=dp_metadata_list)
+        input_ids_by_stage = self._receive_input_ids_before_model(
+            dp_metadata_list,
+        )
+        self.execute_model(
+            dp_metadata_list=dp_metadata_list,
+            input_ids_by_stage=input_ids_by_stage,
+            connector_state_prepared=True,
+        )
         return None
 
     def execute_connector_driven_step(self) -> None:
@@ -148,10 +223,18 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata] | None = None,
         is_graph_capturing: bool = False,
         is_warmup: bool = False,
+        input_ids_by_stage: dict[int, torch.Tensor] | None = None,
+        connector_state_prepared: bool = False,
     ) -> None:
         step_afd_npu_profiler(self.prof)
         if dp_metadata_list is None:
             raise RuntimeError("AFD NPU FFN is connector-driven")
+        if not connector_state_prepared:
+            self._prepare_connector_step(
+                dp_metadata_list,
+                is_graph_capturing=is_graph_capturing,
+                is_warmup=is_warmup,
+            )
         graph_key = self._make_graph_key(dp_metadata_list)
         acl_graphs = self._acl_graphs
         graph_info = acl_graphs.get(graph_key)
@@ -162,6 +245,15 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             graph_enabled=graph_enabled,
             graph_exists=graph_info is not None,
         )
+        if run_mode in (AFDGraphRunMode.WARMUP, AFDGraphRunMode.CAPTURE):
+            return self.execute_ffn_step(
+                dp_metadata_list=dp_metadata_list,
+                is_graph_capturing=is_graph_capturing,
+                is_warmup=is_warmup,
+                connector_state_prepared=True,
+            )
+        if input_ids_by_stage is None and run_mode is AFDGraphRunMode.REPLAY:
+            input_ids_by_stage = self._receive_input_ids_before_model(dp_metadata_list)
         if run_mode is AFDGraphRunMode.REPLAY:
             logger.debug(
                 "AFD NPU FFN replaying ACL graph; key=%s cached_graphs=%d",
@@ -169,26 +261,94 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 len(acl_graphs),
             )
             graph_info["graph"].replay()
+            # ### PATCH START: eager draft after target graph replay.
+            # Upstream commit 3da28f94 runs colocated target and draft models.
+            # AFD replays only the target graph, then performs the validated
+            # cross-service MTP exchange eagerly for the current step.
+            self._mtp_ffn_forward(
+                sorted(int(stage_idx) for stage_idx in dp_metadata_list) or [0]
+            )
+            # ### PATCH END: eager draft after target graph replay.
             return None
-        if run_mode in (AFDGraphRunMode.WARMUP, AFDGraphRunMode.CAPTURE):
-            return self.execute_ffn_step(
-                dp_metadata_list=dp_metadata_list,
+
+        self._ffn_forward(
+            dp_metadata_list=dp_metadata_list,
+            input_ids_by_stage=input_ids_by_stage,
+            update_connector_state=False,
+        )
+        # Keep the same phase boundary when a target graph is unavailable.
+        self._mtp_ffn_forward(
+            sorted(int(stage_idx) for stage_idx in dp_metadata_list) or [0]
+        )
+        return None
+
+    def _prepare_connector_step(
+        self,
+        dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
+        *,
+        is_graph_capturing: bool = False,
+        is_warmup: bool = False,
+    ) -> None:
+        control_plane = self.connector.control_plane
+        if control_plane is None:
+            raise RuntimeError("AFD NPU FFN requires a DP metadata control plane")
+        control_plane.update_state_from_dp_metadata(
+            _make_dp_metadata_payload(
+                dp_metadata_list,
                 is_graph_capturing=is_graph_capturing,
                 is_warmup=is_warmup,
-            )
+            ),
+        )
 
-        self._ffn_forward(dp_metadata_list=dp_metadata_list)
-        return None
+    def _receive_input_ids_before_model(
+        self,
+        dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
+    ) -> dict[int, torch.Tensor]:
+        """Receive DSV4 IDs before entering an ACL graph region."""
+        if not getattr(self.connector, "requires_input_ids", False):
+            return {}
+        input_ids_by_stage: dict[int, torch.Tensor] = {}
+        for stage_idx in sorted(int(index) for index in dp_metadata_list) or [0]:
+            num_tokens_across_dp = _ffn_token_counts_across_ranks(
+                self.connector,
+                dp_metadata_list,
+                stage_idx,
+                fallback=self.max_num_tokens,
+            )
+            num_tokens = _ffn_token_count_for_rank(
+                self.connector,
+                num_tokens_across_dp,
+            )
+            input_ids_by_stage[stage_idx] = self.connector.recv_input_ids(
+                num_tokens,
+                ubatch_idx=stage_idx,
+            )
+        return input_ids_by_stage
 
     def _make_graph_key(
         self,
         dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
     ) -> tuple:
-        return make_ffn_graph_key(
+        # ### PATCH START: isolate target graphs by speculative configuration.
+        decoder_key = make_ffn_graph_key(
             dp_metadata_list,
             attention_size=int(self.connector.attn_size),
             ffn_size=int(self.connector.ffn_size),
             fallback=int(self.max_num_tokens),
+        )
+        graph_key = ("decoder", *self._speculative_graph_signature(), *decoder_key)
+        # ### PATCH END: isolate target graphs by speculative configuration.
+        return graph_key
+
+    def _speculative_graph_signature(self) -> tuple[str, int, bool]:
+        vllm_config = getattr(self, "vllm_config", None)
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if speculative_config is None:
+            return ("off", 0, False)
+        return (
+            str(getattr(speculative_config, "method", "unknown")),
+            int(getattr(speculative_config, "num_speculative_tokens", 0)),
+            bool(getattr(speculative_config, "enforce_eager", False)),
         )
 
     def _ffn_forward(
@@ -198,6 +358,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         aclgraph_runtime_mode: CUDAGraphMode | None = None,
         is_graph_capturing: bool = False,
         update_connector_state: bool = True,
+        input_ids_by_stage: dict[int, torch.Tensor] | None = None,
     ) -> torch.Tensor | None:
         if update_connector_state:
             assert self.connector.control_plane, (
@@ -219,63 +380,234 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             tokens_lens=[],
             num_stages=num_stages,
         )
-        stage_ids = sorted(int(stage_idx) for stage_idx in dp_metadata_list) or [0]
+        stage_ids = tuple(sorted(int(stage_idx) for stage_idx in dp_metadata_list)) or (
+            0,
+        )
+        layer_indices = tuple(_ffn_layer_indices(self))
+        stage_runtime: dict[int, tuple[int, torch.Tensor]] = {}
+        dp_size = int(self.vllm_config.parallel_config.data_parallel_size)
+        for stage_idx in stage_ids:
+            num_tokens_across_dp = _ffn_token_counts_across_ranks(
+                self.connector,
+                dp_metadata_list,
+                stage_idx,
+                fallback=self.max_num_tokens,
+            )
+            stage_runtime[stage_idx] = (
+                _ffn_token_count_for_rank(
+                    self.connector,
+                    num_tokens_across_dp,
+                ),
+                _to_dp_level_token_counts(
+                    num_tokens_across_dp,
+                    dp_size=dp_size,
+                ),
+            )
+        stage_forward_contexts = {}
+        for stage_idx in stage_ids:
+            num_tokens, dp_num_tokens_across_dp = stage_runtime[stage_idx]
+            initial_input_ids = (
+                input_ids_by_stage.get(stage_idx)
+                if input_ids_by_stage is not None
+                else None
+            )
+            with ascend_forward_context(
+                vllm_config=self.vllm_config,
+                afd_metadata=afd_metadata,
+                model_instance=self.model,
+                input_ids=initial_input_ids,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=dp_num_tokens_across_dp,
+                aclgraph_runtime_mode=aclgraph_runtime_mode,
+            ) as forward_context:
+                stage_forward_contexts[stage_idx] = forward_context
         rank_ffn_output = None
+        model_config = getattr(self, "model_config", self.vllm_config.model_config)
+        num_hash_layers = int(getattr(model_config.hf_config, "num_hash_layers", 0))
+        input_ids_cache = getattr(self, "_ffn_input_ids_cache", None)
+        if input_ids_cache is None:
+            input_ids_cache = self._ffn_input_ids_cache = {}
+        input_ids_cache.clear()
+        stream_overlap = bool(
+            getattr(self, "ffn_stream_overlap_enabled", False)
+            and len(stage_ids) > 1
+            and not is_graph_capturing
+            and aclgraph_runtime_mode in (None, CUDAGraphMode.NONE)
+        )
+        if stream_overlap:
+            assert isinstance(self.connector, P2pHcclAFDConnector)
+            assert self.ffn_recv_stream is not None
+            assert self.ffn_compute_stream is not None
+            assert self.ffn_send_stream is not None
+        try:
+            for layer_idx in layer_indices:
+                for stage_idx in stage_ids:
+                    stage_input_ids = (
+                        input_ids_by_stage.get(stage_idx)
+                        if input_ids_by_stage is not None and layer_idx == 0
+                        else None
+                    )
+                    recv_event = None
+                    if stream_overlap:
+                        previous_send_event = (
+                            self.ffn_send_events[(layer_idx - 1, stage_idx)]
+                            if layer_idx > 0
+                            else None
+                        )
+                        recv_event = self.ffn_recv_events[(layer_idx, stage_idx)]
+                        payload, recv_event = self.connector.recv_attn_output_streamed(
+                            ubatch_idx=stage_idx,
+                            layer_idx=layer_idx,
+                            max_num_tokens=self.max_num_tokens,
+                            input_ids=stage_input_ids,
+                            recv_stream=self.ffn_recv_stream,
+                            wait_event=previous_send_event,
+                            done_event=recv_event,
+                        )
+                    else:
+                        payload = self.connector.recv_attn_output(
+                            ubatch_idx=stage_idx,
+                            layer_idx=layer_idx,
+                            max_num_tokens=self.max_num_tokens,
+                            input_ids=stage_input_ids,
+                        )
+                    if layer_idx == 0 and num_hash_layers > 0:
+                        if payload.input_ids is None:
+                            raise RuntimeError(
+                                "DSV4 FFN layer 0 did not receive input_ids"
+                            )
+                        input_ids_cache[stage_idx] = payload.input_ids
+                    elif payload.input_ids is not None:
+                        raise RuntimeError("DSV4 FFN received input_ids after layer 0")
+                    hash_input_ids = (
+                        input_ids_cache.get(stage_idx)
+                        if layer_idx < num_hash_layers
+                        else None
+                    )
+                    forward_context = stage_forward_contexts[stage_idx]
+                    with override_forward_context(forward_context):
+                        context = payload.context
+                        metadata = context.metadata
+                        states = context.states
+                        hidden_states = payload.hidden_states
+                        metadata.layer_idx = layer_idx
+                        metadata.stage_idx = stage_idx
+                        forward_context.input_ids = hash_input_ids
+                        forward_context.additional_kwargs["afd_metadata"] = metadata
+                        assert states, "Context.states must not be None"
+                        _set_moe_layer_index(forward_context, layer_idx)
 
-        for layer_idx in _ffn_layer_indices(self):
-            for stage_idx in stage_ids:
-                num_tokens_across_dp = _ffn_token_counts_across_ranks(
-                    self.connector,
-                    dp_metadata_list,
-                    stage_idx,
-                    fallback=self.max_num_tokens,
-                )
-                num_tokens = _ffn_token_count_for_rank(
-                    self.connector,
-                    num_tokens_across_dp,
-                )
-                # DBO stages can have different token counts. Build a fresh
-                # Ascend context for each stage so its MC2 padding mask matches
-                # the hidden states received for that stage.
-                dp_num_tokens_across_dp = _to_dp_level_token_counts(
-                    num_tokens_across_dp,
-                    dp_size=int(self.vllm_config.parallel_config.data_parallel_size),
-                )
-                with ascend_forward_context(
-                    vllm_config=self.vllm_config,
-                    afd_metadata=afd_metadata,
-                    model_instance=self.model,
-                    num_tokens=num_tokens,
-                    num_tokens_across_dp=dp_num_tokens_across_dp,
-                    aclgraph_runtime_mode=aclgraph_runtime_mode,
-                ) as forward_context:
-                    payload = self.connector.recv_attn_output(
-                        ubatch_idx=stage_idx,
-                        layer_idx=layer_idx,
-                        max_num_tokens=self.max_num_tokens,
+                        compute_kwargs = {}
+                        if hash_input_ids is not None:
+                            compute_kwargs["input_ids"] = hash_input_ids
+                        if stream_overlap:
+                            assert recv_event is not None
+                            compute_event = self.ffn_compute_events[
+                                (layer_idx, stage_idx)
+                            ]
+                            with torch.npu.stream(self.ffn_compute_stream):
+                                recv_event.wait(self.ffn_compute_stream)
+                                _record_npu_stream(
+                                    hidden_states,
+                                    self.ffn_compute_stream,
+                                )
+                                if hash_input_ids is not None:
+                                    _record_npu_stream(
+                                        hash_input_ids,
+                                        self.ffn_compute_stream,
+                                    )
+                                rank_ffn_output = self.model.compute_ffn_output(
+                                    hidden_states=hidden_states,
+                                    layer_idx=layer_idx,
+                                    **compute_kwargs,
+                                )
+                                compute_event.record(self.ffn_compute_stream)
+                            send_event = self.ffn_send_events[(layer_idx, stage_idx)]
+                            self.connector.send_ffn_output_streamed(
+                                rank_ffn_output,
+                                context,
+                                ubatch_idx=stage_idx,
+                                send_stream=self.ffn_send_stream,
+                                wait_event=compute_event,
+                                done_event=send_event,
+                            )
+                        else:
+                            rank_ffn_output = self.model.compute_ffn_output(
+                                hidden_states=hidden_states,
+                                layer_idx=layer_idx,
+                                **compute_kwargs,
+                            )
+                            _send_ffn_output(
+                                self.connector,
+                                rank_ffn_output,
+                                context,
+                                stage_idx=stage_idx,
+                            )
+            if stream_overlap:
+                current_stream = torch.npu.current_stream()
+                final_layer_idx = layer_indices[-1]
+                for stage_idx in stage_ids:
+                    self.ffn_send_events[(final_layer_idx, stage_idx)].wait(
+                        current_stream
                     )
-                    context = payload.context
-                    metadata = context.metadata
-                    states = context.states
-                    hidden_states = payload.hidden_states
-                    metadata.layer_idx = layer_idx
-                    metadata.stage_idx = stage_idx
-                    forward_context.dp_metadata = dp_metadata_list.get(stage_idx)
-                    forward_context.additional_kwargs["afd_metadata"] = metadata
-                    assert states, "Context.states must not be None"
-                    _set_moe_layer_index(forward_context, layer_idx)
-
-                    rank_ffn_output = self.model.compute_ffn_output(
-                        hidden_states=hidden_states,
-                        layer_idx=layer_idx,
-                    )
-                    _send_ffn_output(
-                        self.connector,
-                        rank_ffn_output,
-                        context,
-                        stage_idx=stage_idx,
-                    )
+        finally:
+            input_ids_cache.clear()
         return rank_ffn_output
+
+    def _mtp_ffn_forward(
+        self,
+        stage_ids: list[int],
+    ) -> torch.Tensor | None:
+        if self.vllm_config.speculative_config is None:
+            return None
+        if stage_ids != [0]:
+            raise RuntimeError("DSV4 AFD MTP supports only U1")
+        if self.mtp_ffn_model is None:
+            raise RuntimeError("DSV4 AFD MTP FFN model is not loaded")
+
+        stage_idx = 0
+        header = self.connector.recv_mtp_header(stage_idx=stage_idx)
+        payload = self.connector.recv_attn_output(
+            ubatch_idx=stage_idx,
+            layer_idx=0,
+            phase="mtp",
+            speculative_step=header.speculative_step,
+            num_tokens=header.num_tokens,
+        )
+        metadata = payload.context.metadata
+        if metadata.phase != "mtp" or metadata.speculative_step != 0:
+            raise RuntimeError("DSV4 AFD FFN received an invalid MTP phase")
+
+        afd_metadata = AFDForwardContextMetadata(
+            tokens_start_loc=[0],
+            requests_start_loc=[0],
+            stage_idx=stage_idx,
+            connector=self.connector,
+            tokens_lens=[header.num_tokens],
+            num_stages=1,
+            tokens_unpadded_lens=[header.num_tokens],
+        )
+        with ascend_forward_context(
+            vllm_config=self.vllm_config,
+            afd_metadata=afd_metadata,
+            model_instance=self.mtp_ffn_model,
+            num_tokens=header.num_tokens,
+            num_tokens_across_dp=header.num_tokens_across_dp,
+            is_draft_model=True,
+        ) as forward_context:
+            forward_context.additional_kwargs["afd_metadata"] = metadata
+            _set_moe_layer_index(forward_context, 0)
+            output = self.mtp_ffn_model.compute_ffn_output(
+                hidden_states=payload.hidden_states,
+                layer_idx=0,
+            )
+        _send_ffn_output(
+            self.connector,
+            output,
+            payload.context,
+            stage_idx=stage_idx,
+        )
+        return output
 
     def _ffn_forward_connector_driven(
         self,
@@ -337,11 +669,21 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata] | None = None,
         is_warmup: bool = False,
         is_attn_graph_capturing: bool = True,
+        input_ids_by_stage: dict[int, torch.Tensor] | None = None,
+        connector_state_prepared: bool = False,
     ) -> int:
         if not self.use_aclgraph:
             return 0
         if dp_metadata_list is None:
             raise RuntimeError("AFD NPU FFN capture requires dp_metadata_list")
+        if not connector_state_prepared:
+            self._prepare_connector_step(
+                dp_metadata_list,
+                is_graph_capturing=is_attn_graph_capturing,
+                is_warmup=is_warmup,
+            )
+        if input_ids_by_stage is None:
+            input_ids_by_stage = self._receive_input_ids_before_model(dp_metadata_list)
 
         logger.debug(
             "AFD NPU FFN capture_model start; key=%s is_warmup=%s "
@@ -353,17 +695,24 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         start_free_memory = int(torch.npu.mem_get_info()[0])
         set_cudagraph_capturing_enabled(True)
         try:
+            stage_ids = sorted(int(stage_idx) for stage_idx in dp_metadata_list) or [0]
             if is_warmup:
                 self._ffn_forward(
                     dp_metadata_list=dp_metadata_list,
                     is_graph_capturing=False,
+                    input_ids_by_stage=input_ids_by_stage,
+                    update_connector_state=False,
                 )
+                # Warmup remains end-to-end; only the actual target capture
+                # omits the eager draft phase.
+                self._mtp_ffn_forward(stage_ids)
             else:
                 with graph_capture(device=self.device):
                     self._capture_graphs(
                         aclgraph_runtime_mode=CUDAGraphMode.FULL,
                         dp_metadata_list=dp_metadata_list,
                         is_attn_graph_capturing=is_attn_graph_capturing,
+                        input_ids_by_stage=input_ids_by_stage,
                     )
         finally:
             set_cudagraph_capturing_enabled(False)
@@ -383,6 +732,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         aclgraph_runtime_mode: CUDAGraphMode,
         dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
         is_attn_graph_capturing: bool = True,
+        input_ids_by_stage: dict[int, torch.Tensor] | None = None,
     ) -> None:
         assert self.connector.control_plane, (
             "Only DP metadata control plane supports graph capturing."
@@ -398,13 +748,6 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         logger.debug("AFD NPU FFN capturing ACL graph for key=%s", graph_key)
         graph = torch.npu.NPUGraph()
         logger.debug("AFD NPU FFN created NPUGraph for key=%s", graph_key)
-        self.connector.control_plane.update_state_from_dp_metadata(
-            _make_dp_metadata_payload(
-                dp_metadata_list,
-                is_graph_capturing=is_attn_graph_capturing,
-            ),
-        )
-        logger.debug("AFD NPU FFN updated connector state for key=%s", graph_key)
         with torch.npu.graph(graph, pool=self.graph_pool):
             logger.debug(
                 "AFD NPU FFN entered NPU graph context for key=%s",
@@ -415,6 +758,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 aclgraph_runtime_mode=aclgraph_runtime_mode,
                 is_graph_capturing=is_attn_graph_capturing,
                 update_connector_state=False,
+                input_ids_by_stage=input_ids_by_stage,
             )
             logger.debug("AFD NPU FFN left _ffn_forward for key=%s", graph_key)
         self._acl_graphs[graph_key] = {
@@ -462,6 +806,11 @@ def _send_ffn_output(
         context,
         **kwargs,
     )
+
+
+def _record_npu_stream(tensor: torch.Tensor, stream) -> None:
+    if tensor.device.type == "npu":
+        tensor.record_stream(stream)
 
 
 def _ffn_layer_indices(runner: AFDNPUFFNModelRunner) -> range | list[int]:
