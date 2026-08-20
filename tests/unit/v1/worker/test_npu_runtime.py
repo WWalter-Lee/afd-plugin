@@ -3581,13 +3581,6 @@ def test_dsv4_feature_validation_rejects_unvalidated_modes(mutation, message):
     ("mutation", "message"),
     [
         (
-            lambda config: config.additional_config["afd"].update(
-                num_attention_ranks=2,
-                num_ffn_ranks=1,
-            ),
-            "requires equal A/F ranks",
-        ),
-        (
             lambda config: (
                 setattr(config.model_config, "enforce_eager", False),
                 setattr(config.speculative_config, "enforce_eager", False),
@@ -3633,6 +3626,33 @@ def test_dsv4_feature_validation_rejects_unvalidated_mtp_m1_modes(
     mutation(config)
 
     with pytest.raises(RuntimeError, match=message):
+        fail_if_unsupported_npu_afd_features(config)
+
+
+def test_dsv4_feature_validation_accepts_eager_mtp_a2f1():
+    config = _dsv4_config(speculative_config=_mtp_speculative_config())
+    config.additional_config["afd"].update(
+        connector="P2pHcclAFDConnector",
+        num_attention_ranks=2,
+        num_ffn_ranks=1,
+    )
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
+def test_dsv4_feature_validation_rejects_graph_mtp_a2f1():
+    config = _dsv4_config(
+        cudagraph_mode="FULL_DECODE_ONLY",
+        speculative_config=_mtp_speculative_config(enforce_eager=True),
+    )
+    config.model_config.enforce_eager = False
+    config.additional_config["afd"].update(
+        connector="P2pHcclAFDConnector",
+        num_attention_ranks=2,
+        num_ffn_ranks=1,
+    )
+
+    with pytest.raises(RuntimeError, match="graph execution requires equal"):
         fail_if_unsupported_npu_afd_features(config)
 
 

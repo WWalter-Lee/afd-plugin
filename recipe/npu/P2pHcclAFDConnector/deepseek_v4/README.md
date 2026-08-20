@@ -17,11 +17,12 @@ Supported execution boundary:
 - integer-multiple topology contract `A >= F` and `A % F == 0`;
 - eager U1 or eager U2, including the integer-multiple topologies above;
 - `FULL_DECODE_ONLY` Graph U1 or U2 for equal Attention/FFN rank counts;
-- eager U1 or U2 + MTP for A8F8, one MTP layer, and one speculative token;
-- target Graph U1 or U2 + eager draft MTP for the same MTP boundary;
-- Graph with unequal Attention/FFN ranks, full draft Graph, unequal MTP,
-  multiple speculative tokens, PD, sequence parallelism, and Attention-side
-  gate are disabled.
+- eager U1 or U2 + MTP for equal or integer-multiple Attention/FFN rank counts,
+  one MTP layer, and one speculative token;
+- target Graph U1 or U2 + eager draft MTP for equal Attention/FFN rank counts;
+- Graph with unequal Attention/FFN ranks, full draft Graph, multiple
+  speculative tokens, PD, sequence parallelism, and Attention-side gate are
+  disabled.
 
 The public communication API remains synchronous: every eager transfer still
 calls blocking `torch.distributed.send/recv`. Eager U2 additionally uses
@@ -119,8 +120,8 @@ python recipe/npu/P2pHcclAFDConnector/deepseek_v4/run_validation.py \
 ```
 
 The HCCL connector rejects Graph with unequal rank counts, Graph U3, `A < F`,
-and non-integer A/F ratios. MTP additionally rejects full draft Graph, unequal
-rank counts, and more than one speculative token. The shared validator records
+and non-integer A/F ratios. MTP supports eager integer-multiple topologies and
+rejects full draft Graph and more than one speculative token. The shared validator records
 the selected connector in `runtime.json` and preserves the same golden,
 lifecycle, fatal-log, and NPU cleanup gates used by the CAMP2P baseline.
 

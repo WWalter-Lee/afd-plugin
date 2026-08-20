@@ -303,6 +303,36 @@ def test_p2p_hccl_mtp_header_uses_graph_send_while_compiling(monkeypatch):
         )
 
 
+def test_p2p_hccl_mtp_projects_attention_counts_to_unequal_ffn_world(
+    monkeypatch,
+):
+    connector = _connector(
+        role="attention",
+        role_rank=3,
+        attention=4,
+        ffn=2,
+        mtp=True,
+    )
+    sent = []
+    monkeypatch.setattr(
+        connector,
+        "_send_tensor",
+        lambda tensor, *, dst, group: sent.append((tensor.clone(), dst, group)),
+    )
+
+    connector.send_mtp_header(
+        num_tokens=5,
+        speculative_step=0,
+        num_tokens_across_dp=torch.tensor([2, 3, 4, 5], dtype=torch.int32),
+        stage_idx=0,
+    )
+
+    assert len(sent) == 1
+    header, dst, group = sent[0]
+    assert (dst, group) == (1, connector.ids_pg_list[0])
+    assert header.tolist() == [0x4D545031, 0, 5, 2, 5, 9]
+
+
 def test_p2p_hccl_mtp_rejects_pre_hc_three_dimensional_hidden():
     connector = _connector(role="attention", mtp=True)
 
@@ -353,6 +383,154 @@ def test_p2p_hccl_ffn_receives_mtp_header_and_separate_hidden_buffer(monkeypatch
     assert payload.input_ids is None
     assert payload.hidden_states.shape == (3, 4)
     assert torch.equal(payload.hidden_states, torch.full_like(payload.hidden_states, 7))
+
+
+def test_p2p_hccl_ffn_aggregates_unequal_mtp_headers_and_splits_output(
+    monkeypatch,
+):
+    connector = _connector(
+        role="ffn",
+        role_rank=1,
+        attention=4,
+        ffn=2,
+        max_num_batched_tokens=12,
+        mtp=True,
+    )
+    connector.mtp_hidden_recv_buffers[0] = torch.empty((9, 4), dtype=torch.bfloat16)
+    headers = {
+        4: torch.tensor([0x4D545031, 0, 4, 2, 5, 9], dtype=torch.int32),
+        5: torch.tensor([0x4D545031, 0, 5, 2, 5, 9], dtype=torch.int32),
+    }
+    events = []
+
+    def recv(tensor, *, src, group):
+        events.append((src, group, tuple(tensor.shape)))
+        if tensor.dtype == torch.int32:
+            tensor.copy_(headers[src])
+        else:
+            tensor.fill_(src)
+
+    sent = []
+    monkeypatch.setattr(hccl_module.dist, "recv", recv)
+    monkeypatch.setattr(
+        hccl_module.dist,
+        "send",
+        lambda tensor, *, dst, group: sent.append((tensor.clone(), dst, group)),
+    )
+
+    header = connector.recv_mtp_header(stage_idx=0)
+    payload = connector.recv_attn_output(
+        ubatch_idx=0,
+        layer_idx=0,
+        phase="mtp",
+        speculative_step=header.speculative_step,
+        num_tokens=header.num_tokens,
+    )
+    connector.send_ffn_output(payload.hidden_states + 1, payload.context)
+
+    assert header.num_tokens == 9
+    assert header.speculative_step == 0
+    assert header.num_tokens_across_dp.tolist() == [5, 9]
+    assert events == [
+        (4, connector.ids_pg_list[0], (6,)),
+        (5, connector.ids_pg_list[0], (6,)),
+        (4, connector.data_pg_list[0], (4, 4)),
+        (5, connector.data_pg_list[0], (5, 4)),
+    ]
+    assert payload.context.metadata.seq_lens == [4, 5]
+    assert payload.hidden_states[:, 0].tolist() == [4] * 4 + [5] * 5
+    assert [(dst, tensor.shape[0]) for tensor, dst, _group in sent] == [
+        (4, 4),
+        (5, 5),
+    ]
+    assert connector.mtp_stage_layouts == {}
+
+
+def test_p2p_hccl_ffn_rejects_inconsistent_unequal_mtp_headers(monkeypatch):
+    connector = _connector(
+        role="ffn",
+        role_rank=1,
+        attention=4,
+        ffn=2,
+        mtp=True,
+    )
+    headers = iter(
+        (
+            torch.tensor([0x4D545031, 0, 4, 2, 5, 9], dtype=torch.int32),
+            torch.tensor([0x4D545031, 0, 5, 2, 5, 8], dtype=torch.int32),
+        )
+    )
+    monkeypatch.setattr(
+        hccl_module.dist,
+        "recv",
+        lambda tensor, **_kwargs: tensor.copy_(next(headers)),
+    )
+
+    with pytest.raises(RuntimeError, match="peer headers disagree"):
+        connector.recv_mtp_header(stage_idx=0)
+
+    assert connector.mtp_stage_layouts == {}
+
+
+def test_p2p_hccl_ffn_rejects_unequal_mtp_subgroup_total_mismatch(monkeypatch):
+    connector = _connector(
+        role="ffn",
+        role_rank=1,
+        attention=4,
+        ffn=2,
+        mtp=True,
+    )
+    headers = iter(
+        (
+            torch.tensor([0x4D545031, 0, 4, 2, 5, 8], dtype=torch.int32),
+            torch.tensor([0x4D545031, 0, 5, 2, 5, 8], dtype=torch.int32),
+        )
+    )
+    monkeypatch.setattr(
+        hccl_module.dist,
+        "recv",
+        lambda tensor, **_kwargs: tensor.copy_(next(headers)),
+    )
+
+    with pytest.raises(RuntimeError, match="does not match the FFN count vector"):
+        connector.recv_mtp_header(stage_idx=0)
+
+    assert connector.mtp_stage_layouts == {}
+
+
+def test_p2p_hccl_mtp_header_layout_must_be_consumed_once(monkeypatch):
+    connector = _connector(role="ffn", mtp=True)
+    connector.mtp_hidden_recv_buffers[0] = torch.empty((3, 4), dtype=torch.bfloat16)
+
+    def recv(tensor, **_kwargs):
+        if tensor.dtype == torch.int32:
+            tensor.copy_(torch.tensor([0x4D545031, 0, 3, 1, 3], dtype=torch.int32))
+        else:
+            tensor.fill_(1)
+
+    monkeypatch.setattr(
+        hccl_module.dist,
+        "recv",
+        recv,
+    )
+
+    connector.recv_mtp_header(stage_idx=0)
+    with pytest.raises(RuntimeError, match="unconsumed header layout"):
+        connector.recv_mtp_header(stage_idx=0)
+
+    connector.recv_attn_output(
+        ubatch_idx=0,
+        layer_idx=0,
+        phase="mtp",
+        num_tokens=3,
+    )
+    with pytest.raises(RuntimeError, match="requires a preceding header"):
+        connector.recv_attn_output(
+            ubatch_idx=0,
+            layer_idx=0,
+            phase="mtp",
+            num_tokens=3,
+        )
 
 
 def test_p2p_hccl_pretransferred_ids_send_only_hidden(monkeypatch):
@@ -1333,6 +1511,7 @@ def test_p2p_hccl_close_destroys_all_groups(monkeypatch):
     assert connector.input_ids_buffers == []
     assert connector.hidden_recv_buffers == {}
     assert connector.stage_layouts == {}
+    assert connector.mtp_stage_layouts == {}
     assert connector.is_initialized is False
 
 

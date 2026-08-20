@@ -67,10 +67,6 @@ case "$ENABLE_MTP" in
       echo "DeepSeek-V4 MTP requires P2pHcclAFDConnector" >&2
       exit 2
     fi
-    if [[ "$ATTENTION_RANKS" != "$FFN_RANKS" ]]; then
-      echo "DeepSeek-V4 MTP requires equal Attention/FFN ranks" >&2
-      exit 2
-    fi
     if [[ "$MTP_NUM_SPECULATIVE_TOKENS" != "1" ]]; then
       echo "DeepSeek-V4 MTP supports exactly one speculative token" >&2
       exit 2
@@ -108,6 +104,10 @@ case "$EXECUTION_MODE" in
     EXECUTION_ARGS=(--enforce-eager)
     ;;
   full-decode-only)
+    if [[ "$AFD_CONNECTOR" == "P2pHcclAFDConnector" && "$ATTENTION_RANKS" != "$FFN_RANKS" ]]; then
+      echo "DeepSeek-V4 P2pHcclAFDConnector graph execution requires equal Attention/FFN ranks" >&2
+      exit 2
+    fi
     read -r -a CAPTURE_SIZE_ARGS <<<"$CUDAGRAPH_CAPTURE_SIZES"
     EXECUTION_ARGS=(
       --max-cudagraph-capture-size "$MAX_CUDAGRAPH_CAPTURE_SIZE"

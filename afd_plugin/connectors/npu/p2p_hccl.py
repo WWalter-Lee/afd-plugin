@@ -18,7 +18,9 @@ transfers with connector-owned NPU streams and events. DeepSeek-V4 drives its
 two stages from one layer-major host loop, avoiding cross-thread DBO handoff
 without changing the HCCL message protocol or introducing ``isend/irecv``.
 Graph U2 captures the two stages into one FULL graph and deliberately bypasses
-the eager-only communication streams. U1 and MTP retain their existing paths.
+the eager-only communication streams. MTP remains a merged stage-0 exchange;
+for ``A = k * F`` each FFN rank aggregates its ``k`` Attention peers before
+running the draft MoE and splits the result back to the same peers.
 """
 
 from __future__ import annotations
@@ -235,6 +237,7 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         self.mtp_hidden_recv_buffers: dict[int, torch.Tensor] = {}
         self.dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata] = {}
         self.stage_layouts: dict[int, HCCLP2PStageLayout] = {}
+        self.mtp_stage_layouts: dict[int, HCCLP2PStageLayout] = {}
         self.is_graph_capturing = False
         self.is_warmup = False
         self.a2f_send_stream = None
@@ -338,6 +341,7 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         self.mtp_hidden_recv_buffers = {}
         self.dp_metadata_list = {}
         self.stage_layouts = {}
+        self.mtp_stage_layouts = {}
         self.a2f_send_stream = None
         self.f2a_recv_stream = None
         self.attention_pipeline_events = {}
@@ -655,24 +659,25 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         stream = kwargs.get("_stream")
         if phase == "mtp":
             explicit_num_tokens = int(kwargs.get("num_tokens", 0))
+            layout = self.mtp_stage_layouts.pop(ubatch_idx, None)
+            if layout is None:
+                raise RuntimeError(
+                    "DSV4 MTP hidden receive requires a preceding header: "
+                    f"stage={ubatch_idx}"
+                )
+            if layout.num_tokens != explicit_num_tokens:
+                raise ValueError(
+                    "DSV4 MTP hidden token count does not match the aggregated "
+                    f"header layout: {explicit_num_tokens} != {layout.num_tokens}"
+                )
             metadata_probe = AFDTransferMetadata.create_ffn_metadata(
                 layer_idx=layer_idx,
                 stage_idx=ubatch_idx,
-                seq_lens=[explicit_num_tokens],
+                seq_lens=layout.seq_lens,
                 phase=phase,
                 speculative_step=speculative_step,
             )
             self._validate_mtp_scope(metadata_probe)
-            peer_ranks = self._attention_peer_world_ranks()
-            layout = HCCLP2PStageLayout(
-                peer_ranks=peer_ranks,
-                seq_lens=(explicit_num_tokens,),
-                peer_slices=_make_peer_slices(
-                    peer_ranks,
-                    (explicit_num_tokens,),
-                ),
-                num_tokens=explicit_num_tokens,
-            )
         else:
             layout = self._stage_layout(
                 ubatch_idx,
@@ -868,13 +873,14 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         num_tokens_across_dp: torch.Tensor,
         stage_idx: int,
     ) -> None:
+        counts = self._mtp_ffn_token_counts(num_tokens_across_dp)
         self._validate_mtp_header_values(
             num_tokens=num_tokens,
             speculative_step=speculative_step,
-            num_tokens_across_dp=num_tokens_across_dp,
+            num_tokens_across_dp=counts,
         )
         buffer, group = self._mtp_header_buffer_and_group(stage_idx)
-        counts = num_tokens_across_dp.reshape(-1).to(
+        counts = counts.reshape(-1).to(
             device=buffer.device,
             dtype=torch.int32,
         )
@@ -893,26 +899,62 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         if self.afd_config.role != "ffn":
             raise RuntimeError("only the FFN role receives MTP headers")
         self._validate_mtp_topology()
-        buffer, group = self._mtp_header_buffer_and_group(stage_idx)
-        source_rank = self._attention_peer_world_ranks()[0]
-        dist.recv(buffer, src=source_rank, group=group)
-        values = [int(value) for value in buffer.cpu().tolist()]
-        if values[0] != _MTP_HEADER_MAGIC:
-            raise RuntimeError(f"invalid DSV4 MTP HCCL header magic: {values[0]}")
-        if values[3] != self.ffn_size:
+        if stage_idx in self.mtp_stage_layouts:
             raise RuntimeError(
-                "DSV4 MTP HCCL header DP size does not match FFN world: "
-                f"{values[3]} != {self.ffn_size}"
+                f"DSV4 MTP stage has an unconsumed header layout: stage={stage_idx}"
             )
-        counts = torch.tensor(values[_MTP_HEADER_PREFIX_SIZE:], dtype=torch.int32)
-        self._validate_mtp_header_values(
-            num_tokens=values[2],
-            speculative_step=values[1],
-            num_tokens_across_dp=counts,
+        buffer, group = self._mtp_header_buffer_and_group(stage_idx)
+        peer_ranks = self._attention_peer_world_ranks()
+        seq_lens: list[int] = []
+        speculative_step: int | None = None
+        expected_counts: tuple[int, ...] | None = None
+        for source_rank in peer_ranks:
+            dist.recv(buffer, src=source_rank, group=group)
+            values = [int(value) for value in buffer.cpu().tolist()]
+            if values[0] != _MTP_HEADER_MAGIC:
+                raise RuntimeError(f"invalid DSV4 MTP HCCL header magic: {values[0]}")
+            if values[3] != self.ffn_size:
+                raise RuntimeError(
+                    "DSV4 MTP HCCL header DP size does not match FFN world: "
+                    f"{values[3]} != {self.ffn_size}"
+                )
+            counts_tuple = tuple(values[_MTP_HEADER_PREFIX_SIZE:])
+            counts = torch.tensor(counts_tuple, dtype=torch.int32)
+            self._validate_mtp_header_values(
+                num_tokens=values[2],
+                speculative_step=values[1],
+                num_tokens_across_dp=counts,
+            )
+            if speculative_step is None:
+                speculative_step = values[1]
+                expected_counts = counts_tuple
+            elif values[1] != speculative_step or counts_tuple != expected_counts:
+                raise RuntimeError(
+                    "DSV4 MTP peer headers disagree on speculative step or "
+                    "FFN token counts"
+                )
+            seq_lens.append(values[2])
+
+        assert speculative_step is not None and expected_counts is not None
+        num_tokens = sum(seq_lens)
+        self._validate_receive_capacity(num_tokens)
+        expected_local_tokens = expected_counts[self.mapping.subgroup_index]
+        if num_tokens != expected_local_tokens:
+            raise RuntimeError(
+                "DSV4 MTP peer token total does not match the FFN count vector: "
+                f"{num_tokens} != {expected_local_tokens}"
+            )
+        layout = HCCLP2PStageLayout(
+            peer_ranks=peer_ranks,
+            seq_lens=tuple(seq_lens),
+            peer_slices=_make_peer_slices(peer_ranks, seq_lens),
+            num_tokens=num_tokens,
         )
+        self.mtp_stage_layouts[stage_idx] = layout
+        counts = torch.tensor(expected_counts, dtype=torch.int32)
         return HCCLMTPHeader(
-            num_tokens=values[2],
-            speculative_step=values[1],
+            num_tokens=num_tokens,
+            speculative_step=speculative_step,
             num_tokens_across_dp=counts,
         )
 
@@ -1156,10 +1198,28 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         self._validate_receive_capacity(metadata.total_tokens)
 
     def _validate_mtp_topology(self) -> None:
-        if self.attn_size != self.ffn_size or self.ratio != 1:
-            raise RuntimeError("DSV4 HCCL P2P MTP requires equal A/F ranks")
         if len(self.data_pg_list) not in (1, 2):
             raise RuntimeError("DSV4 HCCL P2P MTP supports target decoder U1 or U2")
+
+    def _mtp_ffn_token_counts(
+        self,
+        num_tokens_across_dp: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project Attention DP token counts onto the FFN rank topology."""
+        flat_counts = num_tokens_across_dp.reshape(-1)
+        count_size = int(flat_counts.numel())
+        if count_size != self.attn_size:
+            raise ValueError(
+                "DSV4 MTP token-count vector must match Attention world size: "
+                f"{count_size} != {self.attn_size}"
+            )
+        if not torch.compiler.is_compiling():
+            counts = [int(value) for value in flat_counts.tolist()]
+            if any(value < 0 for value in counts):
+                raise ValueError("DSV4 MTP token counts cannot be negative")
+        if self.ratio == 1:
+            return flat_counts
+        return flat_counts.reshape(self.ffn_size, self.ratio).sum(dim=1)
 
     def _validate_mtp_header_values(
         self,

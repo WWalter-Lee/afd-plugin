@@ -177,8 +177,6 @@ def _fail_if_unsupported_deepseek_v4_features(
     if speculative_config is not None:
         if afd_config.connector != "P2pHcclAFDConnector":
             raise RuntimeError("DeepSeek-V4 AFD MTP supports only P2pHcclAFDConnector")
-        if afd_config.num_attention_ranks != afd_config.num_ffn_ranks:
-            raise RuntimeError("DeepSeek-V4 AFD MTP requires equal A/F ranks")
         if getattr(speculative_config, "method", None) != "mtp":
             raise RuntimeError("DeepSeek-V4 AFD supports only MTP speculative method")
         if int(getattr(speculative_config, "num_speculative_tokens", 0)) != 1:

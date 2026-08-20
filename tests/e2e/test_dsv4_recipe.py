@@ -135,7 +135,8 @@ def test_dsv4_role_scripts_offer_u1_graph_and_eager_u2():
         assert '"${MTP_ARGS[@]}"' in script
         assert "MTP requires P2pHcclAFDConnector" in script
         assert "MTP target Graph/U2 is not validated" not in script
-        assert "MTP requires equal Attention/FFN ranks" in script
+        assert "MTP requires equal Attention/FFN ranks" not in script
+        assert "graph execution requires equal Attention/FFN ranks" in script
         assert "MTP supports exactly one speculative token" in script
         assert "graph U2 requires P2pHcclAFDConnector" in script
         assert "U2 currently supports only EXECUTION_MODE=eager" not in script
@@ -336,6 +337,14 @@ def test_dsv4_hccl_mtp_m4_topology_gate_and_environment(monkeypatch):
         u_batches=2,
         enable_mtp=True,
         mtp_num_speculative_tokens=1,
+        topology={"attention_ranks": 8, "ffn_ranks": 4},
+    )
+    runner._validate_execution_topology(
+        connector="P2pHcclAFDConnector",
+        execution_mode="eager",
+        u_batches=2,
+        enable_mtp=True,
+        mtp_num_speculative_tokens=1,
         topology=topology,
     )
     runner._validate_execution_topology(
@@ -363,10 +372,6 @@ def test_dsv4_hccl_mtp_m4_topology_gate_and_environment(monkeypatch):
 
     invalid_cases = [
         ({"connector": "CAMP2pAFDConnector"}, "P2pHcclAFDConnector"),
-        (
-            {"topology": {"attention_ranks": 8, "ffn_ranks": 4}},
-            "equal Attention/FFN",
-        ),
         ({"mtp_num_speculative_tokens": 2}, "exactly one speculative token"),
     ]
     defaults = {

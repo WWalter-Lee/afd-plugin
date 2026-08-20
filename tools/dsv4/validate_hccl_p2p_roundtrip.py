@@ -54,6 +54,22 @@ def _hidden_value(attention_rank: int, *, step_idx: int, stage_idx: int) -> int:
     return 100 * step_idx + 10 * stage_idx + attention_rank
 
 
+def _mtp_token_counts(attention_size: int, *, step_idx: int) -> list[int]:
+    return [
+        1 + ((2 * step_idx + attention_rank) % 3)
+        for attention_rank in range(attention_size)
+    ]
+
+
+def _mtp_hidden_value(attention_rank: int, *, step_idx: int) -> int:
+    return 40 + 20 * step_idx + attention_rank
+
+
+def _ffn_token_counts(counts: list[int], *, ffn_size: int) -> list[int]:
+    ratio = len(counts) // ffn_size
+    return [sum(counts[rank * ratio : (rank + 1) * ratio]) for rank in range(ffn_size)]
+
+
 def _worker(
     role: str,
     role_rank: int,
@@ -63,6 +79,7 @@ def _worker(
     port: int,
     stages: int,
     steps: int,
+    enable_mtp: bool,
     result_path: Path,
 ) -> None:
     connector = None
@@ -110,6 +127,7 @@ def _worker(
                     vocab_size=128,
                 ),
             ),
+            speculative_config=(SimpleNamespace(method="mtp") if enable_mtp else None),
         )
         afd_config = AFDConfig(
             connector="P2pHcclAFDConnector",
@@ -288,6 +306,125 @@ def _worker(
                     },
                 )
 
+            if not enable_mtp:
+                continue
+
+            mtp_counts = _mtp_token_counts(attention_size, step_idx=step_idx)
+            expected_ffn_counts = _ffn_token_counts(
+                mtp_counts,
+                ffn_size=ffn_size,
+            )
+            if role == "attention":
+                num_tokens = mtp_counts[role_rank]
+                hidden = torch.full(
+                    (num_tokens, 16),
+                    _mtp_hidden_value(role_rank, step_idx=step_idx),
+                    dtype=torch.bfloat16,
+                    device="npu:0",
+                )
+                context = AFDTransferContext(
+                    metadata=AFDTransferMetadata.create_attention_metadata(
+                        layer_idx=0,
+                        stage_idx=0,
+                        seq_len=num_tokens,
+                        phase="mtp",
+                        speculative_step=0,
+                    ),
+                )
+                connector.send_attn_output(
+                    hidden,
+                    context,
+                    num_tokens_across_dp=torch.tensor(
+                        mtp_counts,
+                        dtype=torch.int32,
+                    ),
+                )
+                returned = connector.recv_ffn_output(
+                    ref_tensor=torch.empty_like(hidden),
+                    ubatch_idx=0,
+                    phase="mtp",
+                )
+                if not torch.equal(returned.cpu(), (hidden + 2).cpu()):
+                    raise AssertionError(
+                        "MTP round-trip mismatch for "
+                        f"attention={role_rank} step={step_idx}"
+                    )
+                checks.append(
+                    {
+                        "phase": "mtp",
+                        "step": step_idx,
+                        "tokens": num_tokens,
+                        "ffn_tokens": expected_ffn_counts,
+                        "roundtrip": True,
+                    }
+                )
+                continue
+
+            first_attention_rank = role_rank * connector.ratio
+            peer_attention_ranks = list(
+                range(
+                    first_attention_rank,
+                    first_attention_rank + connector.ratio,
+                )
+            )
+            peer_counts = [mtp_counts[index] for index in peer_attention_ranks]
+            header = connector.recv_mtp_header(stage_idx=0)
+            if header.num_tokens != sum(peer_counts):
+                raise AssertionError(
+                    f"MTP aggregate token mismatch for ffn={role_rank}: "
+                    f"{header.num_tokens} != {sum(peer_counts)}"
+                )
+            if header.num_tokens_across_dp.tolist() != expected_ffn_counts:
+                raise AssertionError(
+                    f"MTP FFN counts mismatch: "
+                    f"{header.num_tokens_across_dp.tolist()} != "
+                    f"{expected_ffn_counts}"
+                )
+            received = connector.recv_attn_output(
+                ubatch_idx=0,
+                layer_idx=0,
+                phase="mtp",
+                speculative_step=header.speculative_step,
+                num_tokens=header.num_tokens,
+            )
+            expected_hidden_values: list[int] = []
+            for attention_rank, num_tokens in zip(
+                peer_attention_ranks,
+                peer_counts,
+                strict=True,
+            ):
+                expected_hidden_values.extend(
+                    [_mtp_hidden_value(attention_rank, step_idx=step_idx)] * num_tokens
+                )
+            actual_hidden_values = received.hidden_states[:, 0].cpu().tolist()
+            if actual_hidden_values != expected_hidden_values:
+                raise AssertionError(
+                    f"MTP hidden aggregation mismatch for ffn={role_rank} "
+                    f"step={step_idx}"
+                )
+            if received.context.metadata.seq_lens != peer_counts:
+                raise AssertionError(
+                    f"MTP peer lengths mismatch: "
+                    f"{received.context.metadata.seq_lens} != {peer_counts}"
+                )
+            connector.send_ffn_output(
+                received.hidden_states + 2,
+                received.context,
+                ubatch_idx=0,
+            )
+            checks.append(
+                {
+                    "phase": "mtp",
+                    "step": step_idx,
+                    "peer_tokens": peer_counts,
+                    "aggregate_tokens": header.num_tokens,
+                    "ffn_tokens": expected_ffn_counts,
+                    "header_fan_in": True,
+                    "hidden_fan_in": True,
+                    "output_split": True,
+                }
+            )
+
         torch.npu.synchronize()
         result.update(passed=True, checks=checks)
     except BaseException:
@@ -305,6 +442,8 @@ def _worker(
         result_path.write_text(
             json.dumps(result, indent=2, sort_keys=True) + "\n",
         )
+    if not result["passed"]:
+        raise SystemExit(1)
 
 
 def _parse_devices(raw: str) -> list[int]:
@@ -326,6 +465,7 @@ def main() -> None:
     parser.add_argument("--ffn-devices", type=_parse_devices, default=[8])
     parser.add_argument("--stages", type=int, choices=(1, 2), default=2)
     parser.add_argument("--steps", type=int, default=2)
+    parser.add_argument("--enable-mtp", action="store_true")
     parser.add_argument("--timeout", type=float, default=300)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -368,6 +508,7 @@ def main() -> None:
                 args.port,
                 args.stages,
                 args.steps,
+                args.enable_mtp,
                 result_paths[(role, role_rank)],
             ),
             name=f"hccl-p2p-{role}-{role_rank}",
@@ -378,8 +519,14 @@ def main() -> None:
         worker.start()
 
     deadline = time.monotonic() + args.timeout
-    for worker in workers:
-        worker.join(timeout=max(0.0, deadline - time.monotonic()))
+    while time.monotonic() < deadline:
+        if all(worker.exitcode is not None for worker in workers):
+            break
+        if any(
+            worker.exitcode is not None and worker.exitcode != 0 for worker in workers
+        ):
+            break
+        time.sleep(0.2)
     for worker in workers:
         if worker.is_alive():
             worker.terminate()
@@ -420,6 +567,7 @@ def main() -> None:
         "port": args.port,
         "stages": args.stages,
         "steps": args.steps,
+        "enable_mtp": args.enable_mtp,
         "results": results,
         "exit_codes": exit_codes,
     }
