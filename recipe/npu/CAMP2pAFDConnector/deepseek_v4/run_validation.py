@@ -528,6 +528,7 @@ def _resolve_topology(
     ffn_devices: list[int],
     attention_max_num_batched_tokens: int,
     ffn_max_num_batched_tokens: int | None,
+    tensor_parallel_size: int = 1,
 ) -> dict[str, Any]:
     attention_ranks = len(attention_devices)
     ffn_ranks = len(ffn_devices)
@@ -545,6 +546,20 @@ def _resolve_topology(
         )
     if attention_max_num_batched_tokens <= 0:
         raise ValueError("Attention max_num_batched_tokens must be positive")
+    if tensor_parallel_size not in (1, 2):
+        raise ValueError("DeepSeek-V4 AFD supports tensor parallel size 1 or 2")
+    if (
+        attention_ranks % tensor_parallel_size != 0
+        or ffn_ranks % tensor_parallel_size != 0
+    ):
+        raise ValueError("Attention and FFN ranks must be divisible by TP size")
+    if tensor_parallel_size == 2:
+        if connector != "P2pHcclAFDConnector":
+            raise ValueError("DeepSeek-V4 AFD TP2 requires P2pHcclAFDConnector")
+        if attention_ranks != ffn_ranks:
+            raise ValueError(
+                "DeepSeek-V4 AFD TP2 requires equal Attention and FFN ranks"
+            )
 
     ratio = attention_ranks // ffn_ranks
     required_ffn_tokens = attention_max_num_batched_tokens * ratio
@@ -562,6 +577,11 @@ def _resolve_topology(
     return {
         "attention_ranks": attention_ranks,
         "ffn_ranks": ffn_ranks,
+        "tensor_parallel_size": tensor_parallel_size,
+        "attention_data_parallel_size": (
+            attention_ranks // tensor_parallel_size
+        ),
+        "ffn_data_parallel_size": ffn_ranks // tensor_parallel_size,
         "ratio": ratio,
         "attention_devices": attention_devices,
         "ffn_devices": ffn_devices,
@@ -576,6 +596,7 @@ def _set_topology_environment(topology: dict[str, Any]) -> None:
         {
             "ATTENTION_RANKS": str(topology["attention_ranks"]),
             "FFN_RANKS": str(topology["ffn_ranks"]),
+            "TENSOR_PARALLEL_SIZE": str(topology["tensor_parallel_size"]),
             "ATTENTION_DEVICES": ",".join(
                 str(device) for device in topology["attention_devices"]
             ),
@@ -615,6 +636,15 @@ def _validate_execution_topology(
     mtp_draft_execution: str = "eager",
     topology: dict[str, Any],
 ) -> None:
+    tensor_parallel_size = int(topology.get("tensor_parallel_size", 1))
+    if tensor_parallel_size == 2 and connector != "P2pHcclAFDConnector":
+        raise ValueError("DeepSeek-V4 AFD TP2 requires P2pHcclAFDConnector")
+    if tensor_parallel_size == 2 and (
+        int(topology["attention_ranks"]) != int(topology["ffn_ranks"])
+    ):
+        raise ValueError(
+            "DeepSeek-V4 AFD TP2 requires equal Attention and FFN ranks"
+        )
     if (
         u_batches == 2
         and execution_mode == "full-decode-only"
@@ -683,6 +713,7 @@ def main() -> None:
         default=1024,
     )
     parser.add_argument("--ffn-max-num-batched-tokens", type=int)
+    parser.add_argument("--tensor-parallel-size", type=int, choices=(1, 2), default=1)
     parser.add_argument(
         "--profile",
         action="store_true",
@@ -716,6 +747,7 @@ def main() -> None:
             ffn_devices=args.ffn_devices,
             attention_max_num_batched_tokens=(args.attention_max_num_batched_tokens),
             ffn_max_num_batched_tokens=args.ffn_max_num_batched_tokens,
+            tensor_parallel_size=args.tensor_parallel_size,
         )
         _validate_execution_topology(
             connector=args.connector,
@@ -853,7 +885,7 @@ def main() -> None:
                     args.u_batches,
                     enable_mtp=args.enable_mtp,
                     batch_sizes=args.batch_sizes,
-                    data_parallel_size=topology["attention_ranks"],
+                    data_parallel_size=topology["attention_data_parallel_size"],
                 )
                 profile_passed = True
                 if profile_dir is not None:

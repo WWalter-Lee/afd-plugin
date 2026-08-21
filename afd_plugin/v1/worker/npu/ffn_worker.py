@@ -152,6 +152,11 @@ class AFDNPUFFNWorker(NPUWorker):
                 logger.info("AFD NPU FFN received Attention shutdown payload")
                 event.set()
                 return
+            # Preserve the complete Attention-side control contract. Rebuilding
+            # a payload from only DP metadata drops TP and phase fields.
+            self.model_runner.connector.control_plane.update_state_from_dp_metadata(
+                payload,
+            )
             dp_metadata_list = payload.dp_metadata_list
             is_attn_graph_capturing = payload.is_graph_capturing
             is_warmup = payload.is_warmup
@@ -160,6 +165,7 @@ class AFDNPUFFNWorker(NPUWorker):
                 dp_metadata_list=dp_metadata_list,
                 is_graph_capturing=is_attn_graph_capturing,
                 is_warmup=is_warmup,
+                connector_state_prepared=True,
             )
             torch.npu.synchronize()
 

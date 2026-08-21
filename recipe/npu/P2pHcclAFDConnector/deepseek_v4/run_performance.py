@@ -390,6 +390,7 @@ class _NPUMonitor:
 
 
 def _runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
+    tensor_parallel_size = int(getattr(args, "tensor_parallel_size", 1))
     manifest = SHARED._runtime_manifest(
         connector="P2pHcclAFDConnector",
         execution_mode=args.execution_mode,
@@ -400,7 +401,10 @@ def _runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
         enable_mtp=args.enable_mtp,
         mtp_num_speculative_tokens=args.mtp_num_speculative_tokens,
         mtp_draft_execution=getattr(args, "mtp_draft_execution", "eager"),
-        topology=_a8f8_topology(args.max_num_batched_tokens),
+        topology=_a8f8_topology(
+            args.max_num_batched_tokens,
+            tensor_parallel_size,
+        ),
     )
     manifest.update(
         {
@@ -413,7 +417,9 @@ def _runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
                 if args.enable_mtp
                 else "A3-P8"
             ),
-            "topology_label": "A8F8",
+            "topology_label": (
+                "A8F8-DP4TP2" if tensor_parallel_size == 2 else "A8F8"
+            ),
             "npu_count": TOTAL_NPUS,
             "mtp_draft_execution": (
                 getattr(args, "mtp_draft_execution", "eager")
@@ -435,6 +441,7 @@ def _runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
                 "attention_hccl_if_base_port": args.attention_hccl_base_port,
                 "ffn_hccl_if_base_port": args.ffn_hccl_base_port,
                 "async_scheduling": args.async_scheduling,
+                "tensor_parallel_size": tensor_parallel_size,
             },
             "workload": {
                 "input_len": args.input_len,
@@ -469,6 +476,7 @@ def _runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _set_service_environment(args: argparse.Namespace) -> None:
+    tensor_parallel_size = int(getattr(args, "tensor_parallel_size", 1))
     os.environ.update(
         {
             "MAX_MODEL_LEN": str(args.max_model_len),
@@ -479,6 +487,7 @@ def _set_service_environment(args: argparse.Namespace) -> None:
             "FFN_HCCL_IF_BASE_PORT": str(args.ffn_hccl_base_port),
             "TORCH_PROFILER_WITH_STACK": "0",
             "AFD_ASYNC_SCHEDULING": args.async_scheduling,
+            "TENSOR_PARALLEL_SIZE": str(tensor_parallel_size),
         }
     )
     SHARED._set_mtp_environment(
@@ -503,10 +512,19 @@ def _set_service_environment(args: argparse.Namespace) -> None:
         )
 
 
-def _a8f8_topology(max_num_batched_tokens: int) -> dict[str, Any]:
+def _a8f8_topology(
+    max_num_batched_tokens: int,
+    tensor_parallel_size: int = 1,
+) -> dict[str, Any]:
+    if tensor_parallel_size not in (1, 2):
+        raise ValueError("A8F8 supports tensor_parallel_size=1 or 2")
+    data_parallel_size = 8 // tensor_parallel_size
     return {
         "attention_ranks": 8,
         "ffn_ranks": 8,
+        "tensor_parallel_size": tensor_parallel_size,
+        "attention_data_parallel_size": data_parallel_size,
+        "ffn_data_parallel_size": data_parallel_size,
         "ratio": 1,
         "attention_devices": list(range(8)),
         "ffn_devices": list(range(8, 16)),
@@ -517,6 +535,7 @@ def _a8f8_topology(max_num_batched_tokens: int) -> dict[str, Any]:
 
 
 def _validate_execution_args(args: argparse.Namespace) -> None:
+    tensor_parallel_size = int(getattr(args, "tensor_parallel_size", 1))
     SHARED._validate_execution_topology(
         connector="P2pHcclAFDConnector",
         execution_mode=args.execution_mode,
@@ -524,7 +543,10 @@ def _validate_execution_args(args: argparse.Namespace) -> None:
         enable_mtp=args.enable_mtp,
         mtp_num_speculative_tokens=args.mtp_num_speculative_tokens,
         mtp_draft_execution=getattr(args, "mtp_draft_execution", "eager"),
-        topology=_a8f8_topology(args.max_num_batched_tokens),
+        topology=_a8f8_topology(
+            args.max_num_batched_tokens,
+            tensor_parallel_size,
+        ),
     )
 
 
@@ -549,6 +571,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "execution_mode": args.execution_mode,
         "u_batches": args.u_batches,
+        "tensor_parallel_size": int(getattr(args, "tensor_parallel_size", 1)),
         "enable_mtp": args.enable_mtp,
         "mtp_num_speculative_tokens": args.mtp_num_speculative_tokens,
         "profile": args.profile,
@@ -752,6 +775,13 @@ def _parse_args() -> argparse.Namespace:
         default="eager",
     )
     parser.add_argument("--u-batches", type=int, choices=(1, 2), required=True)
+    parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="Use A8F8 as DP8/TP1 or DP4/TP2 for both AFD roles.",
+    )
     parser.add_argument(
         "--enable-mtp",
         action="store_true",

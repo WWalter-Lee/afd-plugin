@@ -136,6 +136,9 @@ class AFDControlPayload:
             work and therefore expects a following ``mtp_phase_ready`` marker.
             Startup profile, warmup, and capture steps execute paired dummy
             draft work directly and leave this disabled.
+        tensor_parallel_size: Attention-side TP size. FFN validates this
+            against its local TP group before receiving AFD tensors so a
+            mismatched deployment fails before the HCCL message order drifts.
     """
 
     dp_metadata_list: dict[int, AFDDPMetadata]
@@ -145,6 +148,7 @@ class AFDControlPayload:
     mtp_phase_ready: bool = False
     mtp_phase_graph_replay: bool = False
     mtp_phase_control_enabled: bool = False
+    tensor_parallel_size: int = 1
 
     def __post_init__(self) -> None:
         self.dp_metadata_list = {
@@ -369,6 +373,7 @@ def encode_control_payload(payload: AFDControlPayload) -> bytes:
         "mtp_phase_ready": bool(payload.mtp_phase_ready),
         "mtp_phase_graph_replay": bool(payload.mtp_phase_graph_replay),
         "mtp_phase_control_enabled": bool(payload.mtp_phase_control_enabled),
+        "tensor_parallel_size": int(payload.tensor_parallel_size),
     }
     return json.dumps(wire_payload, separators=(",", ":"), sort_keys=True).encode(
         "utf-8",
@@ -405,6 +410,7 @@ def decode_control_payload(payload_bytes: bytes) -> AFDControlPayload:
         mtp_phase_control_enabled=bool(
             payload.get("mtp_phase_control_enabled", False),
         ),
+        tensor_parallel_size=int(payload.get("tensor_parallel_size", 1)),
     )
 
 

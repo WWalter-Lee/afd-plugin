@@ -153,6 +153,7 @@ def _merge_results(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _service_environment(args: argparse.Namespace, index: int) -> dict[str, str]:
+    tensor_parallel_size = int(getattr(args, "tensor_parallel_size", 1))
     start_device = index * NPUS_PER_INSTANCE
     devices = ",".join(
         str(device) for device in range(start_device, start_device + NPUS_PER_INSTANCE)
@@ -174,6 +175,7 @@ def _service_environment(args: argparse.Namespace, index: int) -> dict[str, str]
             "VLLM_PLUGINS": NATIVE_PLUGINS,
             "ENABLE_MTP": "1" if args.enable_mtp else "0",
             "MTP_NUM_SPECULATIVE_TOKENS": str(args.mtp_num_speculative_tokens),
+            "TENSOR_PARALLEL_SIZE": str(tensor_parallel_size),
             "TORCH_PROFILER_WITH_STACK": "0",
             "PYTHONUNBUFFERED": "1",
         }
@@ -250,7 +252,11 @@ def _run_pair_benchmark(
                 run_kind=run_kind,
                 repeat=repeat,
                 served_model=f"dsv4-v023-native-{index}",
-                connector="native-dp8-pair",
+                connector=(
+                    "native-dp4-tp2-pair"
+                    if int(getattr(args, "tensor_parallel_size", 1)) == 2
+                    else "native-dp8-pair"
+                ),
             )
             handle = log_path.open("wb")
             process = subprocess.Popen(
@@ -388,6 +394,8 @@ def _shutdown_services(
 
 
 def _runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
+    tensor_parallel_size = int(getattr(args, "tensor_parallel_size", 1))
+    data_parallel_size = NPUS_PER_INSTANCE // tensor_parallel_size
     topology = {
         "deployment": "two_independent_native_instances",
         "npu_count": INSTANCE_COUNT * NPUS_PER_INSTANCE,
@@ -397,8 +405,8 @@ def _runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
                 "devices": list(
                     range(index * NPUS_PER_INSTANCE, (index + 1) * NPUS_PER_INSTANCE)
                 ),
-                "data_parallel_size": NPUS_PER_INSTANCE,
-                "tensor_parallel_size": 1,
+                "data_parallel_size": data_parallel_size,
+                "tensor_parallel_size": tensor_parallel_size,
                 "expert_parallel": True,
                 "api_port": args.api_ports[index],
                 "data_parallel_rpc_port": args.dp_rpc_ports[index],
@@ -437,6 +445,7 @@ def _runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
                 "max_num_batched_tokens": args.max_num_batched_tokens,
                 "max_num_seqs": args.max_num_seqs,
                 "gpu_memory_utilization": args.gpu_memory_utilization,
+                "tensor_parallel_size": tensor_parallel_size,
             },
             "workload": {
                 "input_len": args.input_len,
@@ -481,7 +490,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "passed": False,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "deployment": "two_independent_native_dp8_instances",
+        "deployment": (
+            "two_independent_native_dp4_tp2_instances"
+            if int(getattr(args, "tensor_parallel_size", 1)) == 2
+            else "two_independent_native_dp8_instances"
+        ),
+        "tensor_parallel_size": int(getattr(args, "tensor_parallel_size", 1)),
         "enable_mtp": args.enable_mtp,
         "mtp_num_speculative_tokens": args.mtp_num_speculative_tokens,
     }
@@ -610,6 +624,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--master-ports", type=int, nargs=2, default=[29351, 29451])
     parser.add_argument("--hccl-base-ports", type=int, nargs=2, default=[53000, 54000])
     parser.add_argument("--startup-timeout", type=float, default=3600)
+    parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="Use each 8-NPU native instance as DP8/TP1 or DP4/TP2.",
+    )
     parser.add_argument("--input-len", type=int, default=1024)
     parser.add_argument("--output-len", type=int, default=128)
     parser.add_argument("--concurrencies", type=int, nargs="+", default=[1, 8, 32])

@@ -11,18 +11,23 @@ does not use `afd_camp2p_send_attn_output`, `afd_ascend.a2e`, or
 
 Supported execution boundary:
 
-- Attention: NPU 0-7, DP8/TP1;
-- FFN: NPU 8-15, DP8/TP1/EP8;
+- Attention: NPU 0-7, DP8/TP1 or DP4/TP2;
+- FFN: NPU 8-15, DP8/TP1/EP8 or DP4/TP2/EP8;
 - A8F8 one-to-one deployment and A2F1/A4F2 component topologies;
-- integer-multiple topology contract `A >= F` and `A % F == 0`;
+- integer-multiple topology contract `A >= F` and `A % F == 0` under TP1;
+- TP2 requires `P2pHcclAFDConnector`, equal physical A/F rank counts, and the
+  same TP size on both roles;
 - eager U1 or eager U2, including the integer-multiple topologies above;
-- `FULL_DECODE_ONLY` Graph U1 or U2 for equal or integer-multiple rank counts;
+- `FULL_DECODE_ONLY` Graph U1 or U2 for TP1 equal or integer-multiple rank
+  counts, with TP2 transport covered at component level;
 - eager U1 or U2 + MTP for equal or integer-multiple Attention/FFN rank counts,
   one MTP layer, and one speculative token;
 - target Graph U1 or U2 + eager draft MTP for equal or integer-multiple rank
   counts;
-- full draft Graph, multiple speculative tokens, PD, sequence parallelism,
-  and Attention-side gate are disabled.
+- full draft Graph U1 or U2 for equal TP1 ranks, plus component coverage for
+  integer-multiple TP1 and equal TP2 topologies;
+- multiple speculative tokens, PD, sequence parallelism, PP/CP/DCP greater
+  than 1, and Attention-side gate are disabled.
 
 The public communication API remains synchronous: every eager transfer still
 calls blocking `torch.distributed.send/recv`. Eager U2 additionally uses
@@ -45,6 +50,17 @@ The MTP virtual layer has a separate phase and fixed header. Its learned gate
 does not consume input IDs: Attention sends the per-DP token counts followed by
 post-HC `[T,4096]` BF16 hidden states, and FFN returns a tensor with the same
 shape. Pre-HC `[T,4,4096]` transfers are rejected.
+
+Run the A8F8 DP4/TP2 eager U1 correctness gate with a native TP2 golden:
+
+```bash
+source tools/dsv4/activate_v023_vllm_cann_runtime.sh
+python recipe/npu/P2pHcclAFDConnector/deepseek_v4/run_validation.py \
+  --tensor-parallel-size 2 --execution-mode eager --u-batches 1 \
+  --golden /mnt/workspace/validation/dsv4_v023_vllm_cann_native_tp2/golden_results.json \
+  --cycles 1 --idle-seconds 0 --rounds 3 --batch-sizes 1 8 32 \
+  --output-dir /mnt/workspace/validation/dsv4_afd_v023_hccl_tp2_<timestamp>
+```
 
 Run the Graph U1 correctness gate on the vLLM 0.23 + `rfc/vllm_cann` stack:
 
@@ -83,8 +99,9 @@ python recipe/npu/P2pHcclAFDConnector/deepseek_v4/run_validation.py \
 
 MTP/U2 splits the target decoder only at request boundaries. If any DP rank
 cannot form two non-empty request stages, all ranks fall back to U1 for that
-step. With DP8, batch sizes below 16 therefore exercise the fallback; batch 16
-or 32 is required to validate a real two-stage MTP target run.
+step. With DP8, batch sizes below 16 therefore exercise the fallback; with
+DP4/TP2 the threshold is batch 8. A larger batch is required to validate a
+real two-stage MTP target run.
 
 Run the target Graph U2 + eager draft MTP gate:
 
@@ -119,13 +136,18 @@ python recipe/npu/P2pHcclAFDConnector/deepseek_v4/run_validation.py \
   --output-dir /mnt/workspace/validation/dsv4_afd_hccl_p2p_u2_$(date +%Y%m%d_%H%M%S)
 ```
 
-The HCCL connector supports Graph U1/U2 for integer-multiple topologies and
-rejects Graph U3, `A < F`, and non-integer A/F ratios. MTP supports eager or
-target Graph with an eager draft on integer-multiple topologies, and rejects
-full draft Graph and more than one speculative token. The shared validator
-records the selected connector in `runtime.json` and preserves the same
-golden, lifecycle, fatal-log, and NPU cleanup gates used by the CAMP2P
-baseline.
+The frozen M8 TP2 real-model acceptance boundary is equal-rank A8F8,
+DP4/TP2, eager/U1. TP2 Graph/MTP transport has component coverage, but the
+combined TP2 + full-draft Graph + U2 real-model path is rejected because its
+A3 smoke run triggered an FFN AICore exception. The HCCL connector continues
+to support Graph U1/U2 for integer-multiple TP1 topologies. It rejects Graph
+U3, `A < F`, non-integer A/F ratios, unequal TP2, and the failed TP2 combined
+mode above. TP1 MTP supports eager, target Graph with eager draft, or
+full-draft Graph; more than one speculative token remains a separate
+milestone. The
+shared validator records DP/TP and the selected connector in `runtime.json`
+and preserves the same golden, lifecycle, fatal-log, and NPU cleanup gates used
+by the CAMP2P baseline.
 
 The data path uses blocking HCCL point-to-point API calls. Under eager U2,
 events connect Attention compute, A2F send, F2A receive, FFN receive, FFN

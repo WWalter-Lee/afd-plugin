@@ -901,7 +901,8 @@ eager、CAMP2P、MTP header 协议和同步 HCCL API 均未改变。
 本阶段仍是 component functional snapshot。A3 无法加载 A8F4 FFN EP4 实模，因此没有
 30/30 golden、batch 1/8/32、生命周期或 P1/P2 结论；这些门禁保留到高 HBM A5。
 下一功能阶段曾规划为 full draft ACL Graph；该阶段已经由 M7 完成，已知 6/30 问题提升为
-U1/U2 各 30/30。后续先推进 TP，再依次处理 SP/CP/DCP 和 PP。
+U1/U2 各 30/30。M8 TP 也已冻结；当前直接进入 M9 Mooncake PD。
+SP/CP/DCP 和 PP 统一后移到 M9 之后，不作为 PD 功能开发的前置条件。
 
 #### A3-P7M7：full draft ACL Graph
 
@@ -923,6 +924,34 @@ A4F2 的 6 个 worker 完成 target Graph 和 MTP Graph capture/replay。正式 
 
 完整报告见 `DEEPSEEK_V4_AFD_HCCL_P2P_MTP_FULL_DRAFT_GRAPH_VALIDATION_REPORT_ZH.md`。
 M7 只创建功能 tag，不创建性能 tag；A8F4 实模 full-draft Graph 继续留到 A5。
+
+#### A3-P7M8：HCCL P2P TP2 功能基线
+
+M8 已完成并达到进入 M9 的既定功能门禁。标准 HCCL P2P connector 现在接受 TP1/TP2；
+TP2 首版限定等量物理 A/F、两侧相同 TP2 和 `physical ranks = DP x TP`。A8F8 部署由
+原来的两侧 DP8/TP1 变为两侧 DP4/TP2，Attention rank `i` 仍只与 FFN rank `i`
+交换 IDs、hidden 和 output。CAMP2P TP2、非等量 TP2 和 TP3 继续 fail-fast。
+
+control payload 显式携带 TP，FFN 从完整 payload 更新 Graph/warmup/MTP phase，MTP 的
+逻辑 DP token count 按 TP rank 复制到物理 peer。部署入口显式选择
+`flashinfer_all2allv`，以遵守固定 vLLM-Ascend 栈在 `enable_sp=False` 时关闭隐式
+sequence-parallel MoE 的约定；本阶段没有启用 SP。
+
+验证结果：
+
+- A2F2、DP1/TP2 的 eager、eager + MTP、full Graph/MTP 组件 capture/replay 全部通过；
+- 原生 NPU0-7、DP4/TP2 的 10 条 prompt x 3 轮结果稳定，形成 TP2 golden；
+- AFD A8F8、DP4/TP2、eager/U1 实模 F0 达到 30/30 token IDs 精确一致；
+- batch 1/8/32、fatal log、Attention 先停、FFN 后停和 NPU 清理门禁通过。
+
+补充的 `TP2 + FULL_DECODE_ONLY + U2 + full-draft MTP` 最大组合没有通过：Attention
+完成 Graph capture/replay 且观测到两个 stage，但 FFN Graph warmup 触发 AICore
+507015/非法内存访问。该精确组合已 fail-fast，不纳入 M8 发布边界，也不得写成已经支持。
+M8 冻结的是 TP2 eager/U1 实模基线及 TP2 connector/control 契约，不是全部功能的 TP2
+笛卡尔积。
+
+完整报告见 `DEEPSEEK_V4_AFD_HCCL_P2P_TP2_VALIDATION_REPORT_ZH.md`。M8 只创建功能
+tag，不创建性能 tag。下一功能阶段直接进入 M9 Mooncake PD；SP/CP/DCP 和 PP 后移。
 
 ### 5.12 A3-P8：同步 HCCL 第一轮性能门禁
 
@@ -1210,18 +1239,38 @@ profiling 仍遵守：部署、采集、解析分离；`TORCH_PROFILER_WITH_STAC
 
 A5 使用与 A3 相同的公平资源口径，但重新生成全部数字和门禁结论。通过后再创建带 A5 标识的独立 tag，不能复用 A3 性能 tag 代表 A5。
 
-## 9. PD 集成顺序
+## 9. M9 Mooncake PD 集成顺序
 
-Mooncake PD 不进入当前 A3 standalone AF 性能开发的关键路径。
+M8 TP 功能基线冻结后，下一功能阶段直接进入 M9 Mooncake PD。SP、CP、DCP
+和 PP 全部后移，不作为 M9 的前置能力。M9 继续只修改 `afd-plugin`；若目标
+Mooncake 接口与固定 vLLM/vLLM-Ascend 栈不兼容，先在插件兼容层适配并记录
+上游差异，不直接修改两个固定上游工作树。
 
-进入 PD 的门禁：
+M9 分为功能门禁和性能门禁，二者不得混为一个准入条件。
 
-- A3 或目标 A5 上 standalone AF 的 HCCL P2P eager/U2 正确性和性能门禁通过；
-- AFD 相对非 AFD 的性能收益已经按公平资源口径得到解释；
-- A2F/F2A、FFN wait 和 bubble 的主要瓶颈已有 profile 证据；
-- 生命周期和自动清理稳定。
+进入 M9 功能开发的门禁：
 
-进入 PD 后，把 PD 拓扑作为新的独立变量重新验证，不用 standalone AF 的结果直接替代生产拓扑结论。U3 不纳入当前路线。
+- M8 的 HCCL P2P TP2 组件、同栈原生 golden 和至少 eager/U1 实模 F0 通过；
+- TP1 行为无回退，TP2 rank/peer/control payload 契约已冻结；
+- Attention、FFN 生命周期和自动清理稳定；
+- 已明确 Mooncake PD 的 prefill/decode 角色、KV transfer、AF 子拓扑和启动顺序。
+
+M9 功能开发顺序：
+
+1. 审计固定目标栈中的 Mooncake connector/API 和已有部署脚本，冻结 P/D/AF
+   进程、rank、端口、NIC 与 KV ownership；
+2. 建立不加载实模的最小 PD + AF connector 生命周期与 metadata 组件测试；
+3. 先支持 TP1、eager/U1 的 PD + A8F8，再扩展到 M8 冻结的 DP4/TP2；
+4. 完成 prefill -> decode KV transfer、decode Attention -> FFN HCCL P2P、请求
+   取消、异常、shutdown 和二次启动；
+5. 生成同平台 PD control/golden，执行串行 token exact、batch 和生命周期 F0；
+6. 再组合 U2、Graph 和 MTP，每个组合保留独立 fail-fast 与验证产物。
+
+standalone AF 的 `P8D-PERF-001` 在 M9 期间继续保持 Open，但不阻塞上述功能
+开发。进入 M9 性能结论和性能 tag 前，仍必须补齐：AFD 相对非 AFD 的公平
+资源对照、A2F/F2A/FFN wait/bubble profile、三轮稳定性，以及 PD control 对照。
+PD 拓扑是新的独立变量，不能用 standalone AF 数字直接替代生产拓扑结论。
+U3 仍不纳入当前路线。
 
 ## 10. 分支、Tag 和产物规范
 
@@ -1236,6 +1285,8 @@ Mooncake PD 不进入当前 A3 standalone AF 性能开发的关键路径。
 | A3 HCCL P2P 非等量正确性基线 | `dsv4-afd-a3-hccl-p2p-unequal-v1` |
 | v0.23 HCCL P2P eager 非等量 MTP 组件基线 | `dsv4-afd-v023-hccl-mtp-unequal-component-v1` |
 | v0.23 HCCL P2P full draft Graph 功能基线 | `dsv4-afd-v023-hccl-mtp-full-draft-graph-v1` |
+| v0.23 HCCL P2P TP2 功能基线 | `dsv4-afd-v023-hccl-tp2-v1` |
+| v0.23 Mooncake PD + AFD 开发 | `feat/dsv4-afd-mooncake-pd` |
 | A3 HCCL P2P 性能验收 | `dsv4-afd-a3-hccl-p2p-perf-v1` |
 | vLLM 0.23 + `rfc/vllm_cann` 功能兼容基线 | `dsv4-afd-v023-vllm-cann-eager-u2-functional-v1` |
 | A5 基线 | 在实际硬件和版本确认后使用 `dsv4-afd-a5-*` 命名 |
@@ -1302,11 +1353,12 @@ Mooncake PD 不进入当前 A3 standalone AF 性能开发的关键路径。
 11. A3-P7M5/M6 的 eager/Graph 非等量组件闭环已完成；恢复时核对 M5 的 A1F1/A2F1/A4F2 与 M6 的 A2F1/A4F2/Graph+MTP `summary.json` 和两份专项报告，不把 component tag 当成 A8F4 E2E 或性能基线；
 12. A3-P8/P8C/P8D 的 eager 性能缺口 `P8D-PERF-001` 仍为 Open；Graph/U2 P1 的 107.189 token/s 和 M4 P1 的 31.473 token/s 都不能直接关闭该问题。功能组合闭环后再做 Graph/U1、Graph/U2、MTP on/off 和同预算 native Graph 三轮 P2；
 13. A3-P7M7 full draft ACL Graph 已完成；恢复时核对专项报告、U1/U2 各 30/30、A4F2 组件、capture bucket、128/128 P1 和 cleanup，不再沿用旧的 6/30 结论；
-14. 下一项功能里程碑为 M8 TP，随后依次推进 SP/CP/DCP 和 PP；更多 speculative token 保持独立里程碑；
-15. standalone AF 功能与性能冻结后再进入 M9 Mooncake PD；
-16. A5 到位后从硬件审计和独立工具链开始，不复用 A3 二进制，并重新生成原生 MTP golden；
-17. 每次阶段完成都保存日志、原始数据、解析结果和清理证据。
+14. A3-P7M8 TP2 功能基线已完成；恢复时核对专项报告、三个 TP2 组件产物、原生 DP4/TP2 golden 和 A8F8 eager/U1 30/30 F0；不要把失败的 TP2 full-draft Graph U2 最大组合写成支持；
+15. 当前功能里程碑为 M9 Mooncake PD；先审计固定栈 Mooncake/KV connector，再做 TP1 eager/U1 PD + AF，随后复用 M8 的 DP4/TP2 契约；
+16. SP/CP/DCP 和 PP 全部后移到 M9 之后；更多 speculative token 保持独立里程碑；
+17. A5 到位后从硬件审计和独立工具链开始，不复用 A3 二进制，并重新生成原生 MTP golden；
+18. 每次阶段完成都保存日志、原始数据、解析结果和清理证据。
 
 ## 13. 一句话路线
 
-在 vLLM 0.23 + `rfc/vllm_cann` 目标栈已经完成 HCCL P2P eager U1/U2、等量 Graph/U1/U2、原生 MTP/M0、eager/U1 + MTP/M1、target Graph/U1 + draft eager MTP/M2、eager/U2 + MTP/M3、target Graph/U2 + draft eager MTP/M4、eager 非等量 MTP/M5、非等量 Graph 组件/M6，以及 full draft ACL Graph/M7。M7 的 A8F8 U1/U2 均达到 30/30 golden，A4F2 full-draft Graph 组件和 128/128 P1 通过；A8F4 实模 F0 仍因 A3 EP4 HBM 不足转到高 HBM A5。下一步按功能优先推进 M8 TP，再依次处理 SP/CP/DCP 和 PP，M9 进入 Mooncake PD；多 speculative token 保持独立里程碑。功能组合闭环后统一执行三轮 P2、MTP on/off 和同预算 native 公平对照。Attention-side gate 不纳入支持范围，`P8D-PERF-001` 仍保留，A3 数字不得直接外推到 A5。
+在 vLLM 0.23 + `rfc/vllm_cann` 目标栈已经完成 HCCL P2P eager U1/U2、等量 Graph/U1/U2、原生 MTP/M0、eager/U1 + MTP/M1、target Graph/U1 + draft eager MTP/M2、eager/U2 + MTP/M3、target Graph/U2 + draft eager MTP/M4、eager 非等量 MTP/M5、非等量 Graph 组件/M6、full draft ACL Graph/M7，以及等量 A8F8 DP4/TP2 eager/U1 功能基线/M8。M8 的原生 TP2 golden 稳定且 AFD 实模 F0 达到 30/30；TP2 full-draft Graph U2 最大组合因 FFN AICore 异常保持 fail-fast。下一步直接进入 M9 Mooncake PD；先做 TP1 eager/U1，再复用 M8 的 TP2 control/rank 契约。SP/CP/DCP 和 PP 全部后移到 M9 之后，多 speculative token 保持独立里程碑。功能组合闭环后统一执行三轮 P2、MTP on/off 和同预算 native 公平对照。Attention-side gate 不纳入支持范围，`P8D-PERF-001` 仍保留，A3 数字不得直接外推到 A5。

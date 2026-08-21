@@ -269,6 +269,7 @@ def test_p2p_dp_metadata_serialization_uses_json_payload():
             is_graph_capturing=True,
             is_warmup=False,
             mtp_phase_control_enabled=True,
+            tensor_parallel_size=2,
         ),
     )
     decoded_payload = module.decode_control_payload(payload)
@@ -286,6 +287,7 @@ def test_p2p_dp_metadata_serialization_uses_json_payload():
     assert decoded_payload.shutdown is False
     assert decoded_payload.mtp_phase_ready is False
     assert decoded_payload.mtp_phase_control_enabled is True
+    assert decoded_payload.tensor_parallel_size == 2
 
 
 def test_p2p_mtp_phase_control_payload_round_trip():

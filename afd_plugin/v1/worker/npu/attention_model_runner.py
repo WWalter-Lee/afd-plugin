@@ -1688,6 +1688,13 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             dp_metadata_list=dp_metadata_list,
             is_graph_capturing=is_graph_capturing,
             is_warmup=is_warmup,
+            tensor_parallel_size=int(
+                getattr(
+                    self.vllm_config.parallel_config,
+                    "tensor_parallel_size",
+                    1,
+                ),
+            ),
             mtp_phase_control_enabled=bool(
                 getattr(self, "_afd_live_execution", False),
             ),

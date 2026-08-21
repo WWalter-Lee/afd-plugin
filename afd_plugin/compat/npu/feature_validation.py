@@ -157,8 +157,35 @@ def _fail_if_unsupported_deepseek_v4_features(
         raise RuntimeError(
             "DeepSeek-V4 CAMP2pAFDConnector requires equal Attention and FFN ranks"
         )
-    if parallel_config.tensor_parallel_size != 1:
-        raise RuntimeError("DeepSeek-V4 AFD supports only tensor_parallel_size=1")
+    tensor_parallel_size = int(parallel_config.tensor_parallel_size)
+    if tensor_parallel_size not in (1, 2):
+        raise RuntimeError(
+            "DeepSeek-V4 AFD supports only tensor_parallel_size=1 or 2"
+        )
+    if tensor_parallel_size == 2:
+        if afd_config.connector != "P2pHcclAFDConnector":
+            raise RuntimeError(
+                "DeepSeek-V4 AFD TP2 supports only P2pHcclAFDConnector"
+            )
+        if afd_config.num_attention_ranks != afd_config.num_ffn_ranks:
+            raise RuntimeError(
+                "DeepSeek-V4 AFD TP2 currently requires equal Attention and FFN ranks"
+            )
+        role_ranks = (
+            afd_config.num_attention_ranks
+            if afd_config.role == "attention"
+            else afd_config.num_ffn_ranks
+        )
+        expected_role_ranks = (
+            int(parallel_config.data_parallel_size) * tensor_parallel_size
+        )
+        if role_ranks != expected_role_ranks:
+            raise RuntimeError(
+                "DeepSeek-V4 AFD TP2 requires role ranks to equal DP x TP: "
+                f"role={afd_config.role}, ranks={role_ranks}, "
+                f"DP={int(parallel_config.data_parallel_size)}, "
+                f"TP={tensor_parallel_size}"
+            )
     if parallel_config.pipeline_parallel_size != 1:
         raise RuntimeError("DeepSeek-V4 AFD supports only pipeline_parallel_size=1")
     if parallel_config.prefill_context_parallel_size != 1:
@@ -186,6 +213,16 @@ def _fail_if_unsupported_deepseek_v4_features(
         if target_enforce_eager and not draft_enforce_eager:
             raise RuntimeError(
                 "DeepSeek-V4 AFD MTP eager execution requires draft enforce_eager=true"
+            )
+        if (
+            tensor_parallel_size == 2
+            and not target_enforce_eager
+            and not draft_enforce_eager
+            and parallel_config.use_ubatching
+        ):
+            raise RuntimeError(
+                "DeepSeek-V4 AFD TP2 full-draft MTP Graph U2 is not validated; "
+                "use the TP2 eager/U1 baseline or TP1 for this combined mode"
             )
         num_mtp_layers = int(
             getattr(vllm_config.model_config.hf_config, "num_nextn_predict_layers", 1)

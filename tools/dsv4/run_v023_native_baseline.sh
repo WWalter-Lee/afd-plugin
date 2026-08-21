@@ -18,6 +18,13 @@ DATA_PARALLEL_RPC_PORT="${DATA_PARALLEL_RPC_PORT:-29350}"
 MASTER_PORT="${MASTER_PORT:-29351}"
 ENABLE_MTP="${ENABLE_MTP:-0}"
 MTP_NUM_SPECULATIVE_TOKENS="${MTP_NUM_SPECULATIVE_TOKENS:-1}"
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
+
+if [[ ! "${TENSOR_PARALLEL_SIZE}" =~ ^[12]$ ]]; then
+  echo "TENSOR_PARALLEL_SIZE must be 1 or 2" >&2
+  exit 2
+fi
+DATA_PARALLEL_SIZE=$((8 / TENSOR_PARALLEL_SIZE))
 
 MTP_ARGS=()
 case "${ENABLE_MTP}" in
@@ -63,10 +70,10 @@ exec vllm serve "${MODEL_PATH}" \
   --max-model-len "${MAX_MODEL_LEN}" \
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
   --max-num-seqs "${MAX_NUM_SEQS}" \
-  --data-parallel-size 8 \
+  --data-parallel-size "${DATA_PARALLEL_SIZE}" \
   --data-parallel-rpc-port "${DATA_PARALLEL_RPC_PORT}" \
   --master-port "${MASTER_PORT}" \
-  --tensor-parallel-size 1 \
+  --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
   --enable-expert-parallel \
   --enforce-eager \
   --seed 1024 \

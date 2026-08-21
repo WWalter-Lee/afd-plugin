@@ -228,6 +228,9 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         self.ffn_size = self.mapping.ffn_size
         self.min_size = self.mapping.min_size
         self.ratio = self.mapping.ratio
+        self.tensor_parallel_size = int(
+            vllm_config.parallel_config.tensor_parallel_size,
+        )
         self.dst_list = list(self.mapping.dp_metadata_destinations)
         self.hidden_size = int(vllm_config.model_config.hf_config.hidden_size)
         self.dtype = vllm_config.model_config.dtype
@@ -1419,6 +1422,12 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         """Project Attention DP token counts onto the FFN rank topology."""
         flat_counts = num_tokens_across_dp.reshape(-1)
         count_size = int(flat_counts.numel())
+        if (
+            count_size < self.attn_size
+            and count_size * self.tensor_parallel_size == self.attn_size
+        ):
+            flat_counts = flat_counts.repeat_interleave(self.tensor_parallel_size)
+            count_size = int(flat_counts.numel())
         if count_size != self.attn_size:
             raise ValueError(
                 "DSV4 MTP token-count vector must match Attention world size: "
@@ -1478,6 +1487,13 @@ class P2pHcclAFDControlPlane(AFDControlPlane):
         payload: AFDControlPayload,
     ) -> None:
         connector = self.connector
+        if int(payload.tensor_parallel_size) != connector.tensor_parallel_size:
+            raise RuntimeError(
+                "DeepSeek-V4 AFD requires matching Attention/FFN tensor "
+                "parallel sizes: "
+                f"attention={int(payload.tensor_parallel_size)}, "
+                f"ffn={connector.tensor_parallel_size}"
+            )
         connector.dp_metadata_list = payload.dp_metadata_list
         connector.stage_layouts = {}
         connector.is_graph_capturing = payload.is_graph_capturing

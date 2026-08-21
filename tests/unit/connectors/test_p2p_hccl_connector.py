@@ -33,14 +33,16 @@ def _vllm_config(
     mtp: bool = False,
     mtp_draft_enforce_eager: bool = True,
     enforce_eager: bool = True,
+    tensor_parallel_size: int = 1,
+    data_parallel_size: int = 1,
 ):
     return SimpleNamespace(
         additional_config={"afd": {"connector_extra_config": {}}},
         parallel_config=SimpleNamespace(
-            data_parallel_size=1,
+            data_parallel_size=data_parallel_size,
             data_parallel_rank=0,
             prefill_context_parallel_size=1,
-            tensor_parallel_size=1,
+            tensor_parallel_size=tensor_parallel_size,
             num_ubatches=num_ubatches,
         ),
         scheduler_config=SimpleNamespace(
@@ -87,6 +89,8 @@ def _connector(
     max_num_batched_tokens: int = 16,
     mtp: bool = False,
     mtp_draft_enforce_eager: bool = True,
+    tensor_parallel_size: int = 1,
+    data_parallel_size: int = 1,
 ):
     connector = P2pHcclAFDConnector(
         0,
@@ -96,6 +100,8 @@ def _connector(
             max_num_batched_tokens=max_num_batched_tokens,
             mtp=mtp,
             mtp_draft_enforce_eager=mtp_draft_enforce_eager,
+            tensor_parallel_size=tensor_parallel_size,
+            data_parallel_size=data_parallel_size,
         ),
         _afd_config(role=role, attention=attention, ffn=ffn),
         role_rank,
@@ -403,6 +409,54 @@ def test_p2p_hccl_mtp_projects_attention_counts_to_unequal_ffn_world(
     header, dst, group = sent[0]
     assert (dst, group) == (1, connector.ids_pg_list[0])
     assert header.tolist() == [0x4D545031, 0, 5, 2, 5, 9]
+
+
+def test_p2p_hccl_mtp_expands_dp_counts_for_equal_tp2(monkeypatch):
+    connector = _connector(
+        role="attention",
+        role_rank=3,
+        attention=4,
+        ffn=4,
+        mtp=True,
+        tensor_parallel_size=2,
+        data_parallel_size=2,
+    )
+    sent = []
+    monkeypatch.setattr(
+        connector,
+        "_send_tensor",
+        lambda tensor, *, dst, group: sent.append((tensor.clone(), dst, group)),
+    )
+
+    connector.send_mtp_header(
+        num_tokens=5,
+        speculative_step=0,
+        num_tokens_across_dp=torch.tensor([3, 5], dtype=torch.int32),
+        stage_idx=0,
+    )
+
+    assert len(sent) == 1
+    header, dst, group = sent[0]
+    assert (dst, group) == (3, connector.ids_pg_list[0])
+    assert header.tolist() == [0x4D545031, 0, 5, 4, 3, 3, 5, 5]
+
+
+def test_p2p_hccl_control_plane_rejects_mismatched_tp_size():
+    connector = _connector(
+        role="ffn",
+        attention=2,
+        ffn=2,
+        tensor_parallel_size=2,
+    )
+    payload = AFDControlPayload(
+        dp_metadata_list={0: AFDDPMetadata([3])},
+        is_graph_capturing=False,
+        is_warmup=False,
+        tensor_parallel_size=1,
+    )
+
+    with pytest.raises(RuntimeError, match="matching Attention/FFN"):
+        connector.control_plane.update_state_from_dp_metadata(payload)
 
 
 def test_p2p_hccl_mtp_rejects_pre_hc_three_dimensional_hidden():

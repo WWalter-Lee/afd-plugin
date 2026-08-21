@@ -3499,6 +3499,52 @@ def test_npu_ffn_worker_stops_on_attention_shutdown_payload(monkeypatch):
     assert event.is_set()
 
 
+def test_npu_ffn_worker_preserves_complete_control_payload(monkeypatch):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_worker as ffn_worker_module
+
+    event = threading.Event()
+    payload = AFDControlPayload(
+        dp_metadata_list={0: _FakeDPMetadata([3, 5])},
+        is_graph_capturing=True,
+        is_warmup=True,
+        tensor_parallel_size=2,
+        mtp_phase_control_enabled=True,
+    )
+    updates = []
+    executions = []
+
+    def execute_ffn_step(**kwargs):
+        executions.append(kwargs)
+        event.set()
+
+    control_plane = SimpleNamespace(
+        recv_dp_metadata_list=lambda: payload,
+        update_state_from_dp_metadata=updates.append,
+    )
+    worker = _new_ffn_worker()
+    worker._ffn_shutdown_event = event
+    worker.device = SimpleNamespace(type="npu")
+    worker.model_runner = SimpleNamespace(
+        connector=SimpleNamespace(control_plane=control_plane),
+        execute_ffn_step=execute_ffn_step,
+    )
+    monkeypatch.setattr(ffn_worker_module.torch.npu, "set_device", lambda _device: None)
+    monkeypatch.setattr(ffn_worker_module.torch.npu, "synchronize", lambda: None)
+
+    worker._run_ffn_server_loop()
+
+    assert updates == [payload]
+    assert executions == [
+        {
+            "dp_metadata_list": payload.dp_metadata_list,
+            "is_graph_capturing": True,
+            "is_warmup": True,
+            "connector_state_prepared": True,
+        }
+    ]
+
+
 def test_npu_ffn_worker_loop_error_is_propagated(caplog):
     worker = _new_ffn_worker()
     worker._ffn_thread = None
@@ -3801,6 +3847,64 @@ def test_dsv4_feature_validation_accepts_eager_hccl_p2p_a2f1():
     fail_if_unsupported_npu_afd_features(config)
 
 
+@pytest.mark.parametrize(
+    ("cudagraph_mode", "enforce_eager"),
+    [("FULL", True), ("FULL_DECODE_ONLY", False)],
+)
+def test_dsv4_feature_validation_accepts_equal_hccl_tp2(
+    cudagraph_mode,
+    enforce_eager,
+):
+    config = _dsv4_config(
+        cudagraph_mode=cudagraph_mode,
+        tensor_parallel_size=2,
+        data_parallel_size=1,
+    )
+    config.model_config.enforce_eager = enforce_eager
+    config.additional_config["afd"].update(
+        connector="P2pHcclAFDConnector",
+        num_attention_ranks=2,
+        num_ffn_ranks=2,
+    )
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda config: config.additional_config["afd"].update(
+                connector="CAMP2pAFDConnector"
+            ),
+            "TP2 supports only P2pHcclAFDConnector",
+        ),
+        (
+            lambda config: config.additional_config["afd"].update(num_ffn_ranks=1),
+            "requires equal Attention and FFN ranks",
+        ),
+        (
+            lambda config: setattr(config.parallel_config, "data_parallel_size", 2),
+            "ranks to equal DP x TP",
+        ),
+    ],
+)
+def test_dsv4_feature_validation_rejects_unvalidated_tp2_topology(
+    mutation,
+    message,
+):
+    config = _dsv4_config(tensor_parallel_size=2, data_parallel_size=1)
+    config.additional_config["afd"].update(
+        connector="P2pHcclAFDConnector",
+        num_attention_ranks=2,
+        num_ffn_ranks=2,
+    )
+    mutation(config)
+
+    with pytest.raises(RuntimeError, match=message):
+        fail_if_unsupported_npu_afd_features(config)
+
+
 def test_dsv4_feature_validation_accepts_hccl_p2p_full_decode_only_u1():
     config = _dsv4_config(cudagraph_mode="FULL_DECODE_ONLY")
     config.model_config.enforce_eager = False
@@ -3865,6 +3969,28 @@ def test_dsv4_feature_validation_accepts_full_draft_mtp_graph():
     fail_if_unsupported_npu_afd_features(config)
 
 
+def test_dsv4_feature_validation_rejects_tp2_full_draft_mtp_graph_u2():
+    config = _dsv4_config(
+        cudagraph_mode="FULL_DECODE_ONLY",
+        speculative_config=_mtp_speculative_config(enforce_eager=False),
+        tensor_parallel_size=2,
+        data_parallel_size=1,
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+        ubatch_size=2,
+    )
+    config.model_config.enforce_eager = False
+    config.additional_config["afd"].update(
+        connector="P2pHcclAFDConnector",
+        num_attention_ranks=2,
+        num_ffn_ranks=2,
+    )
+
+    with pytest.raises(RuntimeError, match="TP2 full-draft MTP Graph U2"):
+        fail_if_unsupported_npu_afd_features(config)
+
+
 def test_dsv4_feature_validation_accepts_hccl_p2p_graph_a2f1():
     config = _dsv4_config(cudagraph_mode="FULL_DECODE_ONLY")
     config.model_config.enforce_eager = False
@@ -3891,8 +4017,8 @@ def test_dsv4_feature_validation_accepts_hccl_p2p_graph_a2f1():
             "equal Attention and FFN",
         ),
         (
-            lambda config: setattr(config.parallel_config, "tensor_parallel_size", 2),
-            "tensor_parallel_size=1",
+            lambda config: setattr(config.parallel_config, "tensor_parallel_size", 3),
+            "tensor_parallel_size=1 or 2",
         ),
         (
             lambda config: setattr(config.parallel_config, "pipeline_parallel_size", 2),

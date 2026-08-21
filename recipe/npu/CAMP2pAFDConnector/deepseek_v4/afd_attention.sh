@@ -16,6 +16,7 @@ AFD_PORT="${AFD_PORT:-29761}"
 AFD_CONNECTOR="${AFD_CONNECTOR:-CAMP2pAFDConnector}"
 ATTENTION_RANKS="${ATTENTION_RANKS:-8}"
 FFN_RANKS="${FFN_RANKS:-8}"
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 MAX_NUM_BATCHED_TOKENS="${ATTENTION_MAX_NUM_BATCHED_TOKENS:-${MAX_NUM_BATCHED_TOKENS:-1024}}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
@@ -46,6 +47,26 @@ export SOC_VERSION=ascend910_9362
 export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-18000}"
 export VLLM_PLUGINS=ascend,ascend_model,ascend_model_loader,ascend_kv_connector,afd
 unset VLLM_ASCEND_ENABLE_FLASHCOMM1
+
+if [[ ! "$TENSOR_PARALLEL_SIZE" =~ ^[12]$ ]]; then
+  echo "DeepSeek-V4 AFD supports TENSOR_PARALLEL_SIZE=1 or 2" >&2
+  exit 2
+fi
+if ((ATTENTION_RANKS % TENSOR_PARALLEL_SIZE != 0)); then
+  echo "ATTENTION_RANKS must be divisible by TENSOR_PARALLEL_SIZE" >&2
+  exit 2
+fi
+if ((TENSOR_PARALLEL_SIZE > 1)); then
+  if [[ "$AFD_CONNECTOR" != "P2pHcclAFDConnector" ]]; then
+    echo "DeepSeek-V4 AFD TP2 requires P2pHcclAFDConnector" >&2
+    exit 2
+  fi
+  if [[ "$ATTENTION_RANKS" != "$FFN_RANKS" ]]; then
+    echo "DeepSeek-V4 AFD TP2 requires equal Attention and FFN ranks" >&2
+    exit 2
+  fi
+fi
+ATTENTION_DP_SIZE=$((ATTENTION_RANKS / TENSOR_PARALLEL_SIZE))
 
 case "$AFD_CONNECTOR" in
   CAMP2pAFDConnector)
@@ -172,8 +193,9 @@ exec vllm serve "$MODEL_PATH" \
   --max-model-len "$MAX_MODEL_LEN" \
   --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
   --max-num-seqs "$MAX_NUM_SEQS" \
-  --data-parallel-size "$ATTENTION_RANKS" \
-  --tensor-parallel-size 1 \
+  --data-parallel-size "$ATTENTION_DP_SIZE" \
+  --tensor-parallel-size "$TENSOR_PARALLEL_SIZE" \
+  --all2all-backend flashinfer_all2allv \
   --enable-expert-parallel \
   --seed 1024 \
   --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \

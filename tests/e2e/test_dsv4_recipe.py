@@ -109,6 +109,7 @@ def test_dsv4_role_scripts_offer_u1_graph_and_eager_u2():
         assert "/mnt/workspace/code/vllm-ascend-rfc-vllm-cann" in script
         assert 'EXECUTION_MODE="${EXECUTION_MODE:-eager}"' in script
         assert 'U_BATCHES="${U_BATCHES:-1}"' in script
+        assert 'TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"' in script
         assert 'MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"' in script
         assert 'GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"' in script
         assert '"cudagraph_mode":"FULL_DECODE_ONLY"' in script
@@ -140,6 +141,9 @@ def test_dsv4_role_scripts_offer_u1_graph_and_eager_u2():
         assert "graph execution requires equal Attention/FFN ranks" not in script
         assert "MTP supports exactly one speculative token" in script
         assert "graph U2 requires P2pHcclAFDConnector" in script
+        assert "AFD TP2 requires P2pHcclAFDConnector" in script
+        assert '--tensor-parallel-size "$TENSOR_PARALLEL_SIZE"' in script
+        assert "--all2all-backend flashinfer_all2allv" in script
         assert "U2 currently supports only EXECUTION_MODE=eager" not in script
 
     attention_script = (recipe_dir / "afd_attention.sh").read_text(encoding="utf-8")
@@ -194,6 +198,9 @@ def test_dsv4_v023_native_baseline_has_explicit_mtp_switch():
         in script
     )
     assert "ascend_kv_connector,afd" not in script
+    assert 'TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"' in script
+    assert '--data-parallel-size "${DATA_PARALLEL_SIZE}"' in script
+    assert '--tensor-parallel-size "${TENSOR_PARALLEL_SIZE}"' in script
 
 
 @pytest.mark.parametrize(
@@ -250,9 +257,12 @@ def test_dsv4_hccl_a8f4_topology_derives_ffn_capacity_and_unused_devices():
     )
 
     assert topology == {
-        "attention_ranks": 8,
-        "ffn_ranks": 4,
-        "ratio": 2,
+            "attention_ranks": 8,
+            "ffn_ranks": 4,
+            "tensor_parallel_size": 1,
+            "attention_data_parallel_size": 8,
+            "ffn_data_parallel_size": 4,
+            "ratio": 2,
         "attention_devices": list(range(8)),
         "ffn_devices": list(range(8, 12)),
         "unused_devices": [12, 13, 14, 15],
@@ -314,6 +324,40 @@ def test_dsv4_hccl_graph_topology_accepts_integer_multiple_roles():
             execution_mode="full-decode-only",
             u_batches=2,
             topology={"attention_ranks": 8, "ffn_ranks": 8},
+        )
+
+
+def test_dsv4_hccl_tp2_topology_and_environment(monkeypatch):
+    runner = _load_runner()
+    topology = runner._resolve_topology(
+        connector="P2pHcclAFDConnector",
+        attention_devices=list(range(8)),
+        ffn_devices=list(range(8, 16)),
+        attention_max_num_batched_tokens=1024,
+        ffn_max_num_batched_tokens=None,
+        tensor_parallel_size=2,
+    )
+
+    assert topology["tensor_parallel_size"] == 2
+    assert topology["attention_data_parallel_size"] == 4
+    assert topology["ffn_data_parallel_size"] == 4
+    runner._validate_execution_topology(
+        connector="P2pHcclAFDConnector",
+        execution_mode="full-decode-only",
+        u_batches=2,
+        topology=topology,
+    )
+    runner._set_topology_environment(topology)
+    assert runner.os.environ["TENSOR_PARALLEL_SIZE"] == "2"
+
+    with pytest.raises(ValueError, match="requires equal Attention and FFN"):
+        runner._resolve_topology(
+            connector="P2pHcclAFDConnector",
+            attention_devices=list(range(8)),
+            ffn_devices=list(range(8, 12)),
+            attention_max_num_batched_tokens=1024,
+            ffn_max_num_batched_tokens=None,
+            tensor_parallel_size=2,
         )
 
 
@@ -455,10 +499,45 @@ def test_dsv4_native_pair_uses_disjoint_devices_ports_and_no_afd_plugin(tmp_path
     assert env0["HCCL_IF_BASE_PORT"] != env1["HCCL_IF_BASE_PORT"]
     assert env0["VLLM_PLUGINS"] == runner.NATIVE_PLUGINS
     assert ",afd" not in env0["VLLM_PLUGINS"]
+    assert env0["TENSOR_PARALLEL_SIZE"] == "1"
 
     service_script = runner.NATIVE_SERVICE_SCRIPT.read_text(encoding="utf-8")
     assert '--data-parallel-rpc-port "${DATA_PARALLEL_RPC_PORT}"' in service_script
     assert '--master-port "${MASTER_PORT}"' in service_script
+
+
+def test_dsv4_native_pair_supports_dp4_tp2(tmp_path):
+    runner = _load_native_performance_runner()
+    args = SimpleNamespace(
+        model=tmp_path / "model",
+        api_ports=[8920, 8921],
+        dp_rpc_ports=[29350, 29450],
+        master_ports=[29351, 29451],
+        hccl_base_ports=[53000, 54000],
+        max_model_len=4096,
+        max_num_batched_tokens=1024,
+        max_num_seqs=8,
+        gpu_memory_utilization=0.9,
+        enable_mtp=False,
+        mtp_num_speculative_tokens=1,
+        tensor_parallel_size=2,
+        input_len=1024,
+        output_len=128,
+        concurrencies=[32],
+        repeats=1,
+        prompts_per_concurrency=4,
+        min_prompts=128,
+        warmup_input_len=256,
+        warmup_output_len=16,
+        warmup_prompts=16,
+        warmup_concurrency=8,
+        max_throughput_cv=0.1,
+    )
+
+    assert runner._service_environment(args, 0)["TENSOR_PARALLEL_SIZE"] == "2"
+    manifest = runner._runtime_manifest(args)
+    assert manifest["topology"]["instances"][0]["data_parallel_size"] == 4
+    assert manifest["topology"]["instances"][0]["tensor_parallel_size"] == 2
 
 
 def test_dsv4_native_pair_merges_shared_request_window_and_latencies():
@@ -545,6 +624,37 @@ def test_dsv4_performance_defaults_to_validated_sync_scheduler(monkeypatch, tmp_
     args = runner._parse_args()
 
     assert args.async_scheduling == "off"
+    assert args.tensor_parallel_size == 1
+
+
+def test_dsv4_performance_tp2_uses_dp4_topology_and_environment(monkeypatch):
+    runner = _load_performance_runner()
+    topology = runner._a8f8_topology(1024, tensor_parallel_size=2)
+
+    assert topology["attention_ranks"] == topology["ffn_ranks"] == 8
+    assert topology["tensor_parallel_size"] == 2
+    assert topology["attention_data_parallel_size"] == 4
+    assert topology["ffn_data_parallel_size"] == 4
+
+    args = SimpleNamespace(
+        execution_mode="eager",
+        u_batches=1,
+        tensor_parallel_size=2,
+        enable_mtp=False,
+        mtp_num_speculative_tokens=1,
+        max_num_batched_tokens=1024,
+        max_model_len=4096,
+        max_num_seqs=8,
+        gpu_memory_utilization=0.9,
+        attention_hccl_base_port=51000,
+        ffn_hccl_base_port=52000,
+        async_scheduling="off",
+        profile=False,
+    )
+    runner._validate_execution_args(args)
+    runner._set_service_environment(args)
+
+    assert runner.os.environ["TENSOR_PARALLEL_SIZE"] == "2"
 
 
 def test_dsv4_performance_mtp_uses_functional_gate_and_environment(monkeypatch):

@@ -29,9 +29,15 @@ def _token_counts(
     *,
     step_idx: int,
     stage_idx: int,
+    tensor_parallel_size: int = 1,
 ) -> list[int]:
+    dp_size = attention_size // tensor_parallel_size
+    dp_counts = [
+        2 + ((step_idx + stage_idx + dp_rank) % 4)
+        for dp_rank in range(dp_size)
+    ]
     return [
-        2 + ((step_idx + stage_idx + attention_rank) % 4)
+        dp_counts[attention_rank // tensor_parallel_size]
         for attention_rank in range(attention_size)
     ]
 
@@ -54,11 +60,24 @@ def _hidden_value(attention_rank: int, *, step_idx: int, stage_idx: int) -> int:
     return 100 * step_idx + 10 * stage_idx + attention_rank
 
 
-def _mtp_token_counts(attention_size: int, *, step_idx: int) -> list[int]:
+def _mtp_token_counts(
+    attention_size: int,
+    *,
+    step_idx: int,
+    tensor_parallel_size: int = 1,
+) -> list[int]:
+    dp_size = attention_size // tensor_parallel_size
+    dp_counts = [
+        1 + ((2 * step_idx + dp_rank) % 3) for dp_rank in range(dp_size)
+    ]
     return [
-        1 + ((2 * step_idx + attention_rank) % 3)
+        dp_counts[attention_rank // tensor_parallel_size]
         for attention_rank in range(attention_size)
     ]
+
+
+def _dp_token_counts(counts: list[int], *, tensor_parallel_size: int) -> list[int]:
+    return counts[::tensor_parallel_size]
 
 
 def _mtp_hidden_value(attention_rank: int, *, step_idx: int) -> int:
@@ -78,6 +97,7 @@ def _validate_graph_transport(
     attention_size: int,
     stages: int,
     step_idx: int,
+    tensor_parallel_size: int,
 ) -> list[dict[str, object]]:
     import torch
     import torch.distributed as dist
@@ -94,16 +114,26 @@ def _validate_graph_transport(
             attention_size,
             step_idx=step_idx,
             stage_idx=stage_idx,
+            tensor_parallel_size=tensor_parallel_size,
         )
         for stage_idx in range(stages)
     }
     control_payload = AFDControlPayload(
         dp_metadata_list={
-            stage_idx: AFDDPMetadata(torch.tensor(counts, dtype=torch.int32))
+            stage_idx: AFDDPMetadata(
+                torch.tensor(
+                    _dp_token_counts(
+                        counts,
+                        tensor_parallel_size=tensor_parallel_size,
+                    ),
+                    dtype=torch.int32,
+                )
+            )
             for stage_idx, counts in counts_by_stage.items()
         },
         is_graph_capturing=True,
         is_warmup=False,
+        tensor_parallel_size=tensor_parallel_size,
     )
     if role == "attention":
         connector.control_plane.update_state_from_dp_metadata(control_payload)
@@ -273,6 +303,7 @@ def _validate_mtp_graph_transport(
     ffn_size: int,
     stages: int,
     step_idx: int,
+    tensor_parallel_size: int,
 ) -> list[dict[str, object]]:
     """Capture and replay the merged MTP phase on physical HCCL groups."""
 
@@ -292,16 +323,26 @@ def _validate_mtp_graph_transport(
             attention_size,
             step_idx=step_idx,
             stage_idx=stage_idx,
+            tensor_parallel_size=tensor_parallel_size,
         )
         for attention_rank, count in enumerate(stage_counts):
             attention_peer_counts[attention_rank] += count
 
     control_payload = AFDControlPayload(
         dp_metadata_list={
-            0: AFDDPMetadata(torch.tensor(attention_peer_counts, dtype=torch.int32))
+            0: AFDDPMetadata(
+                torch.tensor(
+                    _dp_token_counts(
+                        attention_peer_counts,
+                        tensor_parallel_size=tensor_parallel_size,
+                    ),
+                    dtype=torch.int32,
+                )
+            )
         },
         is_graph_capturing=True,
         is_warmup=False,
+        tensor_parallel_size=tensor_parallel_size,
     )
     if role == "attention":
         connector.control_plane.update_state_from_dp_metadata(control_payload)
@@ -343,7 +384,10 @@ def _validate_mtp_graph_transport(
                 static_hidden,
                 context,
                 num_tokens_across_dp=torch.tensor(
-                    attention_peer_counts,
+                    _dp_token_counts(
+                        attention_peer_counts,
+                        tensor_parallel_size=tensor_parallel_size,
+                    ),
                     dtype=torch.int32,
                 ),
             )
@@ -450,6 +494,7 @@ def _worker(
     enable_mtp: bool,
     graph_transport: bool,
     mtp_graph_transport: bool,
+    tensor_parallel_size: int,
     result_path: Path,
 ) -> None:
     connector = None
@@ -489,11 +534,13 @@ def _worker(
             additional_config={"afd": {"connector_extra_config": {}}},
             parallel_config=SimpleNamespace(
                 data_parallel_size=(
-                    attention_size if role == "attention" else ffn_size
+                    attention_size // tensor_parallel_size
+                    if role == "attention"
+                    else ffn_size // tensor_parallel_size
                 ),
-                data_parallel_rank=role_rank,
+                data_parallel_rank=role_rank // tensor_parallel_size,
                 prefill_context_parallel_size=1,
-                tensor_parallel_size=1,
+                tensor_parallel_size=tensor_parallel_size,
                 num_ubatches=stages,
             ),
             scheduler_config=SimpleNamespace(max_num_batched_tokens=64),
@@ -540,18 +587,26 @@ def _worker(
                     attention_size,
                     step_idx=step_idx,
                     stage_idx=stage_idx,
+                    tensor_parallel_size=tensor_parallel_size,
                 )
                 for stage_idx in range(stages)
             }
             control_payload = AFDControlPayload(
                 dp_metadata_list={
                     stage_idx: AFDDPMetadata(
-                        torch.tensor(counts, dtype=torch.int32),
+                        torch.tensor(
+                            _dp_token_counts(
+                                counts,
+                                tensor_parallel_size=tensor_parallel_size,
+                            ),
+                            dtype=torch.int32,
+                        ),
                     )
                     for stage_idx, counts in counts_by_stage.items()
                 },
                 is_graph_capturing=False,
                 is_warmup=False,
+                tensor_parallel_size=tensor_parallel_size,
             )
             if role == "attention":
                 connector.control_plane.update_state_from_dp_metadata(
@@ -696,7 +751,11 @@ def _worker(
             if not enable_mtp or mtp_graph_transport:
                 continue
 
-            mtp_counts = _mtp_token_counts(attention_size, step_idx=step_idx)
+            mtp_counts = _mtp_token_counts(
+                attention_size,
+                step_idx=step_idx,
+                tensor_parallel_size=tensor_parallel_size,
+            )
             expected_ffn_counts = _ffn_token_counts(
                 mtp_counts,
                 ffn_size=ffn_size,
@@ -722,7 +781,10 @@ def _worker(
                     hidden,
                     context,
                     num_tokens_across_dp=torch.tensor(
-                        mtp_counts,
+                        _dp_token_counts(
+                            mtp_counts,
+                            tensor_parallel_size=tensor_parallel_size,
+                        ),
                         dtype=torch.int32,
                     ),
                 )
@@ -821,6 +883,7 @@ def _worker(
                     attention_size=attention_size,
                     stages=stages,
                     step_idx=2,
+                    tensor_parallel_size=tensor_parallel_size,
                 )
             )
         if mtp_graph_transport:
@@ -833,6 +896,7 @@ def _worker(
                     ffn_size=ffn_size,
                     stages=stages,
                     step_idx=2,
+                    tensor_parallel_size=tensor_parallel_size,
                 )
             )
 
@@ -892,6 +956,7 @@ def main() -> None:
     parser.add_argument("--enable-mtp", action="store_true")
     parser.add_argument("--graph-transport", action="store_true")
     parser.add_argument("--mtp-graph-transport", action="store_true")
+    parser.add_argument("--tensor-parallel-size", type=int, choices=(1, 2), default=1)
     parser.add_argument("--timeout", type=float, default=300)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -906,6 +971,13 @@ def main() -> None:
         parser.error("--mtp-graph-transport requires --graph-transport")
     if attention_size < ffn_size or attention_size % ffn_size != 0:
         parser.error("Attention count must be an integer multiple of FFN count")
+    if (
+        attention_size % args.tensor_parallel_size != 0
+        or ffn_size % args.tensor_parallel_size != 0
+    ):
+        parser.error("Attention and FFN counts must be divisible by TP size")
+    if args.tensor_parallel_size == 2 and attention_size != ffn_size:
+        parser.error("TP2 component validation requires equal Attention and FFN counts")
     all_devices = [*args.attention_devices, *args.ffn_devices]
     if len(set(all_devices)) != len(all_devices):
         parser.error("Attention and FFN device lists must not overlap")
@@ -941,6 +1013,7 @@ def main() -> None:
                 args.enable_mtp,
                 args.graph_transport,
                 args.mtp_graph_transport,
+                args.tensor_parallel_size,
                 result_paths[(role, role_rank)],
             ),
             name=f"hccl-p2p-{role}-{role_rank}",
@@ -992,6 +1065,11 @@ def main() -> None:
         "topology": {
             "attention_size": attention_size,
             "ffn_size": ffn_size,
+            "tensor_parallel_size": args.tensor_parallel_size,
+            "attention_data_parallel_size": (
+                attention_size // args.tensor_parallel_size
+            ),
+            "ffn_data_parallel_size": ffn_size // args.tensor_parallel_size,
             "ratio": attention_size // ffn_size,
             "attention_devices": args.attention_devices,
             "ffn_devices": args.ffn_devices,
