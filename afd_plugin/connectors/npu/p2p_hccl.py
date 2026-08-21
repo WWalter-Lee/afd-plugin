@@ -32,6 +32,7 @@ import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
 from torch.distributed.distributed_c10d import ProcessGroup
 from vllm.forward_context import DPMetadata, get_forward_context
+from vllm_ascend.utils import is_dspark_config
 
 from afd_plugin.config import AFDConfig
 from afd_plugin.connectors.base import (
@@ -217,6 +218,7 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         self.requires_mtp = (
             speculative_config is not None
             and getattr(speculative_config, "method", None) == "mtp"
+            and not is_dspark_config(vllm_config)
         )
         self.vocab_size = int(vllm_config.model_config.hf_config.vocab_size)
         self.num_stages = max(
