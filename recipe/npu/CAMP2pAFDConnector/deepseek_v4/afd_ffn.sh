@@ -104,10 +104,6 @@ case "$EXECUTION_MODE" in
     EXECUTION_ARGS=(--enforce-eager)
     ;;
   full-decode-only)
-    if [[ "$AFD_CONNECTOR" == "P2pHcclAFDConnector" && "$ATTENTION_RANKS" != "$FFN_RANKS" ]]; then
-      echo "DeepSeek-V4 P2pHcclAFDConnector graph execution requires equal Attention/FFN ranks" >&2
-      exit 2
-    fi
     read -r -a CAPTURE_SIZE_ARGS <<<"$CUDAGRAPH_CAPTURE_SIZES"
     EXECUTION_ARGS=(
       --max-cudagraph-capture-size "$MAX_CUDAGRAPH_CAPTURE_SIZE"

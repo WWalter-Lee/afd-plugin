@@ -619,15 +619,6 @@ def _validate_execution_topology(
         raise ValueError(
             "DeepSeek-V4 graph U2 requires P2pHcclAFDConnector",
         )
-    if (
-        connector == "P2pHcclAFDConnector"
-        and execution_mode == "full-decode-only"
-        and topology["attention_ranks"] != topology["ffn_ranks"]
-    ):
-        raise ValueError(
-            "P2pHcclAFDConnector full-decode-only execution requires equal "
-            "Attention and FFN ranks",
-        )
     if not enable_mtp:
         return
     if connector != "P2pHcclAFDConnector":

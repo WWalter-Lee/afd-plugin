@@ -31,6 +31,7 @@ def _vllm_config(
     dsv4: bool = True,
     max_num_batched_tokens: int = 16,
     mtp: bool = False,
+    enforce_eager: bool = True,
 ):
     return SimpleNamespace(
         additional_config={"afd": {"connector_extra_config": {}}},
@@ -46,6 +47,7 @@ def _vllm_config(
         ),
         model_config=SimpleNamespace(
             dtype=torch.bfloat16,
+            enforce_eager=enforce_eager,
             hf_config=SimpleNamespace(
                 architectures=["DeepseekV4ForCausalLM"] if dsv4 else [],
                 hidden_size=4,
@@ -1210,6 +1212,52 @@ def test_p2p_hccl_ffn_aggregates_unequal_peer_payloads_and_splits_output(
     assert torch.equal(sent[1][0], ffn_output[4:])
 
 
+def test_p2p_hccl_ffn_graph_uses_each_unequal_peer_slice(monkeypatch):
+    connector = _connector(
+        role="ffn",
+        role_rank=1,
+        attention=4,
+        ffn=2,
+        max_num_batched_tokens=12,
+    )
+    connector.is_graph_capturing = True
+    connector.dp_metadata_list = {
+        0: AFDDPMetadata(torch.tensor([2, 3, 4, 5], dtype=torch.int32)),
+    }
+    connector.hidden_recv_buffers[0] = torch.empty((9, 4), dtype=torch.bfloat16)
+    graph_calls = []
+    monkeypatch.setattr(hccl_module.torch.compiler, "is_compiling", lambda: False)
+
+    def graph_recv(tensor, *, src, group):
+        graph_calls.append(("recv", src, tuple(tensor.shape), group))
+
+    def graph_send(tensor, *, dst, group):
+        graph_calls.append(("send", dst, tuple(tensor.shape), group))
+
+    monkeypatch.setattr(hccl_module, "_graph_hccl_recv", graph_recv)
+    monkeypatch.setattr(hccl_module, "_graph_hccl_send", graph_send)
+    monkeypatch.setattr(
+        hccl_module.dist,
+        "recv",
+        lambda *_args, **_kwargs: pytest.fail("capture must not use dist.recv"),
+    )
+    monkeypatch.setattr(
+        hccl_module.dist,
+        "send",
+        lambda *_args, **_kwargs: pytest.fail("capture must not use dist.send"),
+    )
+
+    payload = connector.recv_attn_output(ubatch_idx=0, layer_idx=1)
+    connector.send_ffn_output(payload.hidden_states, payload.context)
+
+    assert graph_calls == [
+        ("recv", 4, (4, 4), connector.data_pg_list[0]),
+        ("recv", 5, (5, 4), connector.data_pg_list[0]),
+        ("send", 4, (4, 4), connector.data_pg_list[0]),
+        ("send", 5, (5, 4), connector.data_pg_list[0]),
+    ]
+
+
 def test_p2p_hccl_ffn_send_uses_matching_stage_and_attention_rank(monkeypatch):
     connector = _connector(role="ffn", num_ubatches=2)
     sent = []
@@ -1547,6 +1595,32 @@ def test_p2p_hccl_partial_init_failure_destroys_created_groups(monkeypatch):
     assert connector.data_pg_list == []
     assert connector.ids_pg_list == []
     assert connector.is_initialized is False
+
+
+def test_p2p_hccl_graph_init_registers_hccl_graph_ops_before_groups(monkeypatch):
+    connector = P2pHcclAFDConnector(
+        0,
+        0,
+        _vllm_config(enforce_eager=False),
+        _afd_config(role="attention"),
+        0,
+    )
+    calls = []
+    monkeypatch.setattr(
+        hccl_module,
+        "_ensure_graph_hccl_ops_registered",
+        lambda: calls.append("register"),
+    )
+    monkeypatch.setattr(
+        hccl_module,
+        "init_afd_process_group",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("stop after register")),
+    )
+
+    with pytest.raises(RuntimeError, match="stop after register"):
+        connector.init_afd_connector()
+
+    assert calls == ["register"]
 
 
 @pytest.mark.parametrize("input_ids", [[-2], [32]])

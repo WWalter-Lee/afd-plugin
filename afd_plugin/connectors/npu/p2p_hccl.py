@@ -107,6 +107,29 @@ def _graph_hccl_recv(
     # ### PATCH END: avoid the torch-npu dynamic-shape tracing guard
 
 
+def _ensure_graph_hccl_ops_registered() -> None:
+    if hasattr(torch.ops.npu_define, "_send") and hasattr(
+        torch.ops.npu_define,
+        "_recv",
+    ):
+        return
+
+    # torch-npu 2.10.0.post2 registers these ops from its npugraph_ex package.
+    # Service compilation normally imports it first, but connector initialization
+    # must not depend on that incidental order.
+    from torch_npu.dynamo.npugraph_ex.ops import (  # noqa: F401
+        _hcom_send_recv,
+    )
+
+    if not hasattr(torch.ops.npu_define, "_send") or not hasattr(
+        torch.ops.npu_define,
+        "_recv",
+    ):
+        raise RuntimeError(
+            "torch-npu did not register npu_define HCCL send/recv Graph ops",
+        )
+
+
 @dataclass(slots=True)
 class HCCLP2PTransferState(AFDTransferState):
     """State retained between one FFN receive and its matching send."""
@@ -263,6 +286,9 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         # Importing torch_npu registers the HCCL backend. This connector does
         # not import or require the afd_ascend custom-op extension.
         import torch_npu  # noqa: F401
+
+        if not bool(getattr(self.vllm_config.model_config, "enforce_eager", True)):
+            _ensure_graph_hccl_ops_registered()
 
         timeout = timedelta(minutes=30)
         try:

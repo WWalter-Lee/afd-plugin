@@ -16,13 +16,13 @@ Supported execution boundary:
 - A8F8 one-to-one deployment and A2F1/A4F2 component topologies;
 - integer-multiple topology contract `A >= F` and `A % F == 0`;
 - eager U1 or eager U2, including the integer-multiple topologies above;
-- `FULL_DECODE_ONLY` Graph U1 or U2 for equal Attention/FFN rank counts;
+- `FULL_DECODE_ONLY` Graph U1 or U2 for equal or integer-multiple rank counts;
 - eager U1 or U2 + MTP for equal or integer-multiple Attention/FFN rank counts,
   one MTP layer, and one speculative token;
-- target Graph U1 or U2 + eager draft MTP for equal Attention/FFN rank counts;
-- Graph with unequal Attention/FFN ranks, full draft Graph, multiple
-  speculative tokens, PD, sequence parallelism, and Attention-side gate are
-  disabled.
+- target Graph U1 or U2 + eager draft MTP for equal or integer-multiple rank
+  counts;
+- full draft Graph, multiple speculative tokens, PD, sequence parallelism,
+  and Attention-side gate are disabled.
 
 The public communication API remains synchronous: every eager transfer still
 calls blocking `torch.distributed.send/recv`. Eager U2 additionally uses
@@ -119,11 +119,13 @@ python recipe/npu/P2pHcclAFDConnector/deepseek_v4/run_validation.py \
   --output-dir /mnt/workspace/validation/dsv4_afd_hccl_p2p_u2_$(date +%Y%m%d_%H%M%S)
 ```
 
-The HCCL connector rejects Graph with unequal rank counts, Graph U3, `A < F`,
-and non-integer A/F ratios. MTP supports eager integer-multiple topologies and
-rejects full draft Graph and more than one speculative token. The shared validator records
-the selected connector in `runtime.json` and preserves the same golden,
-lifecycle, fatal-log, and NPU cleanup gates used by the CAMP2P baseline.
+The HCCL connector supports Graph U1/U2 for integer-multiple topologies and
+rejects Graph U3, `A < F`, and non-integer A/F ratios. MTP supports eager or
+target Graph with an eager draft on integer-multiple topologies, and rejects
+full draft Graph and more than one speculative token. The shared validator
+records the selected connector in `runtime.json` and preserves the same
+golden, lifecycle, fatal-log, and NPU cleanup gates used by the CAMP2P
+baseline.
 
 The data path uses blocking HCCL point-to-point API calls. Under eager U2,
 events connect Attention compute, A2F send, F2A receive, FFN receive, FFN
@@ -332,9 +334,14 @@ python tools/dsv4/validate_hccl_p2p_roundtrip.py \
 
 python tools/dsv4/validate_hccl_p2p_roundtrip.py \
   --attention-devices 0,1,2,3 --ffn-devices 8,9 \
-  --stages 2 --steps 2 --port 29851 \
+  --stages 2 --steps 2 --graph-transport --port 29851 \
   --output /mnt/workspace/validation/dsv4_afd_a3_p5_a4f2/summary.json
 ```
+
+`--graph-transport` first runs the eager two-step regression, then captures
+both stages in one NPUGraph and replays it after changing the static input
+values. Input IDs remain graph-external. Add `--enable-mtp` to combine target
+Graph with the eager MTP phase.
 
 Use `python -m pytest`, not the venv's `pytest` entry point: the entry point may
 retain a stale shebang after the fixed environment is relocated.
@@ -344,6 +351,9 @@ Validated A3-P5 component evidence:
 ```text
 /mnt/workspace/validation/dsv4_afd_a3_p5_hccl_a2f1_20260817_1055/summary.json
 /mnt/workspace/validation/dsv4_afd_a3_p5_hccl_a4f2_20260817_1105/summary.json
+/mnt/workspace/validation/dsv4_afd_v023_hccl_graph_unequal_a2f1_20260821_m6_retry3/summary.json
+/mnt/workspace/validation/dsv4_afd_v023_hccl_graph_unequal_a4f2_20260821_m6/summary.json
+/mnt/workspace/validation/dsv4_afd_v023_hccl_graph_mtp_unequal_a4f2_20260821_m6/summary.json
 ```
 
 ## A3 unequal-topology model capacity result

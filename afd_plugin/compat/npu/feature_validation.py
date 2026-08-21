@@ -198,14 +198,6 @@ def _fail_if_unsupported_deepseek_v4_features(
         if num_mtp_layers != 1:
             raise RuntimeError("DeepSeek-V4 AFD MTP supports exactly one MTP layer")
     if not vllm_config.model_config.enforce_eager:
-        if (
-            afd_config.connector == "P2pHcclAFDConnector"
-            and afd_config.num_attention_ranks != afd_config.num_ffn_ranks
-        ):
-            raise RuntimeError(
-                "DeepSeek-V4 P2pHcclAFDConnector graph execution requires equal "
-                "Attention and FFN ranks"
-            )
         cudagraph_mode = getattr(
             getattr(vllm_config, "compilation_config", None),
             "cudagraph_mode",

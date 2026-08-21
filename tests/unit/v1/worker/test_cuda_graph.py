@@ -120,7 +120,7 @@ def test_make_ffn_graph_key_matches_original_shape():
     )
 
 
-def test_make_ffn_graph_key_can_aggregate_attention_counts_to_ffn_counts():
+def test_make_ffn_graph_key_retains_attention_peer_counts():
     metadata = SimpleNamespace(num_tokens_across_dp_cpu=[12] * 8)
 
     assert make_ffn_graph_key(
@@ -128,7 +128,27 @@ def test_make_ffn_graph_key_can_aggregate_attention_counts_to_ffn_counts():
         attention_size=8,
         ffn_size=4,
         fallback=24,
-    ) == ((0, (24, 24, 24, 24)),)
+    ) == ((0, (12, 12, 12, 12, 12, 12, 12, 12)),)
+
+
+def test_make_ffn_graph_key_separates_equal_aggregates_with_different_peers():
+    first = SimpleNamespace(num_tokens_across_dp_cpu=[2, 3, 4, 5])
+    second = SimpleNamespace(num_tokens_across_dp_cpu=[1, 4, 3, 6])
+
+    first_key = make_ffn_graph_key(
+        {0: first},
+        attention_size=4,
+        ffn_size=2,
+    )
+    second_key = make_ffn_graph_key(
+        {0: second},
+        attention_size=4,
+        ffn_size=2,
+    )
+
+    assert first_key == ((0, (2, 3, 4, 5)),)
+    assert second_key == ((0, (1, 4, 3, 6)),)
+    assert first_key != second_key
 
 
 # --- TP expansion tests ---

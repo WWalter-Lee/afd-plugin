@@ -136,7 +136,7 @@ def test_dsv4_role_scripts_offer_u1_graph_and_eager_u2():
         assert "MTP requires P2pHcclAFDConnector" in script
         assert "MTP target Graph/U2 is not validated" not in script
         assert "MTP requires equal Attention/FFN ranks" not in script
-        assert "graph execution requires equal Attention/FFN ranks" in script
+        assert "graph execution requires equal Attention/FFN ranks" not in script
         assert "MTP supports exactly one speculative token" in script
         assert "graph U2 requires P2pHcclAFDConnector" in script
         assert "U2 currently supports only EXECUTION_MODE=eager" not in script
@@ -286,7 +286,7 @@ def test_dsv4_hccl_topology_rejects_invalid_deployment(
         )
 
 
-def test_dsv4_hccl_graph_topology_requires_equal_roles():
+def test_dsv4_hccl_graph_topology_accepts_integer_multiple_roles():
     runner = _load_runner()
 
     runner._validate_execution_topology(
@@ -295,12 +295,11 @@ def test_dsv4_hccl_graph_topology_requires_equal_roles():
         u_batches=2,
         topology={"attention_ranks": 8, "ffn_ranks": 8},
     )
-    with pytest.raises(ValueError, match="requires equal Attention and FFN"):
-        runner._validate_execution_topology(
-            connector="P2pHcclAFDConnector",
-            execution_mode="full-decode-only",
-            topology={"attention_ranks": 8, "ffn_ranks": 4},
-        )
+    runner._validate_execution_topology(
+        connector="P2pHcclAFDConnector",
+        execution_mode="full-decode-only",
+        topology={"attention_ranks": 8, "ffn_ranks": 4},
+    )
 
     runner._validate_execution_topology(
         connector="P2pHcclAFDConnector",

@@ -108,25 +108,24 @@ def make_ffn_graph_key(
     ffn_size: int | None = None,
     fallback: int = 1,
 ) -> tuple[tuple[int, tuple]]:
-    """Extract the AFD FFN graph hashable key from DP metadata."""
+    """Extract the AFD FFN graph key, including exact Attention peer shapes."""
 
     key_parts: list[tuple[int, tuple]] = []
     for stage_idx, metadata in sorted(dp_metadata_list.items()):
         values = getattr(metadata, "num_tokens_across_dp_cpu", None)
         if values is None:
-            if _use_ffn_aggregated_key(attention_size, ffn_size):
+            if _use_ffn_peer_layout_key(attention_size, ffn_size):
                 values_tuple = tuple(
-                    max(1, int(fallback)) for _ in range(int(ffn_size))
+                    max(1, int(fallback)) for _ in range(int(attention_size))
                 )
             else:
                 values_tuple = (repr(metadata),)
         else:
             values_tuple = _metadata_values_tuple(values)
-            if _use_ffn_aggregated_key(attention_size, ffn_size):
-                values_tuple = _aggregate_ffn_values_tuple(
+            if _use_ffn_peer_layout_key(attention_size, ffn_size):
+                values_tuple = _expand_attention_values_tuple(
                     values_tuple,
                     attention_size=int(attention_size),
-                    ffn_size=int(ffn_size),
                     fallback=int(fallback),
                 )
         key_parts.append((int(stage_idx), values_tuple))
@@ -161,7 +160,7 @@ def _metadata_values_tuple(values: object) -> tuple[int, ...]:
         return (int(values),)
 
 
-def _use_ffn_aggregated_key(
+def _use_ffn_peer_layout_key(
     attention_size: int | None,
     ffn_size: int | None,
 ) -> bool:
@@ -173,11 +172,10 @@ def _use_ffn_aggregated_key(
     )
 
 
-def _aggregate_ffn_values_tuple(
+def _expand_attention_values_tuple(
     values: tuple[int, ...],
     *,
     attention_size: int,
-    ffn_size: int,
     fallback: int,
 ) -> tuple[int, ...]:
     # Expand DP-level values to AFD-level when TP > 1.
@@ -190,12 +188,10 @@ def _aggregate_ffn_values_tuple(
         tp_size = attention_size // len(values)
         expanded = tuple(values[i // tp_size] for i in range(attention_size))
     if len(expanded) < attention_size:
-        return tuple(max(1, int(fallback)) for _ in range(ffn_size))
-    group_size = attention_size // ffn_size
-    return tuple(
-        max(1, sum(expanded[idx * group_size : (idx + 1) * group_size]))
-        for idx in range(ffn_size)
-    )
+        return tuple(max(1, int(fallback)) for _ in range(attention_size))
+    # Graph capture records one HCCL recv/send per Attention peer. Retaining only
+    # the FFN aggregate would alias different peer slice shapes with equal sums.
+    return tuple(max(1, int(value)) for value in expanded[:attention_size])
 
 
 __all__ = [

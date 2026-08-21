@@ -77,8 +77,6 @@ case "${EXECUTION_MODE}" in
     ;;
   full-decode-only)
     [[ "${U_BATCHES}" == "1" ]] || die "Graph requires U1"
-    [[ "${ATTENTION_RANKS}" == "${FFN_RANKS}" ]] \
-      || die "Graph requires equal A/F ranks"
     read -r -a capture_sizes <<<"${CUDAGRAPH_CAPTURE_SIZES}"
     execution_args=(
       --max-cudagraph-capture-size "${MAX_CUDAGRAPH_CAPTURE_SIZE}"

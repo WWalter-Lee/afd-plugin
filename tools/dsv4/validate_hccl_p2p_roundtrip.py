@@ -70,6 +70,200 @@ def _ffn_token_counts(counts: list[int], *, ffn_size: int) -> list[int]:
     return [sum(counts[rank * ratio : (rank + 1) * ratio]) for rank in range(ffn_size)]
 
 
+def _validate_graph_transport(
+    *,
+    connector,
+    role: str,
+    role_rank: int,
+    attention_size: int,
+    stages: int,
+    step_idx: int,
+) -> list[dict[str, object]]:
+    import torch
+    import torch.distributed as dist
+
+    from afd_plugin.connectors.metadata import (
+        AFDControlPayload,
+        AFDDPMetadata,
+        AFDTransferContext,
+        AFDTransferMetadata,
+    )
+
+    counts_by_stage = {
+        stage_idx: _token_counts(
+            attention_size,
+            step_idx=step_idx,
+            stage_idx=stage_idx,
+        )
+        for stage_idx in range(stages)
+    }
+    control_payload = AFDControlPayload(
+        dp_metadata_list={
+            stage_idx: AFDDPMetadata(torch.tensor(counts, dtype=torch.int32))
+            for stage_idx, counts in counts_by_stage.items()
+        },
+        is_graph_capturing=True,
+        is_warmup=False,
+    )
+    if role == "attention":
+        connector.control_plane.update_state_from_dp_metadata(control_payload)
+        connector.control_plane.send_dp_metadata_list(control_payload)
+    else:
+        received_control = connector.control_plane.recv_dp_metadata_list()
+        connector.control_plane.update_state_from_dp_metadata(received_control)
+
+    static_hidden: dict[int, torch.Tensor] = {}
+    returned_buffers: dict[int, torch.Tensor] = {}
+    received_ids: dict[int, list[int]] = {}
+    for stage_idx, counts in counts_by_stage.items():
+        if role == "attention":
+            num_tokens = counts[role_rank]
+            input_ids = torch.tensor(
+                _input_id_values(
+                    role_rank,
+                    num_tokens,
+                    step_idx=step_idx,
+                    stage_idx=stage_idx,
+                ),
+                dtype=torch.int32,
+                device="npu:0",
+            )
+            connector.send_input_ids(input_ids, ubatch_idx=stage_idx)
+            static_hidden[stage_idx] = torch.full(
+                (num_tokens, 16),
+                _hidden_value(role_rank, step_idx=step_idx, stage_idx=stage_idx),
+                dtype=torch.bfloat16,
+                device="npu:0",
+            )
+            returned_buffers[stage_idx] = torch.empty_like(static_hidden[stage_idx])
+            continue
+
+        first_attention_rank = role_rank * connector.ratio
+        peer_counts = counts[
+            first_attention_rank : first_attention_rank + connector.ratio
+        ]
+        ids = connector.recv_input_ids(sum(peer_counts), ubatch_idx=stage_idx)
+        received_ids[stage_idx] = ids.cpu().tolist()
+
+    dist.barrier(group=connector.p2p_pg)
+    graph = torch.npu.NPUGraph()
+    connector.is_graph_capturing = True
+    with torch.npu.graph(graph, pool=torch.npu.graph_pool_handle()):
+        if role == "attention":
+            for stage_idx, hidden in static_hidden.items():
+                context = AFDTransferContext(
+                    metadata=AFDTransferMetadata.create_attention_metadata(
+                        layer_idx=1,
+                        stage_idx=stage_idx,
+                        seq_len=int(hidden.shape[0]),
+                    ),
+                )
+                connector.send_attn_output(hidden, context)
+                connector.recv_ffn_output(
+                    returned_buffers[stage_idx],
+                    ubatch_idx=stage_idx,
+                )
+        else:
+            for stage_idx in counts_by_stage:
+                payload = connector.recv_attn_output(
+                    ubatch_idx=stage_idx,
+                    layer_idx=1,
+                )
+                connector.send_ffn_output(
+                    payload.hidden_states + 1,
+                    payload.context,
+                    ubatch_idx=stage_idx,
+                )
+    connector.is_graph_capturing = False
+    torch.npu.synchronize()
+    dist.barrier(group=connector.p2p_pg)
+
+    checks: list[dict[str, object]] = []
+    if role == "attention":
+        for stage_idx, hidden in static_hidden.items():
+            checks.append(
+                {
+                    "phase": "graph_capture",
+                    "stage": stage_idx,
+                    "tokens": int(hidden.shape[0]),
+                    "captured": True,
+                }
+            )
+    else:
+        first_attention_rank = role_rank * connector.ratio
+        for stage_idx, counts in counts_by_stage.items():
+            expected_ids: list[int] = []
+            for attention_rank in range(
+                first_attention_rank,
+                first_attention_rank + connector.ratio,
+            ):
+                expected_ids.extend(
+                    _input_id_values(
+                        attention_rank,
+                        counts[attention_rank],
+                        step_idx=step_idx,
+                        stage_idx=stage_idx,
+                    )
+                )
+            if received_ids[stage_idx] != expected_ids:
+                raise AssertionError(
+                    f"graph-external input IDs mismatch for ffn={role_rank} "
+                    f"stage={stage_idx}"
+                )
+            checks.append(
+                {
+                    "phase": "graph_capture",
+                    "stage": stage_idx,
+                    "peer_tokens": counts[
+                        first_attention_rank : first_attention_rank + connector.ratio
+                    ],
+                    "input_ids_external": True,
+                    "fan_in_out": True,
+                }
+            )
+
+    replay_step_idx = step_idx + 7
+    if role == "attention":
+        for stage_idx, hidden in static_hidden.items():
+            hidden.fill_(
+                _hidden_value(
+                    role_rank,
+                    step_idx=replay_step_idx,
+                    stage_idx=stage_idx,
+                )
+            )
+    dist.barrier(group=connector.p2p_pg)
+    graph.replay()
+    torch.npu.synchronize()
+    dist.barrier(group=connector.p2p_pg)
+
+    if role == "attention":
+        for stage_idx, hidden in static_hidden.items():
+            if not torch.equal(returned_buffers[stage_idx].cpu(), (hidden + 1).cpu()):
+                raise AssertionError(
+                    "graph replay round-trip mismatch for "
+                    f"attention={role_rank} stage={stage_idx}"
+                )
+            checks.append(
+                {
+                    "phase": "graph_replay",
+                    "stage": stage_idx,
+                    "tokens": int(hidden.shape[0]),
+                    "updated_input": True,
+                    "roundtrip": True,
+                }
+            )
+    else:
+        checks.append(
+            {
+                "phase": "graph_replay",
+                "stages": stages,
+                "fan_in_out": True,
+            }
+        )
+    return checks
+
+
 def _worker(
     role: str,
     role_rank: int,
@@ -80,6 +274,7 @@ def _worker(
     stages: int,
     steps: int,
     enable_mtp: bool,
+    graph_transport: bool,
     result_path: Path,
 ) -> None:
     connector = None
@@ -94,6 +289,7 @@ def _worker(
         os.environ["HCCL_EXEC_TIMEOUT"] = "0"
 
         import torch
+        import torch.distributed as dist
         import torch_npu  # noqa: F401
 
         from afd_plugin.config import AFDConfig
@@ -106,6 +302,14 @@ def _worker(
         from afd_plugin.connectors.npu.p2p_hccl import P2pHcclAFDConnector
 
         torch.npu.set_device(0)
+        if graph_transport:
+            world_rank = role_rank if role == "ffn" else ffn_size + role_rank
+            dist.init_process_group(
+                backend="gloo",
+                init_method=f"tcp://127.0.0.1:{port}",
+                world_size=attention_size + ffn_size,
+                rank=world_rank,
+            )
         vllm_config = SimpleNamespace(
             additional_config={"afd": {"connector_extra_config": {}}},
             parallel_config=SimpleNamespace(
@@ -120,6 +324,7 @@ def _worker(
             scheduler_config=SimpleNamespace(max_num_batched_tokens=64),
             model_config=SimpleNamespace(
                 dtype=torch.bfloat16,
+                enforce_eager=not graph_transport,
                 hf_config=SimpleNamespace(
                     architectures=["DeepseekV4ForCausalLM"],
                     hidden_size=16,
@@ -425,6 +630,18 @@ def _worker(
                 }
             )
 
+        if graph_transport:
+            checks.extend(
+                _validate_graph_transport(
+                    connector=connector,
+                    role=role,
+                    role_rank=role_rank,
+                    attention_size=attention_size,
+                    stages=stages,
+                    step_idx=2,
+                )
+            )
+
         torch.npu.synchronize()
         result.update(passed=True, checks=checks)
     except BaseException:
@@ -436,8 +653,21 @@ def _worker(
             except BaseException:
                 result["passed"] = False
                 result["close_error"] = traceback.format_exc()
+        default_group_closed = True
+        try:
+            import torch.distributed as dist
+
+            if dist.is_initialized():
+                dist.destroy_process_group()
+            default_group_closed = not dist.is_initialized()
+        except BaseException:
+            default_group_closed = False
+            result["passed"] = False
+            result["default_group_close_error"] = traceback.format_exc()
         result["closed"] = bool(
-            connector is not None and not connector.is_initialized,
+            connector is not None
+            and not connector.is_initialized
+            and default_group_closed,
         )
         result_path.write_text(
             json.dumps(result, indent=2, sort_keys=True) + "\n",
@@ -466,6 +696,7 @@ def main() -> None:
     parser.add_argument("--stages", type=int, choices=(1, 2), default=2)
     parser.add_argument("--steps", type=int, default=2)
     parser.add_argument("--enable-mtp", action="store_true")
+    parser.add_argument("--graph-transport", action="store_true")
     parser.add_argument("--timeout", type=float, default=300)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -509,6 +740,7 @@ def main() -> None:
                 args.stages,
                 args.steps,
                 args.enable_mtp,
+                args.graph_transport,
                 result_paths[(role, role_rank)],
             ),
             name=f"hccl-p2p-{role}-{role_rank}",
@@ -568,6 +800,7 @@ def main() -> None:
         "stages": args.stages,
         "steps": args.steps,
         "enable_mtp": args.enable_mtp,
+        "graph_transport": args.graph_transport,
         "results": results,
         "exit_codes": exit_codes,
     }

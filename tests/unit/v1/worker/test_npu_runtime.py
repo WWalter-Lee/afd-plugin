@@ -2637,7 +2637,7 @@ def test_npu_ffn_runner_replays_acl_graph_when_key_exists():
     assert runner.connector.ffn_outputs == []
 
 
-def test_npu_ffn_runner_graph_key_uses_ffn_aggregated_token_counts():
+def test_npu_ffn_runner_graph_key_uses_exact_attention_peer_token_counts():
     runner = _new_ffn_runner()
     runner.connector = _FakeFFNConnector(attn_size=8, ffn_size=4)
     runner.max_num_tokens = 24
@@ -2647,7 +2647,7 @@ def test_npu_ffn_runner_graph_key_uses_ffn_aggregated_token_counts():
         "off",
         0,
         False,
-        (0, (24, 24, 24, 24)),
+        (0, (12, 12, 12, 12, 12, 12, 12, 12)),
     )
 
 
@@ -3497,7 +3497,7 @@ def test_dsv4_feature_validation_accepts_graph_target_with_eager_mtp_draft():
     fail_if_unsupported_npu_afd_features(config)
 
 
-def test_dsv4_feature_validation_rejects_hccl_p2p_graph_a2f1():
+def test_dsv4_feature_validation_accepts_hccl_p2p_graph_a2f1():
     config = _dsv4_config(cudagraph_mode="FULL_DECODE_ONLY")
     config.model_config.enforce_eager = False
     config.additional_config["afd"].update(
@@ -3506,8 +3506,7 @@ def test_dsv4_feature_validation_rejects_hccl_p2p_graph_a2f1():
         num_ffn_ranks=1,
     )
 
-    with pytest.raises(RuntimeError, match="graph execution requires equal"):
-        fail_if_unsupported_npu_afd_features(config)
+    fail_if_unsupported_npu_afd_features(config)
 
 
 @pytest.mark.parametrize(
@@ -3640,7 +3639,7 @@ def test_dsv4_feature_validation_accepts_eager_mtp_a2f1():
     fail_if_unsupported_npu_afd_features(config)
 
 
-def test_dsv4_feature_validation_rejects_graph_mtp_a2f1():
+def test_dsv4_feature_validation_accepts_graph_mtp_a2f1():
     config = _dsv4_config(
         cudagraph_mode="FULL_DECODE_ONLY",
         speculative_config=_mtp_speculative_config(enforce_eager=True),
@@ -3652,8 +3651,7 @@ def test_dsv4_feature_validation_rejects_graph_mtp_a2f1():
         num_ffn_ranks=1,
     )
 
-    with pytest.raises(RuntimeError, match="graph execution requires equal"):
-        fail_if_unsupported_npu_afd_features(config)
+    fail_if_unsupported_npu_afd_features(config)
 
 
 def test_dsv4_feature_validation_accepts_mtp_target_graph_u2():
