@@ -33,6 +33,8 @@ from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec, KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.ubatch_utils import UBatchSlices
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -115,6 +117,25 @@ logger = init_logger(__name__)
 _ASCEND_COMMON_METADATA_FIELDS = frozenset(
     field.name for field in dataclass_fields(AscendCommonAttentionMetadata)
 )
+
+
+class _AFDMTPPhaseAwareRunnable:
+    """Announce a live draft phase at the exact runnable boundary."""
+
+    def __init__(self, runnable: ACLGraphWrapper, callback: Any) -> None:
+        self._runnable = runnable
+        self._callback = callback
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        restore_runtime_mode = self._callback(self._runnable)
+        try:
+            return self._runnable(*args, **kwargs)
+        finally:
+            if restore_runtime_mode is not None:
+                get_forward_context().cudagraph_runtime_mode = restore_runtime_mode
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._runnable, name)
 
 
 def _new_ubatch_dsa_ratio_metadata(
@@ -240,6 +261,9 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         self._afd_transaction_counter = 0
         self._afd_async_moe_ubatch_metadata = None
         self._afd_live_execution = False
+        self._afd_in_mtp_proposal = False
+        self._afd_mtp_phase_announced = False
+        self._afd_mtp_graph_replayed = False
         self.ubatch_slices = None
         self._afd_unpadded_tokens_across_dp: torch.Tensor | None = None
         self._afd_request_boundary_stage_counts_across_dp: (
@@ -1664,6 +1688,9 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             dp_metadata_list=dp_metadata_list,
             is_graph_capturing=is_graph_capturing,
             is_warmup=is_warmup,
+            mtp_phase_control_enabled=bool(
+                getattr(self, "_afd_live_execution", False),
+            ),
         )
         self.connector.control_plane.update_state_from_dp_metadata(payload)
         stage_count = len(dp_metadata_list)
@@ -1729,8 +1756,116 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             if not callable(attach_connector):
                 raise RuntimeError("DSV4 AFD MTP draft model is not role-aware")
             attach_connector(self.connector)
+            self._configure_mtp_draft_graph()
         if bool(self.vllm_config.parallel_config.use_ubatching):
             self._install_ascend_ubatch_wrapper()
+
+    def _configure_mtp_draft_graph(self) -> None:
+        if self.speculative_config is None or bool(
+            getattr(self.speculative_config, "enforce_eager", False),
+        ):
+            return
+        draft_runnable = getattr(self.drafter, "_runnable", None)
+        if not isinstance(draft_runnable, ACLGraphWrapper):
+            raise RuntimeError(
+                "DSV4 AFD full draft Graph requires an ACLGraphWrapper",
+            )
+        # ### PATCH START: synchronize AFD draft graph replay.
+        # Upstream vLLM-Ascend commit 3da28f94 constructs MTP through
+        # AscendEagleProposer and exempts Eagle graph replay from the normal
+        # pre-replay synchronization. AFD inserts a remote FFN graph and HCCL
+        # boundary, so graph-parameter updates must wait for the previous
+        # replay to finish before buffers are reused.
+        draft_runnable.use_eagle = False
+        self.drafter._runnable = _AFDMTPPhaseAwareRunnable(
+            draft_runnable,
+            self._announce_live_mtp_phase,
+        )
+        # ### PATCH END: synchronize AFD draft graph replay.
+
+    def _announce_live_mtp_phase(
+        self,
+        draft_runnable: ACLGraphWrapper,
+    ) -> CUDAGraphMode | None:
+        if not bool(getattr(self, "_afd_in_mtp_proposal", False)):
+            return None
+        forward_context = get_forward_context()
+        runtime_mode = forward_context.cudagraph_runtime_mode
+        graph_requested = runtime_mode != CUDAGraphMode.NONE and runtime_mode.has_mode(
+            draft_runnable.runtime_mode,
+        )
+        graph_entry = (
+            draft_runnable.concrete_aclgraph_entries.get(
+                forward_context.batch_descriptor,
+            )
+            if graph_requested
+            else None
+        )
+        graph_replay = bool(
+            graph_entry is not None and graph_entry.aclgraph is not None,
+        )
+        restore_runtime_mode = None
+        if graph_requested and not graph_replay:
+            # Dynamic live capture cannot be paired atomically with the remote
+            # FFN process. Fall back to eager on both roles for this descriptor.
+            restore_runtime_mode = runtime_mode
+            forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
+        control_plane = self.connector.control_plane
+        send_phase_ready = getattr(control_plane, "send_mtp_phase_ready", None)
+        if not callable(send_phase_ready):
+            raise RuntimeError(
+                "DSV4 AFD MTP requires an explicit phase-aware control plane",
+            )
+        send_phase_ready(graph_replay=graph_replay)
+        self._afd_mtp_phase_announced = True
+        self._afd_mtp_graph_replayed = graph_replay
+        return restore_runtime_mode
+
+    # Upstream source: vLLM-Ascend commit 3da28f94,
+    # NPUModelRunner.propose_draft_token_ids.
+    # ### PATCH START: announce only draft phases that actually execute.
+    def propose_draft_token_ids(
+        self,
+        valid_sampled_token_ids: torch.Tensor | list[list[int]],
+        sampling_metadata: SamplingMetadata,
+        scheduler_output: SchedulerOutput,
+        spec_decode_metadata: SpecDecodeMetadata,
+        spec_decode_common_attn_metadata: AscendCommonAttentionMetadata,
+        positions: torch.Tensor,
+        num_scheduled_tokens: int,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: torch.Tensor | None = None,
+        sample_hidden_states: torch.Tensor | None = None,
+        target_model_batch_desc: BatchDescriptor | None = None,
+    ) -> list[list[int]] | None:
+        """Wait for live full-Graph draft HCCL before the next target step."""
+        self._afd_mtp_phase_announced = False
+        self._afd_mtp_graph_replayed = False
+        self._afd_in_mtp_proposal = True
+        try:
+            draft_token_ids = super().propose_draft_token_ids(
+                valid_sampled_token_ids,
+                sampling_metadata,
+                scheduler_output,
+                spec_decode_metadata,
+                spec_decode_common_attn_metadata,
+                positions,
+                num_scheduled_tokens,
+                hidden_states,
+                aux_hidden_states,
+                sample_hidden_states,
+                target_model_batch_desc,
+            )
+        finally:
+            self._afd_in_mtp_proposal = False
+        # A FULL draft graph enqueues its captured HCCL transfers asynchronously.
+        # If the following target step misses its graph and runs eager, its IDs
+        # can otherwise overtake the preceding draft header on the IDs group.
+        if self._afd_mtp_phase_announced and self._afd_mtp_graph_replayed:
+            torch.npu.current_stream().synchronize()
+        return draft_token_ids
+
+    # ### PATCH END: announce only draft phases that actually execute.
 
     def _install_ascend_ubatch_wrapper(self) -> None:
         if isinstance(self.model, AscendUBatchWrapper):

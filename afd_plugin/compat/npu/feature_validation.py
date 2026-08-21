@@ -187,11 +187,6 @@ def _fail_if_unsupported_deepseek_v4_features(
             raise RuntimeError(
                 "DeepSeek-V4 AFD MTP eager execution requires draft enforce_eager=true"
             )
-        if not target_enforce_eager and not draft_enforce_eager:
-            raise RuntimeError(
-                "DeepSeek-V4 AFD MTP target Graph currently requires draft "
-                "enforce_eager=true; draft ACL Graph is not validated"
-            )
         num_mtp_layers = int(
             getattr(vllm_config.model_config.hf_config, "num_nextn_predict_layers", 1)
         )

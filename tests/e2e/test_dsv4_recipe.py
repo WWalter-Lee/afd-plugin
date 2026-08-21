@@ -123,6 +123,7 @@ def test_dsv4_role_scripts_offer_u1_graph_and_eager_u2():
         assert 'MTP_NUM_SPECULATIVE_TOKENS="${MTP_NUM_SPECULATIVE_TOKENS:-1}"' in (
             script
         )
+        assert 'MTP_DRAFT_EXECUTION="${MTP_DRAFT_EXECUTION:-eager}"' in script
         assert 'AFD_ASYNC_SCHEDULING="${AFD_ASYNC_SCHEDULING:-auto}"' in script
         assert "SCHEDULING_ARGS=(--async-scheduling)" in script
         assert "SCHEDULING_ARGS=(--no-async-scheduling)" in script
@@ -130,7 +131,7 @@ def test_dsv4_role_scripts_offer_u1_graph_and_eager_u2():
         assert '"method":"mtp"' in script
         assert '"num_speculative_tokens":1' in script
         assert "MTP_DRAFT_ENFORCE_EAGER=true" in script
-        assert "MTP_DRAFT_ENFORCE_EAGER=false" not in script
+        assert "MTP_DRAFT_ENFORCE_EAGER=false" in script
         assert '"enforce_eager":%s' in script
         assert '"${MTP_ARGS[@]}"' in script
         assert "MTP requires P2pHcclAFDConnector" in script

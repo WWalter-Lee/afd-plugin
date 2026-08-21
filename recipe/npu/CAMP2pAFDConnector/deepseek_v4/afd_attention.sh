@@ -28,6 +28,7 @@ MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-8}"
 CUDAGRAPH_CAPTURE_SIZES="${CUDAGRAPH_CAPTURE_SIZES:-1 2 4 8}"
 ENABLE_MTP="${ENABLE_MTP:-0}"
 MTP_NUM_SPECULATIVE_TOKENS="${MTP_NUM_SPECULATIVE_TOKENS:-1}"
+MTP_DRAFT_EXECUTION="${MTP_DRAFT_EXECUTION:-eager}"
 AFD_ASYNC_SCHEDULING="${AFD_ASYNC_SCHEDULING:-auto}"
 
 export ASCEND_RT_VISIBLE_DEVICES="${ATTENTION_DEVICES:-${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}}"
@@ -73,12 +74,21 @@ case "$ENABLE_MTP" in
     fi
     case "$EXECUTION_MODE" in
       eager)
+        if [[ "$MTP_DRAFT_EXECUTION" != "eager" ]]; then
+          echo "DeepSeek-V4 eager target requires MTP_DRAFT_EXECUTION=eager" >&2
+          exit 2
+        fi
         MTP_DRAFT_ENFORCE_EAGER=true
         ;;
       full-decode-only)
-        # Keep the one-layer MTP draft eager while the target uses
-        # FULL_DECODE_ONLY Graph, including the validated U2 target path.
-        MTP_DRAFT_ENFORCE_EAGER=true
+        case "$MTP_DRAFT_EXECUTION" in
+          eager) MTP_DRAFT_ENFORCE_EAGER=true ;;
+          graph) MTP_DRAFT_ENFORCE_EAGER=false ;;
+          *)
+            echo "MTP_DRAFT_EXECUTION must be eager or graph" >&2
+            exit 2
+            ;;
+        esac
         ;;
       *)
         echo "DeepSeek-V4 MTP supports eager or full-decode-only" >&2

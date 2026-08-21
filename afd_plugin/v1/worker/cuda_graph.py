@@ -132,6 +132,39 @@ def make_ffn_graph_key(
     return tuple(key_parts)
 
 
+def make_mtp_ffn_graph_key(
+    dp_metadata_list: Mapping[int, object],
+    *,
+    attention_size: int,
+    ffn_size: int,
+    fallback: int,
+) -> tuple[int, ...]:
+    """Return the merged MTP token layout for every Attention peer.
+
+    The target decoder may use one or two stages, but the upstream proposer
+    merges their hidden states into one draft phase.  Retain the exact peer
+    layout instead of only the per-FFN aggregate: two layouts with the same
+    sum capture different HCCL slices and must not share a graph.
+    """
+
+    decoder_key = make_ffn_graph_key(
+        dp_metadata_list,
+        attention_size=attention_size,
+        ffn_size=ffn_size,
+        fallback=fallback,
+    )
+    peer_totals = [0] * int(attention_size)
+    for _, stage_values in decoder_key:
+        if len(stage_values) != int(attention_size):
+            raise ValueError(
+                "MTP graph key requires one token count per Attention peer: "
+                f"{len(stage_values)} != {attention_size}",
+            )
+        for peer_index, value in enumerate(stage_values):
+            peer_totals[peer_index] += int(value)
+    return tuple(max(1, value) for value in peer_totals)
+
+
 def graph_run_mode(
     *,
     is_warmup: bool,
@@ -201,5 +234,6 @@ __all__ = [
     "cudagraph_mode_name",
     "graph_run_mode",
     "make_ffn_graph_key",
+    "make_mtp_ffn_graph_key",
     "validate_cuda_graph_mode",
 ]

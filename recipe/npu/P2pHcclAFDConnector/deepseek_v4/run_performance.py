@@ -399,6 +399,7 @@ def _runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
         profile=args.profile,
         enable_mtp=args.enable_mtp,
         mtp_num_speculative_tokens=args.mtp_num_speculative_tokens,
+        mtp_draft_execution=getattr(args, "mtp_draft_execution", "eager"),
         topology=_a8f8_topology(args.max_num_batched_tokens),
     )
     manifest.update(
@@ -414,7 +415,11 @@ def _runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "topology_label": "A8F8",
             "npu_count": TOTAL_NPUS,
-            "mtp_draft_execution": "eager" if args.enable_mtp else None,
+            "mtp_draft_execution": (
+                getattr(args, "mtp_draft_execution", "eager")
+                if args.enable_mtp
+                else None
+            ),
             "mtp_phase_u_batches": 1 if args.enable_mtp else None,
             "reproducibility_files_sha256": {
                 str(path.relative_to(REPO_ROOT)): _file_sha256(path)
@@ -479,6 +484,7 @@ def _set_service_environment(args: argparse.Namespace) -> None:
     SHARED._set_mtp_environment(
         enable_mtp=args.enable_mtp,
         mtp_num_speculative_tokens=args.mtp_num_speculative_tokens,
+        mtp_draft_execution=getattr(args, "mtp_draft_execution", "eager"),
     )
     if not args.profile:
         return
@@ -517,6 +523,7 @@ def _validate_execution_args(args: argparse.Namespace) -> None:
         u_batches=args.u_batches,
         enable_mtp=args.enable_mtp,
         mtp_num_speculative_tokens=args.mtp_num_speculative_tokens,
+        mtp_draft_execution=getattr(args, "mtp_draft_execution", "eager"),
         topology=_a8f8_topology(args.max_num_batched_tokens),
     )
 
@@ -754,6 +761,11 @@ def _parse_args() -> argparse.Namespace:
         "--mtp-num-speculative-tokens",
         type=int,
         default=int(os.environ.get("MTP_NUM_SPECULATIVE_TOKENS", "1")),
+    )
+    parser.add_argument(
+        "--mtp-draft-execution",
+        choices=("eager", "graph"),
+        default=os.environ.get("MTP_DRAFT_EXECUTION", "eager"),
     )
     parser.add_argument("--dbo-decode-token-threshold", type=int, default=2)
     parser.add_argument("--dbo-prefill-token-threshold", type=int, default=12)

@@ -31,6 +31,7 @@ def _vllm_config(
     dsv4: bool = True,
     max_num_batched_tokens: int = 16,
     mtp: bool = False,
+    mtp_draft_enforce_eager: bool = True,
     enforce_eager: bool = True,
 ):
     return SimpleNamespace(
@@ -56,7 +57,14 @@ def _vllm_config(
                 vocab_size=32,
             ),
         ),
-        speculative_config=(SimpleNamespace(method="mtp") if mtp else None),
+        speculative_config=(
+            SimpleNamespace(
+                method="mtp",
+                enforce_eager=mtp_draft_enforce_eager,
+            )
+            if mtp
+            else None
+        ),
     )
 
 
@@ -78,6 +86,7 @@ def _connector(
     num_ubatches: int = 1,
     max_num_batched_tokens: int = 16,
     mtp: bool = False,
+    mtp_draft_enforce_eager: bool = True,
 ):
     connector = P2pHcclAFDConnector(
         0,
@@ -86,6 +95,7 @@ def _connector(
             num_ubatches=num_ubatches,
             max_num_batched_tokens=max_num_batched_tokens,
             mtp=mtp,
+            mtp_draft_enforce_eager=mtp_draft_enforce_eager,
         ),
         _afd_config(role=role, attention=attention, ffn=ffn),
         role_rank,
@@ -305,6 +315,66 @@ def test_p2p_hccl_mtp_header_uses_graph_send_while_compiling(monkeypatch):
         )
 
 
+def test_p2p_hccl_full_draft_graph_prepares_header_before_send(monkeypatch):
+    connector = _connector(
+        role="attention",
+        role_rank=3,
+        attention=4,
+        ffn=2,
+        mtp=True,
+        mtp_draft_enforce_eager=False,
+    )
+    payload = AFDControlPayload(
+        dp_metadata_list={
+            0: AFDDPMetadata(
+                num_tokens_across_dp_cpu=torch.tensor([2, 3, 4, 5]),
+            ),
+            1: AFDDPMetadata(
+                num_tokens_across_dp_cpu=torch.tensor([1, 2, 3, 4]),
+            ),
+        },
+        is_graph_capturing=True,
+        is_warmup=False,
+    )
+    connector.control_plane.update_state_from_dp_metadata(payload)
+    prepared = connector.mtp_header_buffers[0].clone()
+    sent = []
+    monkeypatch.setattr(
+        connector,
+        "_send_tensor",
+        lambda tensor, *, dst, group: sent.append((tensor.clone(), dst, group)),
+    )
+
+    connector.send_mtp_header(
+        num_tokens=9,
+        speculative_step=0,
+        num_tokens_across_dp=torch.tensor([99]),
+        stage_idx=0,
+    )
+
+    assert prepared.tolist() == [0x4D545031, 0, 9, 2, 8, 16]
+    assert len(sent) == 1
+    header, dst, group = sent[0]
+    assert torch.equal(header, prepared)
+    assert (dst, group) == (1, connector.ids_pg_list[0])
+
+
+def test_p2p_hccl_full_draft_graph_rejects_unprepared_header():
+    connector = _connector(
+        role="attention",
+        mtp=True,
+        mtp_draft_enforce_eager=False,
+    )
+
+    with pytest.raises(RuntimeError, match="was not prepared"):
+        connector.send_mtp_header(
+            num_tokens=3,
+            speculative_step=0,
+            num_tokens_across_dp=torch.tensor([3]),
+            stage_idx=0,
+        )
+
+
 def test_p2p_hccl_mtp_projects_attention_counts_to_unequal_ffn_world(
     monkeypatch,
 ):
@@ -446,6 +516,49 @@ def test_p2p_hccl_ffn_aggregates_unequal_mtp_headers_and_splits_output(
         (5, 5),
     ]
     assert connector.mtp_stage_layouts == {}
+
+
+def test_p2p_hccl_ffn_captures_mtp_headers_from_static_peer_layout(monkeypatch):
+    connector = _connector(
+        role="ffn",
+        role_rank=1,
+        attention=4,
+        ffn=2,
+        max_num_batched_tokens=12,
+        mtp=True,
+    )
+    receives = []
+    monkeypatch.setattr(
+        connector,
+        "_recv_tensor",
+        lambda tensor, *, src, group: receives.append(
+            (tensor, src, group),
+        ),
+    )
+
+    header = connector.recv_mtp_header_for_graph(
+        stage_idx=0,
+        attention_peer_counts=(2, 3, 4, 5),
+    )
+
+    assert header.num_tokens == 9
+    assert header.speculative_step == 0
+    assert header.num_tokens_across_dp.tolist() == [5, 9]
+    assert [(src, group) for _tensor, src, group in receives] == [
+        (4, connector.ids_pg_list[0]),
+        (5, connector.ids_pg_list[0]),
+    ]
+    assert connector.mtp_stage_layouts[0].seq_lens == (4, 5)
+
+
+def test_p2p_hccl_ffn_graph_header_rejects_wrong_attention_layout():
+    connector = _connector(role="ffn", mtp=True)
+
+    with pytest.raises(ValueError, match="Attention world size"):
+        connector.recv_mtp_header_for_graph(
+            stage_idx=0,
+            attention_peer_counts=(1, 2),
+        )
 
 
 def test_p2p_hccl_ffn_rejects_inconsistent_unequal_mtp_headers(monkeypatch):
@@ -1510,6 +1623,77 @@ def test_p2p_hccl_control_plane_receives_from_first_subgroup_attention(monkeypat
 
     assert connector.control_plane.recv_dp_metadata_list() is expected
     assert calls == [(4, connector.p2p_pg, torch.device("cpu"))]
+
+
+def test_p2p_hccl_mtp_phase_marker_uses_control_sender(monkeypatch):
+    connector = _connector(
+        role="attention",
+        role_rank=2,
+        attention=4,
+        ffn=2,
+    )
+    connector.p2p_pg = object()
+    sent = []
+    monkeypatch.setattr(
+        hccl_module,
+        "send_control_payload",
+        lambda value, *, dst, group, device: sent.append(
+            (value, dst, group, device),
+        ),
+    )
+
+    connector.control_plane.send_mtp_phase_ready(graph_replay=True)
+
+    assert len(sent) == 1
+    payload, dst, group, device = sent[0]
+    assert payload.mtp_phase_ready is True
+    assert payload.mtp_phase_graph_replay is True
+    assert payload.dp_metadata_list == {}
+    assert dst == 1
+    assert group is connector.p2p_pg
+    assert device == torch.device("cpu")
+
+
+def test_p2p_hccl_mtp_phase_receive_stashes_next_target(monkeypatch):
+    connector = _connector(role="ffn")
+    connector.p2p_pg = object()
+    next_target = AFDControlPayload(
+        dp_metadata_list={
+            0: AFDDPMetadata(torch.tensor([3], dtype=torch.int32)),
+        },
+        is_graph_capturing=False,
+        is_warmup=False,
+        mtp_phase_control_enabled=True,
+    )
+    monkeypatch.setattr(
+        connector.control_plane,
+        "_recv_payload",
+        lambda: next_target,
+    )
+
+    assert connector.control_plane.recv_mtp_phase_ready() is False
+    assert connector.control_plane.recv_dp_metadata_list() is next_target
+    assert connector.mtp_phase_control_enabled is True
+
+
+def test_p2p_hccl_mtp_phase_receive_consumes_marker(monkeypatch):
+    connector = _connector(role="ffn")
+    marker = AFDControlPayload(
+        dp_metadata_list={},
+        is_graph_capturing=False,
+        is_warmup=False,
+        mtp_phase_ready=True,
+        mtp_phase_graph_replay=True,
+    )
+    monkeypatch.setattr(
+        connector.control_plane,
+        "_recv_payload",
+        lambda: marker,
+    )
+
+    assert connector.control_plane.recv_mtp_phase_ready() is True
+    assert connector.mtp_phase_graph_replay is True
+    assert connector.control_plane._pending_payload is None
 
 
 def test_p2p_hccl_rejects_aggregate_buffer_overflow(monkeypatch):

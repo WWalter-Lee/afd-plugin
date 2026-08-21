@@ -268,6 +268,7 @@ def test_p2p_dp_metadata_serialization_uses_json_payload():
             dp_metadata_list={7: metadata},
             is_graph_capturing=True,
             is_warmup=False,
+            mtp_phase_control_enabled=True,
         ),
     )
     decoded_payload = module.decode_control_payload(payload)
@@ -283,6 +284,28 @@ def test_p2p_dp_metadata_serialization_uses_json_payload():
     assert decoded_payload.is_graph_capturing is True
     assert decoded_payload.is_warmup is False
     assert decoded_payload.shutdown is False
+    assert decoded_payload.mtp_phase_ready is False
+    assert decoded_payload.mtp_phase_control_enabled is True
+
+
+def test_p2p_mtp_phase_control_payload_round_trip():
+    module = importlib.import_module("afd_plugin.connectors.metadata")
+
+    encoded = module.encode_control_payload(
+        AFDControlPayload(
+            dp_metadata_list={},
+            is_graph_capturing=False,
+            is_warmup=False,
+            mtp_phase_ready=True,
+            mtp_phase_graph_replay=True,
+        )
+    )
+    decoded = module.decode_control_payload(encoded)
+
+    assert decoded.dp_metadata_list == {}
+    assert decoded.mtp_phase_ready is True
+    assert decoded.mtp_phase_graph_replay is True
+    assert decoded.shutdown is False
 
 
 def test_p2p_shutdown_control_payload_round_trip():

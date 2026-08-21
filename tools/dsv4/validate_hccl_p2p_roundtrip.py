@@ -264,6 +264,180 @@ def _validate_graph_transport(
     return checks
 
 
+def _validate_mtp_graph_transport(
+    *,
+    connector,
+    role: str,
+    role_rank: int,
+    attention_size: int,
+    ffn_size: int,
+    stages: int,
+    step_idx: int,
+) -> list[dict[str, object]]:
+    """Capture and replay the merged MTP phase on physical HCCL groups."""
+
+    import torch
+    import torch.distributed as dist
+
+    from afd_plugin.connectors.metadata import (
+        AFDControlPayload,
+        AFDDPMetadata,
+        AFDTransferContext,
+        AFDTransferMetadata,
+    )
+
+    attention_peer_counts = [0] * attention_size
+    for stage_idx in range(stages):
+        stage_counts = _token_counts(
+            attention_size,
+            step_idx=step_idx,
+            stage_idx=stage_idx,
+        )
+        for attention_rank, count in enumerate(stage_counts):
+            attention_peer_counts[attention_rank] += count
+
+    control_payload = AFDControlPayload(
+        dp_metadata_list={
+            0: AFDDPMetadata(torch.tensor(attention_peer_counts, dtype=torch.int32))
+        },
+        is_graph_capturing=True,
+        is_warmup=False,
+    )
+    if role == "attention":
+        connector.control_plane.update_state_from_dp_metadata(control_payload)
+        connector.control_plane.send_dp_metadata_list(control_payload)
+    else:
+        received_control = connector.control_plane.recv_dp_metadata_list()
+        connector.control_plane.update_state_from_dp_metadata(received_control)
+
+    static_hidden = None
+    returned_buffer = None
+    header = None
+    if role == "attention":
+        num_tokens = attention_peer_counts[role_rank]
+        static_hidden = torch.full(
+            (num_tokens, 16),
+            _mtp_hidden_value(role_rank, step_idx=step_idx),
+            dtype=torch.bfloat16,
+            device="npu:0",
+        )
+        returned_buffer = torch.empty_like(static_hidden)
+
+    dist.barrier(group=connector.p2p_pg)
+    graph = torch.npu.NPUGraph()
+    connector.is_graph_capturing = True
+    with torch.npu.graph(graph, pool=torch.npu.graph_pool_handle()):
+        if role == "attention":
+            assert static_hidden is not None
+            assert returned_buffer is not None
+            context = AFDTransferContext(
+                metadata=AFDTransferMetadata.create_attention_metadata(
+                    layer_idx=0,
+                    stage_idx=0,
+                    seq_len=int(static_hidden.shape[0]),
+                    phase="mtp",
+                    speculative_step=0,
+                ),
+            )
+            connector.send_attn_output(
+                static_hidden,
+                context,
+                num_tokens_across_dp=torch.tensor(
+                    attention_peer_counts,
+                    dtype=torch.int32,
+                ),
+            )
+            connector.recv_ffn_output(
+                returned_buffer,
+                ubatch_idx=0,
+                phase="mtp",
+            )
+        else:
+            header = connector.recv_mtp_header_for_graph(
+                stage_idx=0,
+                attention_peer_counts=tuple(attention_peer_counts),
+            )
+            payload = connector.recv_attn_output(
+                ubatch_idx=0,
+                layer_idx=0,
+                phase="mtp",
+                speculative_step=header.speculative_step,
+                num_tokens=header.num_tokens,
+            )
+            connector.send_ffn_output(
+                payload.hidden_states + 2,
+                payload.context,
+                ubatch_idx=0,
+            )
+    connector.is_graph_capturing = False
+    torch.npu.synchronize()
+    dist.barrier(group=connector.p2p_pg)
+
+    checks: list[dict[str, object]] = []
+    if role == "attention":
+        checks.append(
+            {
+                "phase": "mtp_graph_capture",
+                "tokens": attention_peer_counts[role_rank],
+                "peer_tokens": attention_peer_counts,
+                "captured": True,
+            }
+        )
+        assert static_hidden is not None
+        static_hidden.fill_(_mtp_hidden_value(role_rank, step_idx=step_idx + 7))
+    else:
+        assert header is not None
+        expected_ffn_counts = _ffn_token_counts(
+            attention_peer_counts,
+            ffn_size=ffn_size,
+        )
+        if header.num_tokens_across_dp.tolist() != expected_ffn_counts:
+            raise AssertionError(
+                "MTP graph FFN count projection mismatch: "
+                f"{header.num_tokens_across_dp.tolist()} != {expected_ffn_counts}"
+            )
+        checks.append(
+            {
+                "phase": "mtp_graph_capture",
+                "peer_tokens": attention_peer_counts[
+                    role_rank * connector.ratio :
+                    (role_rank + 1) * connector.ratio
+                ],
+                "header_fan_in": True,
+                "captured": True,
+            }
+        )
+
+    dist.barrier(group=connector.p2p_pg)
+    graph.replay()
+    torch.npu.synchronize()
+    dist.barrier(group=connector.p2p_pg)
+
+    if role == "attention":
+        assert static_hidden is not None
+        assert returned_buffer is not None
+        if not torch.equal(returned_buffer.cpu(), (static_hidden + 2).cpu()):
+            raise AssertionError(
+                f"MTP graph replay mismatch for attention={role_rank}"
+            )
+        checks.append(
+            {
+                "phase": "mtp_graph_replay",
+                "tokens": int(static_hidden.shape[0]),
+                "updated_input": True,
+                "roundtrip": True,
+            }
+        )
+    else:
+        checks.append(
+            {
+                "phase": "mtp_graph_replay",
+                "fan_in_out": True,
+            }
+        )
+    return checks
+
+
 def _worker(
     role: str,
     role_rank: int,
@@ -275,6 +449,7 @@ def _worker(
     steps: int,
     enable_mtp: bool,
     graph_transport: bool,
+    mtp_graph_transport: bool,
     result_path: Path,
 ) -> None:
     connector = None
@@ -332,7 +507,14 @@ def _worker(
                     vocab_size=128,
                 ),
             ),
-            speculative_config=(SimpleNamespace(method="mtp") if enable_mtp else None),
+            speculative_config=(
+                SimpleNamespace(
+                    method="mtp",
+                    enforce_eager=not mtp_graph_transport,
+                )
+                if enable_mtp
+                else None
+            ),
         )
         afd_config = AFDConfig(
             connector="P2pHcclAFDConnector",
@@ -511,7 +693,7 @@ def _worker(
                     },
                 )
 
-            if not enable_mtp:
+            if not enable_mtp or mtp_graph_transport:
                 continue
 
             mtp_counts = _mtp_token_counts(attention_size, step_idx=step_idx)
@@ -641,6 +823,18 @@ def _worker(
                     step_idx=2,
                 )
             )
+        if mtp_graph_transport:
+            checks.extend(
+                _validate_mtp_graph_transport(
+                    connector=connector,
+                    role=role,
+                    role_rank=role_rank,
+                    attention_size=attention_size,
+                    ffn_size=ffn_size,
+                    stages=stages,
+                    step_idx=2,
+                )
+            )
 
         torch.npu.synchronize()
         result.update(passed=True, checks=checks)
@@ -697,6 +891,7 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=2)
     parser.add_argument("--enable-mtp", action="store_true")
     parser.add_argument("--graph-transport", action="store_true")
+    parser.add_argument("--mtp-graph-transport", action="store_true")
     parser.add_argument("--timeout", type=float, default=300)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -705,6 +900,10 @@ def main() -> None:
     ffn_size = len(args.ffn_devices)
     if args.steps <= 0:
         parser.error("--steps must be positive")
+    if args.mtp_graph_transport and not args.enable_mtp:
+        parser.error("--mtp-graph-transport requires --enable-mtp")
+    if args.mtp_graph_transport and not args.graph_transport:
+        parser.error("--mtp-graph-transport requires --graph-transport")
     if attention_size < ffn_size or attention_size % ffn_size != 0:
         parser.error("Attention count must be an integer multiple of FFN count")
     all_devices = [*args.attention_devices, *args.ffn_devices]
@@ -741,6 +940,7 @@ def main() -> None:
                 args.steps,
                 args.enable_mtp,
                 args.graph_transport,
+                args.mtp_graph_transport,
                 result_paths[(role, role_rank)],
             ),
             name=f"hccl-p2p-{role}-{role_rank}",
@@ -801,6 +1001,7 @@ def main() -> None:
         "steps": args.steps,
         "enable_mtp": args.enable_mtp,
         "graph_transport": args.graph_transport,
+        "mtp_graph_transport": args.mtp_graph_transport,
         "results": results,
         "exit_codes": exit_codes,
     }

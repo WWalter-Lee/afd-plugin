@@ -126,12 +126,25 @@ class AFDControlPayload:
         shutdown: Whether Attention is intentionally closing the control plane.
             Shutdown payloads contain no DP metadata and let FFN leave its
             blocking receive loop before the Gloo process group is destroyed.
+        mtp_phase_ready: Whether Attention actually entered the MTP proposer for
+            the preceding target step.  A target step that finishes every
+            request may legitimately omit its draft phase.
+        mtp_phase_graph_replay: Whether that live draft phase will replay an
+            already captured graph. False means both roles must execute the
+            draft eagerly even when full draft Graph is configured.
+        mtp_phase_control_enabled: Whether the target step is live scheduler
+            work and therefore expects a following ``mtp_phase_ready`` marker.
+            Startup profile, warmup, and capture steps execute paired dummy
+            draft work directly and leave this disabled.
     """
 
     dp_metadata_list: dict[int, AFDDPMetadata]
     is_graph_capturing: bool
     is_warmup: bool
     shutdown: bool = False
+    mtp_phase_ready: bool = False
+    mtp_phase_graph_replay: bool = False
+    mtp_phase_control_enabled: bool = False
 
     def __post_init__(self) -> None:
         self.dp_metadata_list = {
@@ -353,6 +366,9 @@ def encode_control_payload(payload: AFDControlPayload) -> bytes:
         "is_graph_capturing": bool(payload.is_graph_capturing),
         "is_warmup": bool(payload.is_warmup),
         "shutdown": bool(payload.shutdown),
+        "mtp_phase_ready": bool(payload.mtp_phase_ready),
+        "mtp_phase_graph_replay": bool(payload.mtp_phase_graph_replay),
+        "mtp_phase_control_enabled": bool(payload.mtp_phase_control_enabled),
     }
     return json.dumps(wire_payload, separators=(",", ":"), sort_keys=True).encode(
         "utf-8",
@@ -382,6 +398,13 @@ def decode_control_payload(payload_bytes: bytes) -> AFDControlPayload:
         is_graph_capturing=bool(payload.get("is_graph_capturing", False)),
         is_warmup=bool(payload.get("is_warmup", False)),
         shutdown=bool(payload.get("shutdown", False)),
+        mtp_phase_ready=bool(payload.get("mtp_phase_ready", False)),
+        mtp_phase_graph_replay=bool(
+            payload.get("mtp_phase_graph_replay", False),
+        ),
+        mtp_phase_control_enabled=bool(
+            payload.get("mtp_phase_control_enabled", False),
+        ),
     )
 
 

@@ -244,6 +244,12 @@ class P2pHcclAFDConnector(AFDConnectorBase):
             speculative_config is not None
             and getattr(speculative_config, "method", None) == "mtp"
         )
+        self.mtp_draft_graph_enabled = bool(
+            self.requires_mtp
+            and not bool(
+                getattr(speculative_config, "enforce_eager", True),
+            )
+        )
         self.vocab_size = int(vllm_config.model_config.hf_config.vocab_size)
         self.num_stages = max(
             1,
@@ -261,6 +267,9 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         self.dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata] = {}
         self.stage_layouts: dict[int, HCCLP2PStageLayout] = {}
         self.mtp_stage_layouts: dict[int, HCCLP2PStageLayout] = {}
+        self.mtp_graph_header_values: tuple[int, ...] | None = None
+        self.mtp_phase_control_enabled = False
+        self.mtp_phase_graph_replay = False
         self.is_graph_capturing = False
         self.is_warmup = False
         self.a2f_send_stream = None
@@ -368,11 +377,15 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         self.dp_metadata_list = {}
         self.stage_layouts = {}
         self.mtp_stage_layouts = {}
+        self.mtp_graph_header_values = None
+        self.mtp_phase_control_enabled = False
+        self.mtp_phase_graph_replay = False
         self.a2f_send_stream = None
         self.f2a_recv_stream = None
         self.attention_pipeline_events = {}
         self.pending_attention_transfers = {}
         self.attention_receive_dependencies = {}
+        self.control_plane.reset_pending_payload()
         self._initialized = False
 
     @property
@@ -456,7 +469,10 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         if metadata.phase == "mtp":
             self._validate_mtp_scope(metadata)
             expected_shape = (metadata.total_tokens, self.hidden_size)
-            if tuple(hidden_states.shape) != expected_shape:
+            if (
+                not torch.compiler.is_compiling()
+                and tuple(hidden_states.shape) != expected_shape
+            ):
                 raise ValueError(
                     "DSV4 MTP HCCL transfer requires post-HC MoE input shape "
                     f"{expected_shape}, got {tuple(hidden_states.shape)}"
@@ -899,6 +915,13 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         num_tokens_across_dp: torch.Tensor,
         stage_idx: int,
     ) -> None:
+        if self.mtp_draft_graph_enabled:
+            self._send_prepared_mtp_graph_header(
+                num_tokens=num_tokens,
+                speculative_step=speculative_step,
+                stage_idx=stage_idx,
+            )
+            return
         counts = self._mtp_ffn_token_counts(num_tokens_across_dp)
         self._validate_mtp_header_values(
             num_tokens=num_tokens,
@@ -915,6 +938,100 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         buffer[2] = num_tokens
         buffer[3] = self.ffn_size
         buffer[_MTP_HEADER_PREFIX_SIZE:].copy_(counts, non_blocking=False)
+        self._send_tensor(
+            buffer,
+            dst=self.mapping.subgroup_index,
+            group=group,
+        )
+
+    def prepare_mtp_header_for_graph(
+        self,
+        dp_metadata_list: Mapping[int, DPMetadata | AFDDPMetadata],
+    ) -> None:
+        """Prepare the draft header before entering the Attention ACL Graph."""
+
+        if self.afd_config.role != "attention" or not self.mtp_draft_graph_enabled:
+            return
+        self._validate_mtp_topology()
+        attention_peer_counts = [0] * self.attn_size
+        for metadata in dp_metadata_list.values():
+            stage_counts = _attention_token_counts(
+                metadata,
+                attention_size=self.attn_size,
+                fallback=1,
+            )
+            for peer_index, count in enumerate(stage_counts):
+                attention_peer_counts[peer_index] += int(count)
+
+        ffn_counts = [
+            sum(
+                attention_peer_counts[
+                    ffn_index * self.ratio : (ffn_index + 1) * self.ratio
+                ]
+            )
+            for ffn_index in range(self.ffn_size)
+        ]
+        local_tokens = attention_peer_counts[self.mapping.role_rank]
+        self._validate_receive_capacity(local_tokens)
+        header_values = (
+            _MTP_HEADER_MAGIC,
+            0,
+            local_tokens,
+            self.ffn_size,
+            *ffn_counts,
+        )
+        if header_values == self.mtp_graph_header_values:
+            return
+
+        # ### PATCH START: prepare host values outside the draft graph.
+        # Upstream torch-npu 2.10.0.post2 rejects synchronous host-to-device
+        # copies while an NPU stream is being captured.  The scheduler control
+        # payload owns this exact layout, so populate the stable header buffer
+        # before the model enters ACLGraphWrapper.  Synchronize only when a
+        # live layout changes and could otherwise overwrite a prior replay.
+        if (
+            self.mtp_graph_header_values is not None
+            and not self.is_graph_capturing
+            and not self.is_warmup
+        ):
+            torch.npu.current_stream().synchronize()
+        buffer, _ = self._mtp_header_buffer_and_group(0)
+        buffer.copy_(
+            torch.tensor(
+                header_values,
+                dtype=torch.int32,
+                device=buffer.device,
+            ),
+            non_blocking=False,
+        )
+        self.mtp_graph_header_values = header_values
+        # ### PATCH END: prepare host values outside the draft graph.
+
+    def _send_prepared_mtp_graph_header(
+        self,
+        *,
+        num_tokens: int,
+        speculative_step: int,
+        stage_idx: int,
+    ) -> None:
+        header_values = self.mtp_graph_header_values
+        if header_values is None:
+            raise RuntimeError(
+                "DSV4 MTP draft Graph header was not prepared by the control plane",
+            )
+        if stage_idx != 0:
+            raise RuntimeError("DSV4 MTP draft Graph uses merged stage 0")
+        if header_values[1] != speculative_step:
+            raise RuntimeError("DSV4 MTP draft Graph speculative step mismatch")
+        if (
+            not torch.compiler.is_compiling()
+            and header_values[2] != num_tokens
+        ):
+            raise RuntimeError(
+                "DSV4 MTP draft Graph local token count does not match the "
+                f"prepared header: {num_tokens} != {header_values[2]}",
+            )
+        buffer, group = self._mtp_header_buffer_and_group(stage_idx)
         self._send_tensor(
             buffer,
             dst=self.mapping.subgroup_index,
@@ -984,6 +1101,67 @@ class P2pHcclAFDConnector(AFDConnectorBase):
             num_tokens_across_dp=counts,
         )
 
+    def recv_mtp_header_for_graph(
+        self,
+        *,
+        stage_idx: int,
+        attention_peer_counts: tuple[int, ...],
+    ) -> HCCLMTPHeader:
+        """Capture MTP header receives using a scheduler-owned static layout.
+
+        Header values cannot be copied to CPU and parsed inside an NPUGraph.
+        The same padded token layout is already carried by the target decoder's
+        DP metadata, so capture consumes the wire messages while using that
+        metadata as the graph contract.  Live replay is isolated by the exact
+        peer-layout key and therefore does not trust values from another shape.
+        """
+
+        if self.afd_config.role != "ffn":
+            raise RuntimeError("only the FFN role receives MTP headers")
+        self._validate_mtp_topology()
+        if len(attention_peer_counts) != self.attn_size:
+            raise ValueError(
+                "DSV4 MTP graph layout must match Attention world size: "
+                f"{len(attention_peer_counts)} != {self.attn_size}",
+            )
+        if stage_idx in self.mtp_stage_layouts:
+            raise RuntimeError(
+                f"DSV4 MTP stage has an unconsumed header layout: stage={stage_idx}"
+            )
+
+        first_attention_rank = self.mapping.subgroup_index * self.ratio
+        seq_lens = tuple(
+            int(attention_peer_counts[first_attention_rank + offset])
+            for offset in range(self.ratio)
+        )
+        peer_ranks = self._attention_peer_world_ranks()
+        layout = HCCLP2PStageLayout(
+            peer_ranks=peer_ranks,
+            seq_lens=seq_lens,
+            peer_slices=_make_peer_slices(peer_ranks, seq_lens),
+            num_tokens=sum(seq_lens),
+        )
+        self._validate_receive_capacity(layout.num_tokens)
+
+        buffer, group = self._mtp_header_buffer_and_group(stage_idx)
+        for source_rank in peer_ranks:
+            self._recv_tensor(buffer, src=source_rank, group=group)
+        self.mtp_stage_layouts[stage_idx] = layout
+
+        ffn_counts = [
+            sum(
+                attention_peer_counts[
+                    ffn_index * self.ratio : (ffn_index + 1) * self.ratio
+                ]
+            )
+            for ffn_index in range(self.ffn_size)
+        ]
+        return HCCLMTPHeader(
+            num_tokens=layout.num_tokens,
+            speculative_step=0,
+            num_tokens_across_dp=torch.tensor(ffn_counts, dtype=torch.int32),
+        )
+
     def prepare_stage_buffer(self, stage_idx: int, num_tokens: int) -> None:
         """Ensure the FFN receive buffer is allocated before posting recv."""
         if self.afd_config.role != "ffn":
@@ -998,7 +1176,14 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         group: ProcessGroup,
         stream=None,
     ) -> None:
-        send_tensor = tensor if tensor.is_contiguous() else tensor.contiguous()
+        # Dynamo marks the MTP token dimension dynamic. Querying contiguity in
+        # Python specializes that dimension during full draft compilation even
+        # though the model-owned buffers are already contiguous.
+        send_tensor = (
+            tensor
+            if torch.compiler.is_compiling() or tensor.is_contiguous()
+            else tensor.contiguous()
+        )
         if self._graph_transport_active():
             _graph_hccl_send(send_tensor, dst=dst, group=group)
             return
@@ -1286,6 +1471,7 @@ class P2pHcclAFDControlPlane(AFDControlPlane):
 
     def __init__(self, connector: P2pHcclAFDConnector) -> None:
         self.connector = connector
+        self._pending_payload: AFDControlPayload | None = None
 
     def update_state_from_dp_metadata(
         self,
@@ -1296,16 +1482,35 @@ class P2pHcclAFDControlPlane(AFDControlPlane):
         connector.stage_layouts = {}
         connector.is_graph_capturing = payload.is_graph_capturing
         connector.is_warmup = payload.is_warmup
-        if connector.afd_config.role != "ffn":
+        if connector.afd_config.role == "attention":
+            connector.prepare_mtp_header_for_graph(payload.dp_metadata_list)
             return
         for stage_idx in payload.dp_metadata_list:
             layout = connector._stage_layout(int(stage_idx), fallback=1)
             connector.prepare_stage_buffer(int(stage_idx), layout.num_tokens)
 
+    def reset_pending_payload(self) -> None:
+        self._pending_payload = None
+
     def send_dp_metadata_list(
         self,
         payload: AFDControlPayload,
     ) -> None:
+        self._send_payload(payload)
+
+    def send_mtp_phase_ready(self, *, graph_replay: bool) -> None:
+        """Tell FFN that the target entered draft and how it will execute."""
+        self._send_payload(
+            AFDControlPayload(
+                dp_metadata_list={},
+                is_graph_capturing=False,
+                is_warmup=False,
+                mtp_phase_ready=True,
+                mtp_phase_graph_replay=bool(graph_replay),
+            ),
+        )
+
+    def _send_payload(self, payload: AFDControlPayload) -> None:
         connector = self.connector
         if connector.p2p_pg is None:
             return
@@ -1322,6 +1527,36 @@ class P2pHcclAFDControlPlane(AFDControlPlane):
         )
 
     def recv_dp_metadata_list(self) -> AFDControlPayload:
+        if self._pending_payload is not None:
+            payload = self._pending_payload
+            self._pending_payload = None
+        else:
+            payload = self._recv_payload()
+        if payload.mtp_phase_ready:
+            raise RuntimeError(
+                "unexpected DSV4 MTP phase marker before target metadata",
+            )
+        self.connector.mtp_phase_control_enabled = bool(
+            payload.mtp_phase_control_enabled,
+        )
+        self.connector.mtp_phase_graph_replay = False
+        return payload
+
+    def recv_mtp_phase_ready(self) -> bool:
+        """Consume a draft marker or retain the next target/shutdown payload."""
+        if self._pending_payload is not None:
+            raise RuntimeError("HCCL P2P control plane already has a pending payload")
+        payload = self._recv_payload()
+        if payload.mtp_phase_ready:
+            self.connector.mtp_phase_graph_replay = bool(
+                payload.mtp_phase_graph_replay,
+            )
+            return True
+        self.connector.mtp_phase_graph_replay = False
+        self._pending_payload = payload
+        return False
+
+    def _recv_payload(self) -> AFDControlPayload:
         connector = self.connector
         if connector.p2p_pg is None:
             raise RuntimeError(

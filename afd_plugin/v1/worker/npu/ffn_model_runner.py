@@ -49,6 +49,7 @@ from afd_plugin.v1.worker.cuda_graph import (
     AFDGraphRunMode,
     graph_run_mode,
     make_ffn_graph_key,
+    make_mtp_ffn_graph_key,
 )
 from afd_plugin.v1.worker.ffn_model_runner import _set_moe_layer_index
 
@@ -100,6 +101,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             self._initialize_ffn_stream_pipeline(device)
         self.use_aclgraph = _use_npu_aclgraph(vllm_config, self)
         self._acl_graphs: dict[tuple, dict[str, Any]] = {}
+        self._mtp_acl_graphs: dict[tuple, dict[str, Any]] = {}
         self.graph_pool = (
             current_platform.get_global_graph_pool() if self.use_aclgraph else None
         )
@@ -261,14 +263,9 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 len(acl_graphs),
             )
             graph_info["graph"].replay()
-            # ### PATCH START: eager draft after target graph replay.
-            # Upstream commit 3da28f94 runs colocated target and draft models.
-            # AFD replays only the target graph, then performs the validated
-            # cross-service MTP exchange eagerly for the current step.
-            self._mtp_ffn_forward(
-                sorted(int(stage_idx) for stage_idx in dp_metadata_list) or [0]
-            )
-            # ### PATCH END: eager draft after target graph replay.
+            if not self._recv_mtp_phase_ready():
+                return None
+            self._execute_mtp_after_target(dp_metadata_list)
             return None
 
         self._ffn_forward(
@@ -276,11 +273,48 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             input_ids_by_stage=input_ids_by_stage,
             update_connector_state=False,
         )
-        # Keep the same phase boundary when a target graph is unavailable.
+        if not self._recv_mtp_phase_ready():
+            return None
+        self._execute_mtp_after_target(dp_metadata_list)
+        return None
+
+    def _execute_mtp_after_target(
+        self,
+        dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
+    ) -> None:
+        control_enabled = bool(
+            getattr(self.connector, "mtp_phase_control_enabled", False),
+        )
+        graph_replay = bool(
+            getattr(self.connector, "mtp_phase_graph_replay", False),
+        )
+        if self._draft_uses_aclgraph() and (
+            graph_replay
+            or (
+                not control_enabled
+                and self._make_mtp_graph_key(dp_metadata_list) in self._mtp_acl_graphs
+            )
+        ):
+            self._replay_mtp_graph(dp_metadata_list)
+            return
         self._mtp_ffn_forward(
             sorted(int(stage_idx) for stage_idx in dp_metadata_list) or [0]
         )
-        return None
+
+    def _recv_mtp_phase_ready(self) -> bool:
+        if self.vllm_config.speculative_config is None:
+            return False
+        if not bool(
+            getattr(self.connector, "mtp_phase_control_enabled", False),
+        ):
+            return True
+        control_plane = self.connector.control_plane
+        recv_phase_ready = getattr(control_plane, "recv_mtp_phase_ready", None)
+        if not callable(recv_phase_ready):
+            raise RuntimeError(
+                "DSV4 AFD MTP requires an explicit phase-aware control plane",
+            )
+        return bool(recv_phase_ready())
 
     def _prepare_connector_step(
         self,
@@ -350,6 +384,61 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             int(getattr(speculative_config, "num_speculative_tokens", 0)),
             bool(getattr(speculative_config, "enforce_eager", False)),
         )
+
+    def _draft_uses_aclgraph(self) -> bool:
+        speculative_config = getattr(self.vllm_config, "speculative_config", None)
+        return bool(
+            self.use_aclgraph
+            and speculative_config is not None
+            and getattr(speculative_config, "method", None) == "mtp"
+            and not bool(getattr(speculative_config, "enforce_eager", False))
+        )
+
+    def _make_mtp_graph_key(
+        self,
+        dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
+    ) -> tuple:
+        peer_layout = make_mtp_ffn_graph_key(
+            dp_metadata_list,
+            attention_size=int(self.connector.attn_size),
+            ffn_size=int(self.connector.ffn_size),
+            fallback=int(self.max_num_tokens),
+        )
+        capture_sizes = tuple(
+            int(size)
+            for size in getattr(self, "cudagraph_batch_sizes", ())
+        )
+        if capture_sizes:
+            # Attention dispatches each DP rank to the smallest captured batch
+            # descriptor that can hold its live token count. Mirror that
+            # per-peer padding here so FFN selects the graph whose HCCL tensor
+            # slices have the shapes actually replayed by Attention.
+            peer_layout = tuple(
+                next(
+                    (size for size in capture_sizes if size >= peer_tokens),
+                    peer_tokens,
+                )
+                for peer_tokens in peer_layout
+            )
+        return ("mtp", *self._speculative_graph_signature(), peer_layout)
+
+    def _replay_mtp_graph(
+        self,
+        dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
+    ) -> None:
+        graph_key = self._make_mtp_graph_key(dp_metadata_list)
+        graph_info = self._mtp_acl_graphs.get(graph_key)
+        if graph_info is None:
+            raise RuntimeError(
+                "AFD NPU FFN has no captured MTP graph for the current peer "
+                f"layout: key={graph_key}",
+            )
+        logger.debug(
+            "AFD NPU FFN replaying MTP ACL graph; key=%s cached_graphs=%d",
+            graph_key,
+            len(self._mtp_acl_graphs),
+        )
+        graph_info["graph"].replay()
 
     def _ffn_forward(
         self,
@@ -557,6 +646,8 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
     def _mtp_ffn_forward(
         self,
         stage_ids: list[int],
+        *,
+        header: Any | None = None,
     ) -> torch.Tensor | None:
         if self.vllm_config.speculative_config is None:
             return None
@@ -570,7 +661,8 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         # The target decoder may run U2, but the upstream proposer consumes the
         # merged target output and executes one full-batch MTP phase.
         stage_idx = 0
-        header = self.connector.recv_mtp_header(stage_idx=stage_idx)
+        if header is None:
+            header = self.connector.recv_mtp_header(stage_idx=stage_idx)
         payload = self.connector.recv_attn_output(
             ubatch_idx=stage_idx,
             layer_idx=0,
@@ -704,6 +796,8 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 graph_key,
             )
             existing_graph_info["graph"].replay()
+            if self._draft_uses_aclgraph():
+                self._replay_mtp_graph(dp_metadata_list)
             return 0
         # ### PATCH END: mirror duplicate target graph replay.
 
@@ -736,6 +830,8 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                         is_attn_graph_capturing=is_attn_graph_capturing,
                         input_ids_by_stage=input_ids_by_stage,
                     )
+                    if self._draft_uses_aclgraph():
+                        self._capture_mtp_graphs(dp_metadata_list)
         finally:
             set_cudagraph_capturing_enabled(False)
 
@@ -747,6 +843,33 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             graph_size,
         )
         return graph_size
+
+    def _capture_mtp_graphs(
+        self,
+        dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
+    ) -> None:
+        """Capture the merged MTP phase after the target decoder graph."""
+
+        graph_key = self._make_mtp_graph_key(dp_metadata_list)
+        existing = self._mtp_acl_graphs.get(graph_key)
+        if existing is not None:
+            existing["graph"].replay()
+            return
+
+        peer_layout = graph_key[-1]
+        graph = torch.npu.NPUGraph()
+        logger.debug("AFD NPU FFN capturing MTP ACL graph for key=%s", graph_key)
+        with torch.npu.graph(graph, pool=self.graph_pool):
+            header = self.connector.recv_mtp_header_for_graph(
+                stage_idx=0,
+                attention_peer_counts=peer_layout,
+            )
+            output = self._mtp_ffn_forward([0], header=header)
+        self._mtp_acl_graphs[graph_key] = {
+            "graph": graph,
+            "output": output,
+        }
+        logger.debug("AFD NPU FFN captured MTP ACL graph for key=%s", graph_key)
 
     def _capture_graphs(
         self,

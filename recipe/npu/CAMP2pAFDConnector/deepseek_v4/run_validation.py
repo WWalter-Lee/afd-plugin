@@ -441,6 +441,7 @@ def _runtime_manifest(
     profile: bool,
     enable_mtp: bool = False,
     mtp_num_speculative_tokens: int = 1,
+    mtp_draft_execution: str = "eager",
     topology: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     venv_path = os.environ.get(
@@ -488,7 +489,7 @@ def _runtime_manifest(
         "dbo_prefill_token_threshold": dbo_prefill_token_threshold,
         "enable_mtp": enable_mtp,
         "mtp_num_speculative_tokens": mtp_num_speculative_tokens,
-        "mtp_draft_execution": "eager" if enable_mtp else None,
+        "mtp_draft_execution": mtp_draft_execution if enable_mtp else None,
         "profile": profile,
         "profile_role_ranks": [0] if profile else [],
         "torch_profiler_with_stack": False,
@@ -593,11 +594,13 @@ def _set_mtp_environment(
     *,
     enable_mtp: bool,
     mtp_num_speculative_tokens: int,
+    mtp_draft_execution: str = "eager",
 ) -> None:
     os.environ.update(
         {
             "ENABLE_MTP": "1" if enable_mtp else "0",
             "MTP_NUM_SPECULATIVE_TOKENS": str(mtp_num_speculative_tokens),
+            "MTP_DRAFT_EXECUTION": mtp_draft_execution,
         }
     )
 
@@ -609,6 +612,7 @@ def _validate_execution_topology(
     u_batches: int = 1,
     enable_mtp: bool = False,
     mtp_num_speculative_tokens: int = 1,
+    mtp_draft_execution: str = "eager",
     topology: dict[str, Any],
 ) -> None:
     if (
@@ -627,6 +631,10 @@ def _validate_execution_topology(
         raise ValueError("DeepSeek-V4 MTP requires eager or full-decode-only execution")
     if mtp_num_speculative_tokens != 1:
         raise ValueError("DeepSeek-V4 MTP supports exactly one speculative token")
+    if mtp_draft_execution not in {"eager", "graph"}:
+        raise ValueError("DeepSeek-V4 MTP draft execution must be eager or graph")
+    if mtp_draft_execution == "graph" and execution_mode != "full-decode-only":
+        raise ValueError("DeepSeek-V4 MTP draft Graph requires target full-decode-only")
 
 
 def main() -> None:
@@ -690,6 +698,11 @@ def main() -> None:
         type=int,
         default=int(os.environ.get("MTP_NUM_SPECULATIVE_TOKENS", "1")),
     )
+    parser.add_argument(
+        "--mtp-draft-execution",
+        choices=("eager", "graph"),
+        default=os.environ.get("MTP_DRAFT_EXECUTION", "eager"),
+    )
     args = parser.parse_args()
 
     if args.dbo_decode_token_threshold < 0:
@@ -710,6 +723,7 @@ def main() -> None:
             u_batches=args.u_batches,
             enable_mtp=args.enable_mtp,
             mtp_num_speculative_tokens=args.mtp_num_speculative_tokens,
+            mtp_draft_execution=args.mtp_draft_execution,
             topology=topology,
         )
     except ValueError as exc:
@@ -718,6 +732,7 @@ def main() -> None:
     _set_mtp_environment(
         enable_mtp=args.enable_mtp,
         mtp_num_speculative_tokens=args.mtp_num_speculative_tokens,
+        mtp_draft_execution=args.mtp_draft_execution,
     )
 
     for port in (args.attention_port, args.ffn_port, args.afd_port):
@@ -735,6 +750,7 @@ def main() -> None:
                 profile=args.profile,
                 enable_mtp=args.enable_mtp,
                 mtp_num_speculative_tokens=args.mtp_num_speculative_tokens,
+                mtp_draft_execution=args.mtp_draft_execution,
                 topology=topology,
             ),
             indent=2,
