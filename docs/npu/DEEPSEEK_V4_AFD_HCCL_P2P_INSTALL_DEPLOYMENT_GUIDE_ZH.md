@@ -1,4 +1,4 @@
-# DeepSeek-V4 AFD HCCL P2P 安装部署指南
+# DeepSeek-V4 AFD HCCL P2P 安装部署指南（含双机 Mooncake PD）
 
 ## 0. 交付包结构和安装入口
 
@@ -52,10 +52,16 @@ bash bin/install_all.sh
 venv 创建、Python 依赖安装、vLLM/vLLM-Ascend/afd-plugin 安装及验收。需要逐步
 排障时，按脚本包 `README_ZH.md` 中的分步命令执行。
 
+上述现有 `hccl_manual_install` 包冻结的是单机 MTP M1 基线，不包含 Mooncake
+wheel，也不包含 M9 PD 的预发布源码。部署双机 Mooncake PD 时不能只运行该包；
+必须继续执行第 17 节，使用同一个明确的 M9 commit 和经过 SHA256 校验的 Ascend
+Mooncake wheel。
+
 ## 1. 适用范围
 
-本文给出 `P2pHcclAFDConnector` 的单机 Atlas A3 安装、启动和验收方法，
-主路径严格复现以下已验证基线：
+本文给出 `P2pHcclAFDConnector` 的单机 Atlas A3 安装、启动和验收方法，并在
+第 17 节增加两台 Atlas A3 上的 Mooncake PD + AFD 手工部署门禁。单机安装包主
+路径严格复现以下已验证基线：
 
 | 组件 | 固定版本 |
 | --- | --- |
@@ -65,17 +71,22 @@ venv 创建、Python 依赖安装、vLLM/vLLM-Ascend/afd-plugin 安装及验收�
 | torch-npu | 2.10.0.post2 |
 | vLLM | `releases/v0.23.0`，`0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665` |
 | vLLM-Ascend | `rfc/vllm_cann`，`3da28f9414583d2d0b672a8f06d1fae142404bda` |
-| afd-plugin | tag `dsv4-afd-v023-hccl-mtp-m1-v1` |
+| afd-plugin（单机安装包） | tag `dsv4-afd-v023-hccl-mtp-m1-v1` |
+| afd-plugin（Mooncake PD） | `feat/dsv4-afd-mooncake-pd` 的交付 commit；M9 F0 前不创建功能 tag |
 | transformers | 5.5.4 |
 | numpy | 2.2.6 |
 | 硬件 | 16 NPU Atlas A3，验证机型 SoC 为 `ascend910_9362` |
 
 推荐部署为 Attention NPU 0-7、FFN NPU 8-15，即 A8F8、DP8/TP1/EP8。
-本文覆盖 eager/U1、eager/U2、等量 A/F 下的 `FULL_DECODE_ONLY` Graph/U1，
-以及等量 A8F8 的 eager/U1 + MTP。MTP 首版只支持 1 个 MTP layer、
-`method=mtp`、`num_speculative_tokens=1`。Graph + MTP、U2 + MTP、非等量 +
-MTP、更多 speculative token、PD、sequence parallel 和 Attention-side gate
-不在当前支持范围内。
+单机安装包覆盖 eager/U1、eager/U2、等量 A/F 下的 `FULL_DECODE_ONLY`
+Graph/U1，以及等量 A8F8 的 eager/U1 + MTP。MTP 首版只支持 1 个 MTP layer、
+`method=mtp`、`num_speculative_tokens=1`。第 17 节的首个 PD 门禁只开放 Decode
+TP1、eager/U1、MTP off；PD + Graph/U2/MTP/TP2 在 TP1 实模 F0 前继续
+fail-fast。sequence parallel 和 Attention-side gate 不在当前支持范围内。
+
+截至 `2026-08-24`，Mooncake 0.3.9 的运行库/metadata contract 和单机两进程
+Ascend 2 MiB round-trip 已通过，但两台 A3 的实模 F0 尚未执行。因此本文提供的
+是可执行安装和验收流程，不得在完成第 17.11 节全部门禁前宣称 PD 功能基线通过。
 
 本文不适用于 afd-plugin 主 README 当前的 vLLM 0.26 默认栈。不要把 0.26的 vLLM 或 vLLM-Ascend 快照混入本指南的 0.23 Graph/U1 环境。
 
@@ -642,6 +653,18 @@ ss -ltnp | rg ':(8910|8911|29761|51000|52000)\b' || true
 - golden、batch、fatal-log、正常退出和 NPU cleanup 门禁通过；
 - 日志、版本、启动环境和验收产物已归档。
 
+双机 Mooncake PD 还必须满足：
+
+- Prefill 和 Decode 使用相同的 vLLM、vLLM-Ascend、afd-plugin commit 和
+  Mooncake wheel SHA256；
+- 两端 `VLLM_HOST_IP` 都是对端可达的业务/传输网 IPv4，不能是
+  `127.0.0.1` 或自动选择出的错误管理网地址；
+- Decode FFN 没有 `--kv-transfer-config`，Mooncake consumer 只在 Decode
+  Attention；
+- Proxy 的请求确实先进入 Prefill，再携带 `kv_transfer_params` 进入 Decode；
+- Decode Attention 日志出现成功的 KV cache transfer 记录；
+- 通过 Proxy 完成 30/30 token exact、batch 1/8/32、二次启动和双机清理。
+
 功能范围和正式验证证据见
 [`DEEPSEEK_V4_AFD_HCCL_P2P_GRAPH_U1_VALIDATION_REPORT_ZH.md`](DEEPSEEK_V4_AFD_HCCL_P2P_GRAPH_U1_VALIDATION_REPORT_ZH.md)
 和
@@ -673,3 +696,555 @@ bash tools/dsv4/hccl_manual_install/build_bundle.sh /mnt/workspace/artifacts
 到远端，轻量包从已发布提交 `d7aeb9b7554803931e42bf405623f212030ed60f`
 下载 afd-plugin，再应用包内补丁。打包和目标机安装都会校验最终 Git tree、
 精确 commit 以及 SHA256。
+
+该包当前不是 PD 交付包。M9 冻结正式 commit/tag 后，应另行升级 manifest、
+加入 Mooncake wheel SHA256 和双机配置；在此之前按第 17 节手工安装，不得把
+MTP M1 包的 `06_verify_install.sh` 成功当作 PD 安装通过。
+
+## 17. 双机 Mooncake PD + AFD 手工安装与验证
+
+### 17.0 推荐：使用统一脚本入口
+
+第 17.1-17.11 节保留完整命令，主要用于理解流程和逐层排障。正常手工部署推荐
+使用 [`tools/dsv4/mooncake_pd_manual/pd.sh`](../../tools/dsv4/mooncake_pd_manual/pd.sh)，
+避免手工遗漏环境变量、启动顺序、PID 管理或输出收集。
+
+先在 A3-P、A3-D 和 Proxy 所在节点分别创建配置：
+
+```bash
+cd /mnt/workspace/code/afd-plugin
+
+bash tools/dsv4/mooncake_pd_manual/pd.sh init /mnt/workspace/pd-prefill.env
+bash tools/dsv4/mooncake_pd_manual/pd.sh init /mnt/workspace/pd-decode.env
+bash tools/dsv4/mooncake_pd_manual/pd.sh init /mnt/workspace/pd-proxy.env
+```
+
+每台机器只保留本角色配置。编辑其中的 `NODE_ROLE`、`PREFILL_IP`、
+`DECODE_IP`、`NIC_NAME`、Mooncake wheel 路径和交付方提供的 40 位
+`AFD_PD_COMMIT`；三个配置的固定版本和拓扑值必须一致。随后在 A3-P 和 A3-D
+分别执行 `install`、`check`：
+
+```bash
+bash tools/dsv4/mooncake_pd_manual/pd.sh install /mnt/workspace/pd-prefill.env
+bash tools/dsv4/mooncake_pd_manual/pd.sh check /mnt/workspace/pd-prefill.env
+```
+
+A3-D 将配置名改为 `pd-decode.env`；Proxy 只需执行 `check`。按 Prefill、Decode、
+Proxy 顺序启动，并从 Proxy 配置执行验证：
+
+```bash
+bash tools/dsv4/mooncake_pd_manual/pd.sh start /mnt/workspace/pd-prefill.env
+bash tools/dsv4/mooncake_pd_manual/pd.sh start /mnt/workspace/pd-decode.env
+bash tools/dsv4/mooncake_pd_manual/pd.sh start /mnt/workspace/pd-proxy.env
+bash tools/dsv4/mooncake_pd_manual/pd.sh validate /mnt/workspace/pd-proxy.env
+```
+
+前三条命令分别在对应节点执行。停止顺序固定为 Proxy、Decode、Prefill：
+
+```bash
+bash tools/dsv4/mooncake_pd_manual/pd.sh stop /mnt/workspace/pd-proxy.env
+bash tools/dsv4/mooncake_pd_manual/pd.sh stop /mnt/workspace/pd-decode.env
+bash tools/dsv4/mooncake_pd_manual/pd.sh stop /mnt/workspace/pd-prefill.env
+```
+
+脚本不会使用全局 `pkill`，只管理自己 PID 文件记录的 process group。完整说明见
+[`tools/dsv4/mooncake_pd_manual/README_ZH.md`](../../tools/dsv4/mooncake_pd_manual/README_ZH.md)。
+
+### 17.1 首个 M9 交付边界
+
+首个双机功能门禁固定为：
+
+| 节点 | 角色 | NPU | 并行配置 | 对外 HTTP |
+| --- | --- | --- | --- | --- |
+| A3-P | Prefill + Mooncake producer | 0-7 | DP2/TP4 | `8100` |
+| A3-D | Decode Attention + Mooncake consumer | 0-7 | DP8/TP1 | `8910` |
+| A3-D | Decode FFN | 8-15 | DP8/TP1/EP8 | 无业务 HTTP |
+| 任一节点 | PD Proxy | CPU | 1 worker | `9000` |
+
+两条通信链路相互独立：
+
+```text
+Client -> Proxy -> Prefill
+                    |
+                    | MooncakeHybridConnector: KV cache
+                    v
+                 Decode Attention
+                    |
+                    | P2pHcclAFDConnector: hidden state
+                    v
+                 Decode FFN
+```
+
+这个门禁只使用 eager/U1、MTP off、TP1、A8F8。不要为了减少机器数量把
+Prefill 和完整 Decode A8F8 叠放在同一台 16-NPU A3；Decode 已经占满 16 张
+NPU，Prefill 还需要 8 张 NPU。初次 F0 的 `MAX_MODEL_LEN` 固定为 4096，128K
+留给功能基线后的容量专项。
+
+### 17.2 冻结并同步源码和二进制
+
+M9 功能 tag 只有在双机实模 F0 通过后才能创建。部署前由交付方提供一个已经
+提交、已经推送的 40 位 commit，两个节点都按 commit checkout，不能直接跟随
+会继续移动的分支头，也不能使用有未提交修改的工作树：
+
+旧 `hccl_manual_install/bin/02_prepare_sources.sh` 会恢复 MTP M1 补丁树，不能
+用它准备 PD 的 afd-plugin。vLLM 和 vLLM-Ascend 目录可以继续复用；afd-plugin
+应使用一个干净目录并 checkout M9 commit：
+
+```bash
+export CODE_ROOT=/mnt/workspace/code
+export AFD_PD_REMOTE_REF="feat/dsv4-afd-mooncake-pd"
+export AFD_PD_COMMIT="REPLACE_WITH_DELIVERED_40_HEX_COMMIT"
+
+test ! -e "${CODE_ROOT}/afd-plugin" || \
+  test -z "$(git -C "${CODE_ROOT}/afd-plugin" status --short)"
+test -d "${CODE_ROOT}/afd-plugin/.git" || \
+  git clone https://github.com/wenhow/afd-plugin.git "${CODE_ROOT}/afd-plugin"
+test "${#AFD_PD_COMMIT}" -eq 40
+git -C "${CODE_ROOT}/afd-plugin" fetch origin "${AFD_PD_REMOTE_REF}"
+git -C "${CODE_ROOT}/afd-plugin" cat-file -e "${AFD_PD_COMMIT}^{commit}"
+git -C "${CODE_ROOT}/afd-plugin" checkout --detach "${AFD_PD_COMMIT}"
+test "$(git -C "${CODE_ROOT}/afd-plugin" rev-parse HEAD)" = "${AFD_PD_COMMIT}"
+test -z "$(git -C "${CODE_ROOT}/afd-plugin" status --short)"
+```
+
+vLLM 和 vLLM-Ascend 继续使用第 1 节的固定提交。两台机器分别记录：
+
+```bash
+git -C "${CODE_ROOT}/vllm-release-v0.23.0" rev-parse HEAD
+git -C "${CODE_ROOT}/vllm-ascend-rfc-vllm-cann" rev-parse HEAD
+git -C "${CODE_ROOT}/afd-plugin" rev-parse HEAD
+```
+
+当前 A3 功能验证 wheel 为：
+
+```text
+mooncake_transfer_engine-0.3.9-cp312-cp312-manylinux_2_39_aarch64.whl
+SHA256: 0f9964801b24fd683d6016e1196cc0606fc87b0285b45d89c433650b9477ca12
+```
+
+开发机现有副本位于：
+
+```text
+/mnt/workspace/validation/dsv4_afd_v023_mooncake_pd_m9_contract_20260821_181148/
+mooncake_transfer_engine-0.3.9-cp312-cp312-manylinux_2_39_aarch64.whl
+```
+
+将 wheel 复制到两个 A3 节点的相同路径，并在两端执行：
+
+```bash
+cd /path/to/mooncake-wheel
+sha256sum mooncake_transfer_engine-0.3.9-cp312-cp312-manylinux_2_39_aarch64.whl
+```
+
+输出必须与上述 SHA256 完全相同。该 wheel 只作为 A3/CANN 9.0.1/Python 3.12
+功能产物；A5 必须重新构建，不能复用。
+
+### 17.3 两台 A3 安装 Mooncake 运行依赖
+
+先按第 3-7 节在两端安装相同的 CANN 9.0.1、Python venv、vLLM、
+vLLM-Ascend 和当前 M9 afd-plugin。Ubuntu 验证环境额外需要：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  libgoogle-glog0v6t64 libjsoncpp25 libjemalloc2 netcat-openbsd
+```
+
+openEuler 或其他发行版应安装提供 `libglog.so`、`libjsoncpp.so` 和
+`libjemalloc.so.2` 的对应包，然后以 `ldd` 门禁为准，不能照搬 Ubuntu 包名。
+
+在两端安装同一个 wheel：
+
+```bash
+export VENV_ROOT=/mnt/workspace/code/.venvs/afd-v023-vllm-cann
+"${VENV_ROOT}/bin/python" -m pip install \
+  --no-deps --force-reinstall \
+  /path/to/mooncake_transfer_engine-0.3.9-cp312-cp312-manylinux_2_39_aarch64.whl
+```
+
+然后在两端使用 PD launcher 将使用的同一环境执行：
+
+```bash
+cd /mnt/workspace/code/afd-plugin
+export DSV4_CANN_ROOT=/mnt/workspace/code/.ascend/cann-9.0.1/cann-9.0.1
+export DSV4_RUNTIME_VENV=/mnt/workspace/code/.venvs/afd-v023-vllm-cann
+export DSV4_VLLM_ROOT=/mnt/workspace/code/vllm-release-v0.23.0
+export DSV4_VLLM_ASCEND_ROOT=/mnt/workspace/code/vllm-ascend-rfc-vllm-cann
+
+source tools/dsv4/check_mooncake_runtime.sh
+python -c 'from importlib.metadata import version; print(version("mooncake-transfer-engine"))'
+```
+
+门禁要求输出 `MooncakeHybridConnector metadata contract passed`、
+`Mooncake runtime check passed` 和版本 `0.3.9`。脚本会预加载
+`/usr/lib/aarch64-linux-gnu/libjemalloc.so.2`；不能删除这个 preload，否则
+`torch_npu + Mooncake` 组合进程可能在退出阶段发生堆损坏。它还会检查 Mooncake
+扩展来自目标 venv、`ldd` 没有 `not found`，且依赖中没有 CANN 9.1.0 泄漏。
+
+### 17.4 双机网络和端口门禁
+
+在开始部署前明确填写两个地址和网卡：
+
+```bash
+export PREFILL_IP="REPLACE_WITH_A3_P_IP"
+export DECODE_IP="REPLACE_WITH_A3_D_IP"
+export NIC_NAME="eth0"
+```
+
+分别在对应节点核对本机地址，不能把示例 IP 复制过去：
+
+```bash
+ip -o -4 addr show dev "${NIC_NAME}"
+ping -c 3 "${PREFILL_IP}"
+ping -c 3 "${DECODE_IP}"
+```
+
+`MooncakeHybridConnector` 通过 vLLM 的 `get_ip()` 把地址写入
+`kv_transfer_params`，因此两个节点都必须显式设置：
+
+```bash
+export VLLM_HOST_IP="本机对端可达的 IPv4"
+export HCCL_IF_IP="${VLLM_HOST_IP}"
+export GLOO_SOCKET_IFNAME="${NIC_NAME}"
+export HCCL_SOCKET_IFNAME="${NIC_NAME}"
+```
+
+当前 launcher 在 PD 模式下也会把未设置的 `VLLM_HOST_IP` 绑定到
+`HCCL_IF_IP`，但正式部署仍建议显式设置并保存到环境记录。
+
+需要允许的 TCP 端口如下：
+
+| 节点/用途 | 端口 |
+| --- | --- |
+| A3-P Prefill HTTP | `8100` |
+| A3-P Mooncake ZMQ handshake | `30000-30007` |
+| A3-D Decode Attention HTTP | `8910` |
+| A3-D Mooncake ZMQ handshake | `30100-30107` |
+| Proxy HTTP | `9000` |
+| 两端 Mooncake TransferEngine/Ascend transport 动态端口 | `15000-17000` |
+| A3-D 本机 AFD rendezvous | `29761` |
+| A3-D Attention/FFN HCCL base | `51000` / `52000` |
+
+当前 Mooncake 源码使用以下名字限制动态 RPC 端口。`PRC` 是该版本已有的环境
+变量拼写，不要自行改成 `RPC`：
+
+```bash
+export MC_MIN_PRC_PORT=15000
+export MC_MAX_PRC_PORT=17000
+```
+
+防火墙必须允许两台机器双向访问 handshake 和 `15000-17000`。服务启动后再用
+`ss -ltnp` 和 `nc -vz <peer> <port>` 验证实际监听；启动前端口未监听是正常的。
+
+### 17.5 每台机器的本地 Mooncake NPU 组件门禁
+
+在模型服务启动前，两台机器各自选择两个空闲 NPU 执行本地两进程传输。这个
+脚本固定使用 loopback，只证明本机 Mooncake Ascend 引擎可注册和传输 NPU
+buffer，不代替第 17.9 节的跨机实模请求：
+
+```bash
+cd /mnt/workspace/code/afd-plugin
+source tools/dsv4/check_mooncake_runtime.sh
+npu-smi info
+python tools/dsv4/check_mooncake_npu_roundtrip.py \
+  --producer-device 0 --consumer-device 1
+npu-smi info
+```
+
+预期 JSON 包含 `"bytes":2097152`、`"iterations":2` 和
+`"transfer_results":[0,0]`，两个子进程退出码均为 0。
+
+### 17.6 启动 A3-P Prefill
+
+在 A3-P 的一个干净 shell 中执行，所有 IP 都必须替换为实际值：
+
+```bash
+cd /mnt/workspace/code/afd-plugin
+export DSV4_CANN_ROOT=/mnt/workspace/code/.ascend/cann-9.0.1/cann-9.0.1
+export DSV4_RUNTIME_VENV=/mnt/workspace/code/.venvs/afd-v023-vllm-cann
+export DSV4_VLLM_ROOT=/mnt/workspace/code/vllm-release-v0.23.0
+export DSV4_VLLM_ASCEND_ROOT=/mnt/workspace/code/vllm-ascend-rfc-vllm-cann
+export MODEL_PATH=/mnt/workspace/models/DeepSeek-V4-Flash-w8a8-mtp
+
+export VLLM_HOST_IP="REPLACE_WITH_A3_P_IP"
+export HCCL_IF_IP="${VLLM_HOST_IP}"
+export GLOO_SOCKET_IFNAME=eth0
+export HCCL_SOCKET_IFNAME=eth0
+export MC_MIN_PRC_PORT=15000
+export MC_MAX_PRC_PORT=17000
+
+export API_HOST=0.0.0.0
+export API_PORT=8100
+export PREFILL_DEVICES=0,1,2,3,4,5,6,7
+export PREFILL_DP_SIZE=2
+export PREFILL_TP_SIZE=4
+export DECODE_DP_SIZE=8
+export DECODE_TP_SIZE=1
+export MOONCAKE_ENGINE_ID=dsv4-afd-prefill
+export MOONCAKE_KV_PORT=30000
+export MAX_MODEL_LEN=4096
+export MAX_NUM_BATCHED_TOKENS=4096
+export MAX_NUM_SEQS=16
+
+export PD_LOG_ROOT=/mnt/workspace/logs/dsv4-afd-mooncake-pd
+mkdir -p "${PD_LOG_ROOT}"
+bash recipe/npu/P2pHcclAFDConnector/deepseek_v4/mooncake_pd/prefill.sh \
+  > "${PD_LOG_ROOT}/prefill.log" 2>&1 &
+prefill_pid=$!
+printf '%s\n' "${prefill_pid}" > "${PD_LOG_ROOT}/prefill.pid"
+```
+
+### 17.7 启动 A3-D Decode A8F8
+
+Decode FFN 与 Attention 必须前后紧邻启动。FFN 不配置 Mooncake，也没有业务
+HTTP health；只有 Attention 使用 `ENABLE_PD=1` 成为 KV consumer：
+
+```bash
+cd /mnt/workspace/code/afd-plugin
+export DSV4_CANN_ROOT=/mnt/workspace/code/.ascend/cann-9.0.1/cann-9.0.1
+export DSV4_RUNTIME_VENV=/mnt/workspace/code/.venvs/afd-v023-vllm-cann
+export DSV4_VLLM_ROOT=/mnt/workspace/code/vllm-release-v0.23.0
+export DSV4_VLLM_ASCEND_ROOT=/mnt/workspace/code/vllm-ascend-rfc-vllm-cann
+export MODEL_PATH=/mnt/workspace/models/DeepSeek-V4-Flash-w8a8-mtp
+
+export VLLM_HOST_IP="REPLACE_WITH_A3_D_IP"
+export HCCL_IF_IP="${VLLM_HOST_IP}"
+export GLOO_SOCKET_IFNAME=eth0
+export HCCL_SOCKET_IFNAME=eth0
+export MC_MIN_PRC_PORT=15000
+export MC_MAX_PRC_PORT=17000
+
+export AFD_HOST=127.0.0.1
+export AFD_PORT=29761
+export ATTENTION_RANKS=8
+export FFN_RANKS=8
+export ATTENTION_DEVICES=0,1,2,3,4,5,6,7
+export FFN_DEVICES=8,9,10,11,12,13,14,15
+export TENSOR_PARALLEL_SIZE=1
+export EXECUTION_MODE=eager
+export U_BATCHES=1
+export ENABLE_MTP=0
+export PREFILL_DP_SIZE=2
+export PREFILL_TP_SIZE=4
+export MOONCAKE_ENGINE_ID=dsv4-afd-decode
+export MOONCAKE_KV_PORT=30100
+export MAX_MODEL_LEN=4096
+
+export PD_LOG_ROOT=/mnt/workspace/logs/dsv4-afd-mooncake-pd
+mkdir -p "${PD_LOG_ROOT}"
+API_HOST=0.0.0.0 API_PORT=8911 \
+  bash recipe/npu/P2pHcclAFDConnector/deepseek_v4/afd_ffn.sh \
+  > "${PD_LOG_ROOT}/ffn.log" 2>&1 &
+ffn_pid=$!
+printf '%s\n' "${ffn_pid}" > "${PD_LOG_ROOT}/ffn.pid"
+
+sleep 2
+
+ENABLE_PD=1 API_HOST=0.0.0.0 API_PORT=8910 \
+  bash recipe/npu/P2pHcclAFDConnector/deepseek_v4/afd_attention.sh \
+  > "${PD_LOG_ROOT}/attention.log" 2>&1 &
+attention_pid=$!
+printf '%s\n' "${attention_pid}" > "${PD_LOG_ROOT}/attention.pid"
+```
+
+不要等待 FFN HTTP ready 后才启动 Attention；FFN 会在 AFD/HCCL 初始化中等待
+Attention。也不要向 `8911` 发送业务请求或健康检查。
+
+### 17.8 Readiness 和启动 Proxy
+
+从准备运行 Proxy 的节点检查两个后端：
+
+```bash
+curl -fsS --max-time 10 "http://REPLACE_WITH_A3_P_IP:8100/health"
+curl -fsS --max-time 10 "http://REPLACE_WITH_A3_D_IP:8910/health"
+```
+
+在 A3-D 确认 8 个 FFN rank 都进入 connector loop：
+
+```bash
+rg -o 'AFD FFN EngineCore started; workers run connector loop' \
+  /mnt/workspace/logs/dsv4-afd-mooncake-pd/ffn.log | wc -l
+```
+
+结果必须为 8。然后在任一能访问两端 HTTP 的节点启动 Proxy：
+
+```bash
+cd /mnt/workspace/code/afd-plugin
+export DSV4_RUNTIME_VENV=/mnt/workspace/code/.venvs/afd-v023-vllm-cann
+export DSV4_VLLM_ASCEND_ROOT=/mnt/workspace/code/vllm-ascend-rfc-vllm-cann
+export PREFILL_HOSTS="REPLACE_WITH_A3_P_IP"
+export PREFILL_PORTS="8100"
+export DECODE_HOSTS="REPLACE_WITH_A3_D_IP"
+export DECODE_PORTS="8910"
+export PROXY_HOST=0.0.0.0
+export PROXY_PORT=9000
+
+bash recipe/npu/P2pHcclAFDConnector/deepseek_v4/mooncake_pd/proxy.sh \
+  > /mnt/workspace/logs/dsv4-afd-mooncake-pd/proxy.log 2>&1 &
+proxy_pid=$!
+printf '%s\n' "${proxy_pid}" \
+  > /mnt/workspace/logs/dsv4-afd-mooncake-pd/proxy.pid
+
+curl -fsS --max-time 10 http://127.0.0.1:9000/healthcheck
+```
+
+Proxy 的健康接口是 `/healthcheck`。Decode FFN 仍然没有 HTTP health。
+
+### 17.9 跨机 PD smoke 和 golden 验收
+
+业务请求只发送给 Proxy，不能直接请求 Decode Attention，否则会绕过 Prefill
+和 Mooncake：
+
+```bash
+curl -fsS http://127.0.0.1:9000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model":"dsv4-afd",
+    "prompt":"Please explain why deterministic validation matters.",
+    "temperature":0,
+    "seed":1024,
+    "max_tokens":32,
+    "stream":false,
+    "return_token_ids":true
+  }'
+```
+
+请求成功后，A3-D Attention 日志至少出现一条真实 KV transfer 成功记录：
+
+```bash
+rg -n 'KV cache transfer for request .* took .* remote_session_id' \
+  /mnt/workspace/logs/dsv4-afd-mooncake-pd/attention.log
+```
+
+`remote_session_id` 中的地址必须是 A3-P 的可达 IP，不能是 `127.0.0.1` 或
+`0.0.0.0`。随后使用目标栈原生 golden 对 Proxy 做 10 条 prompt、3 轮和 batch
+1/8/32 验收：
+
+```bash
+export PD_VALIDATION_ROOT=/mnt/workspace/validation/dsv4_afd_v023_mooncake_pd_m9_f0
+mkdir -p "${PD_VALIDATION_ROOT}"
+
+python recipe/npu/CAMP2pAFDConnector/deepseek_v4/validate_golden.py \
+  --endpoint http://127.0.0.1:9000/v1/completions \
+  --model dsv4-afd \
+  --golden /mnt/workspace/validation/dsv4_v023_vllm_cann_native_baseline/golden_results.json \
+  --rounds 3 \
+  --batch-sizes 1 8 32 \
+  --output "${PD_VALIDATION_ROOT}/golden.json"
+```
+
+`golden.json` 必须满足 `passed=true`、串行请求 30/30 token exact；batch 记录
+用于验证请求结构和数量，不能用 smoke 文本相似替代 token IDs 比较。
+
+再发送一个预期由客户端取消的长请求。`curl` 返回 28 表示客户端超时取消，
+之后 Proxy、Prefill 和 Decode 必须仍然健康并能完成一个正常请求：
+
+```bash
+set +e
+curl -fsS --max-time 1 http://127.0.0.1:9000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model":"dsv4-afd",
+    "prompt":"Write a detailed deterministic systems validation checklist.",
+    "temperature":0,
+    "seed":1024,
+    "max_tokens":512,
+    "stream":false
+  }'
+cancel_rc=$?
+set -e
+test "${cancel_rc}" -eq 28
+
+curl -fsS --max-time 10 http://127.0.0.1:9000/healthcheck
+curl -fsS http://127.0.0.1:9000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"dsv4-afd","prompt":"Recovery check.","temperature":0,"max_tokens":8}'
+```
+
+如果请求在 1 秒内正常完成而 `cancel_rc=0`，该轮没有覆盖取消路径，应使用更长
+prompt 或输出重新执行；不能把它记为取消恢复通过。
+
+### 17.10 停止、二次启动和清理
+
+先停止入口，再按 Decode Attention、Decode FFN、Prefill 的顺序停止：
+
+```bash
+# Proxy 所在节点
+kill -TERM "$(cat /mnt/workspace/logs/dsv4-afd-mooncake-pd/proxy.pid)"
+
+# A3-D
+kill -TERM "$(cat /mnt/workspace/logs/dsv4-afd-mooncake-pd/attention.pid)"
+kill -TERM "$(cat /mnt/workspace/logs/dsv4-afd-mooncake-pd/ffn.pid)"
+
+# A3-P
+kill -TERM "$(cat /mnt/workspace/logs/dsv4-afd-mooncake-pd/prefill.pid)"
+```
+
+应由保存 PID 的原 shell 分别 `wait` 并记录退出码。不要用全局 `pkill`。两端
+检查：
+
+```bash
+npu-smi info
+ss -ltnp | rg ':(8100|8910|9000|29761|3000[0-7]|3010[0-7])\b' || true
+rg -n \
+  'EngineCore encountered a fatal error|AFD NPU FFN worker loop failed|Mooncake transfer failed|Communication_Error|507015|Traceback' \
+  /mnt/workspace/logs/dsv4-afd-mooncake-pd/*.log
+```
+
+第一次完整停止后，重新执行第 17.6-17.9 节，至少完成 Proxy health、一个 smoke
+请求和一次 KV transfer 证据，再次正常停止。二次启动不能复用旧 PID、旧端口
+监听或旧请求 metadata。
+
+### 17.11 PD 安装验证通过条件和产物
+
+双机 PD 安装只有同时满足以下条件才算完成：
+
+1. 两端 CANN、venv、三个源码 commit 和 Mooncake wheel SHA256 完全一致；
+2. 两端 `check_mooncake_runtime.sh` 通过且没有 CANN 9.1.0 路径；
+3. 两端本地 Mooncake NPU round-trip 都为 2/2、2 MiB 逐字节一致；
+4. Prefill、8 个 Attention rank、8 个 FFN loop 和 Proxy 全部 ready；
+5. Proxy smoke 产生真实跨机 KV transfer，日志中的 remote IP/port 正确；
+6. 10 条 golden 连续 3 轮达到 30/30 token IDs 完全一致；
+7. batch 1/8/32、请求取消后的恢复、正常停止和二次启动通过；
+8. 两端无 fatal 日志、无遗留端口、无遗留推理进程和 NPU 占用。
+
+每台机器分别保存 `environment.txt`、`git.txt`、`npu_before.txt`、启动命令、
+原始日志、`golden.json`、退出码和 `npu_after.txt`。推荐目录：
+
+```text
+/mnt/workspace/validation/dsv4_afd_v023_mooncake_pd_m9_f0_<timestamp>/prefill/
+/mnt/workspace/validation/dsv4_afd_v023_mooncake_pd_m9_f0_<timestamp>/decode/
+/mnt/workspace/validation/dsv4_afd_v023_mooncake_pd_m9_f0_<timestamp>/proxy/
+```
+
+当前已有的
+`dsv4_afd_v023_mooncake_pd_m9_contract_20260821_181148/summary.json` 状态是
+`real_transfer_component_passed_f0_pending`，只能证明安装组件门禁，不能替代
+本节双机实模 F0。完成上述产物并审核后，才提交 M9 验证结论并创建功能 tag。
+
+### 17.12 回传小输出件
+
+不需要回传第 17.11 节中的全部原始目录。三种角色分别执行 `collect`：
+
+```bash
+bash tools/dsv4/mooncake_pd_manual/pd.sh collect /mnt/workspace/pd-prefill.env
+bash tools/dsv4/mooncake_pd_manual/pd.sh collect /mnt/workspace/pd-decode.env
+bash tools/dsv4/mooncake_pd_manual/pd.sh collect /mnt/workspace/pd-proxy.env
+```
+
+每个角色会在其 `OUTPUT_ROOT` 下生成：
+
+```text
+dsv4-m9-pd-<role>-<timestamp>.tar.gz
+dsv4-m9-pd-<role>-<timestamp>.tar.gz.sha256
+```
+
+将三个 `.tar.gz` 及对应 `.sha256` 发回即可。默认每包硬上限 2 MiB，三包合计
+不超过约 6 MiB；通常会更小。包内只包含 commit/包版本/wheel SHA256、PID 和
+端口状态、`npu-smi`、runtime/round-trip 结果、每个角色日志末尾 256 KiB、
+最近 50 条 KV transfer 证据、最近 200 条 fatal marker，以及 Proxy 的
+smoke/golden/batch/取消恢复结果。
+
+输出件明确不包含完整日志、模型、wheel、profiler、core dump、完整环境变量或
+API key。若包超过上限，`collect` 会删除超限包并报错；此时降低配置中的
+`ARTIFACT_LOG_TAIL_BYTES` 后重新收集，不要手工发送整个日志目录。

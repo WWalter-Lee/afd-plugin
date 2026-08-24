@@ -171,7 +171,7 @@ U1 三轮原始吞吐为 17.004、16.229、18.012 token/s；U2 为 10.892、13.6
 
 目标栈 U1 比旧栈同参数、同同步优化的 57.724 token/s 低 70.408%。这说明切换上游栈后必须重新建立绝对性能基线，不能继承旧数字；它不推翻同步优化在旧栈 P4/P7 A/B 中已证明的 +17.521% 收益。若要量化该优化在目标栈上的独立贡献，仍需在目标栈做一次开启/关闭优化的同提交 A/B。
 
-当前性能结论仍是“eager/U2 收益失败，Graph/U2 出现强候选信号但尚未正式验收”。HCCL P2P Graph/U1、Graph/U2、eager/U1 + MTP、target Graph/U1 + draft eager MTP、eager/U2 + MTP 和 target Graph/U2 + draft eager MTP 已作为独立功能里程碑完成。M1、M2、M3、M4 的 P1 分别为 28.280、22.835、16.238 和 31.473 output token/s，都只是轻量 guard；M4 的单轮改善不能覆盖 M3/P8D 已登记的等待缺口。P8C/P8D 在保持同步 `send/recv` 的前提下完成 comm stream 和单线程 `layer -> stage`，但 eager/U2 P1 仍比 U1 回退 46.197%。Graph/U2 MTP-off P1 达到 107.189 token/s，但只有一轮且执行模式改变，不能宣称性能收益。当前按功能优先继续独立边界，功能组合闭环后再以 Graph/U1、Graph/U2、MTP on/off 和同预算 native Graph 三轮 P2 建立正式结论。仍不引入异步 HCCL，也不进入 PD 或 A5 性能外推。
+当前性能结论仍是“eager/U2 收益失败，Graph/U2 出现强候选信号但尚未正式验收”。HCCL P2P Graph/U1、Graph/U2、eager/U1 + MTP、target Graph/U1 + draft eager MTP、eager/U2 + MTP 和 target Graph/U2 + draft eager MTP 已作为独立功能里程碑完成。M1、M2、M3、M4 的 P1 分别为 28.280、22.835、16.238 和 31.473 output token/s，都只是轻量 guard；M4 的单轮改善不能覆盖 M3/P8D 已登记的等待缺口。P8C/P8D 在保持同步 `send/recv` 的前提下完成 comm stream 和单线程 `layer -> stage`，但 eager/U2 P1 仍比 U1 回退 46.197%。Graph/U2 MTP-off P1 达到 107.189 token/s，但只有一轮且执行模式改变，不能宣称性能收益。当前按功能优先进入 M9 Mooncake PD，功能组合闭环后再以 Graph/U1、Graph/U2、MTP on/off 和同预算 native Graph 三轮 P2 建立正式结论。M9 功能开发不引入异步 HCCL，也不做 A5 性能外推。
 
 ### 3.4 当前 profiling 观察基线
 
@@ -254,10 +254,10 @@ AFD world        -> [F0 ... F(F-1), A0 ... A(A-1)]
 - Graph/U3；
 - Attention 侧 gate；
 - 非等量拓扑 + full draft Graph 实模 E2E 和多 speculative token；
-- Mooncake PD；
+- Mooncake PD 实模 E2E（M9 的 TP1 eager/U1 配置和门禁已开始实现）；
 - sequence parallel；
 - A/F 非等量实模 E2E（connector 和 A2F1/A4F2 组件已通过，A3 A8F4 受 HBM 阻塞）；
-- TP、PP、CP 或 DCP 大于 1；
+- 超出 M8 已冻结 DP4/TP2 边界的 TP，以及 PP、SP、CP 或 DCP 大于 1；
 - A5 实机 HCCL P2P 验证与调优。
 
 ## 5. A3 后续开发阶段
@@ -1266,6 +1266,35 @@ M9 功能开发顺序：
 5. 生成同平台 PD control/golden，执行串行 token exact、batch 和生命周期 F0；
 6. 再组合 U2、Graph 和 MTP，每个组合保留独立 fail-fast 与验证产物。
 
+截至 `2026-08-21`，M9 第 1 步审计和首个代码门禁已经落地：固定目标栈注册的
+KV connector 为 `MooncakeHybridConnector`；PD 只连接 Prefill 与 Decode Attention，
+Decode FFN 不配置 KV connector。插件当前只开放 `P2pHcclAFDConnector + TP1 +
+eager/U1 + MTP off + kv_consumer`，并校验 `engine_id`、Mooncake 端口以及
+Prefill/Decode DP/TP 元数据。结构化配置生成器、Prefill/Attention/Proxy recipe 和
+运行库预检已经加入；Graph、U2、MTP 和 TP2 的 PD 组合继续 fail-fast。
+
+当前 A3 环境门禁已经补齐：`libgoogle-glog0v6t64`、`libjsoncpp25`、`libjemalloc2`
+和本地 Ascend Mooncake 0.3.9 wheel 已安装，扩展由目标 `afd-v023-vllm-cann`
+venv 自身提供；`TransferEngine` import、`MooncakeHybridConnector` 请求 metadata、
+Prefill/Decode DP/TP 解析及 CANN 9.1.0 泄漏检查均通过。最小 import 矩阵还确认
+`torch_npu + Mooncake` 必须预加载 `libjemalloc.so.2`，否则进程退出阶段会触发堆损坏；
+PD launchers 通过运行门禁继承该 preload，standalone AF 和 FFN 不受影响。安装 wheel
+使用现有本地构建产物，未修改 Mooncake、vLLM 或 vLLM-Ascend 工作树。两进程真实
+NPU 组件也已通过：NPU0/NPU1 使用 `P2PHANDSHAKE + ascend` 注册 2 MiB buffer，
+连续两次同步传输返回 0、逐字节一致，双方均正常析构退出。下一步启动 TP1 eager/U1
+实模 F0。
+
+当前 contract 证据包括：插件 Mooncake feature gate 13/13、recipe/config/EngineCore
+71/71、固定 vLLM-Ascend `MooncakeHybridConnector` 5/5 和通用 Mooncake connector
+92/92、真实两进程 NPU round-trip 2/2，完整 Ascend runner 回归也通过。阶段汇总保存在：
+
+```text
+/mnt/workspace/validation/dsv4_afd_v023_mooncake_pd_m9_contract_20260821_181148/summary.json
+```
+
+该汇总状态是 `real_transfer_component_passed_f0_pending`，不是 M9 F0 完成证明，
+不得据此创建 M9 功能 tag。
+
 standalone AF 的 `P8D-PERF-001` 在 M9 期间继续保持 Open，但不阻塞上述功能
 开发。进入 M9 性能结论和性能 tag 前，仍必须补齐：AFD 相对非 AFD 的公平
 资源对照、A2F/F2A/FFN wait/bubble profile、三轮稳定性，以及 PD control 对照。
@@ -1354,7 +1383,7 @@ U3 仍不纳入当前路线。
 12. A3-P8/P8C/P8D 的 eager 性能缺口 `P8D-PERF-001` 仍为 Open；Graph/U2 P1 的 107.189 token/s 和 M4 P1 的 31.473 token/s 都不能直接关闭该问题。功能组合闭环后再做 Graph/U1、Graph/U2、MTP on/off 和同预算 native Graph 三轮 P2；
 13. A3-P7M7 full draft ACL Graph 已完成；恢复时核对专项报告、U1/U2 各 30/30、A4F2 组件、capture bucket、128/128 P1 和 cleanup，不再沿用旧的 6/30 结论；
 14. A3-P7M8 TP2 功能基线已完成；恢复时核对专项报告、三个 TP2 组件产物、原生 DP4/TP2 golden 和 A8F8 eager/U1 30/30 F0；不要把失败的 TP2 full-draft Graph U2 最大组合写成支持；
-15. 当前功能里程碑为 M9 Mooncake PD；先审计固定栈 Mooncake/KV connector，再做 TP1 eager/U1 PD + AF，随后复用 M8 的 DP4/TP2 契约；
+15. 当前功能里程碑为 M9 Mooncake PD；固定栈 connector/API 审计、目标 venv Mooncake 环境、TP1 eager/U1 配置、metadata contract 和真实两进程 NPU round-trip 已通过，当前进入两台 A3 的实模 PD + A8F8 F0，随后复用 M8 的 DP4/TP2 契约；
 16. SP/CP/DCP 和 PP 全部后移到 M9 之后；更多 speculative token 保持独立里程碑；
 17. A5 到位后从硬件审计和独立工具链开始，不复用 A3 二进制，并重新生成原生 MTP golden；
 18. 每次阶段完成都保存日志、原始数据、解析结果和清理证据。

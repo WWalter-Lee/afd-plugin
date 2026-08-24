@@ -31,6 +31,11 @@ ENABLE_MTP="${ENABLE_MTP:-0}"
 MTP_NUM_SPECULATIVE_TOKENS="${MTP_NUM_SPECULATIVE_TOKENS:-1}"
 MTP_DRAFT_EXECUTION="${MTP_DRAFT_EXECUTION:-eager}"
 AFD_ASYNC_SCHEDULING="${AFD_ASYNC_SCHEDULING:-auto}"
+ENABLE_PD="${ENABLE_PD:-0}"
+MOONCAKE_ENGINE_ID="${MOONCAKE_ENGINE_ID:-dsv4-afd-decode}"
+MOONCAKE_KV_PORT="${MOONCAKE_KV_PORT:-30100}"
+PREFILL_DP_SIZE="${PREFILL_DP_SIZE:-2}"
+PREFILL_TP_SIZE="${PREFILL_TP_SIZE:-4}"
 
 export ASCEND_RT_VISIBLE_DEVICES="${ATTENTION_DEVICES:-${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}}"
 export HCCL_IF_IP="${HCCL_IF_IP:-192.169.91.106}"
@@ -185,6 +190,41 @@ case "$AFD_ASYNC_SCHEDULING" in
     ;;
 esac
 
+case "$ENABLE_PD" in
+  0)
+    KV_TRANSFER_ARGS=()
+    ;;
+  1)
+    if [[ "$AFD_CONNECTOR" != "P2pHcclAFDConnector" ]]; then
+      echo "DeepSeek-V4 Mooncake PD requires P2pHcclAFDConnector" >&2
+      exit 2
+    fi
+    if [[ "$EXECUTION_MODE" != "eager" || "$U_BATCHES" != "1" ]]; then
+      echo "DeepSeek-V4 Mooncake PD M9 baseline requires eager/U1" >&2
+      exit 2
+    fi
+    if [[ "$ENABLE_MTP" != "0" || "$TENSOR_PARALLEL_SIZE" != "1" ]]; then
+      echo "DeepSeek-V4 Mooncake PD M9 baseline requires MTP off and TP1" >&2
+      exit 2
+    fi
+    export VLLM_HOST_IP="${VLLM_HOST_IP:-${HCCL_IF_IP}}"
+    source "${ROOT_DIR}/tools/dsv4/check_mooncake_runtime.sh"
+    KV_TRANSFER_CONFIG="$(python "${ROOT_DIR}/tools/dsv4/mooncake_pd_config.py" \
+      --role kv_consumer \
+      --engine-id "$MOONCAKE_ENGINE_ID" \
+      --kv-port "$MOONCAKE_KV_PORT" \
+      --prefill-dp-size "$PREFILL_DP_SIZE" \
+      --prefill-tp-size "$PREFILL_TP_SIZE" \
+      --decode-dp-size "$ATTENTION_DP_SIZE" \
+      --decode-tp-size "$TENSOR_PARALLEL_SIZE")"
+    KV_TRANSFER_ARGS=(--kv-transfer-config "$KV_TRANSFER_CONFIG")
+    ;;
+  *)
+    echo "ENABLE_PD must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
+
 exec vllm serve "$MODEL_PATH" \
   --host "$API_HOST" \
   --port "$API_PORT" \
@@ -205,6 +245,7 @@ exec vllm serve "$MODEL_PATH" \
   --quantization ascend \
   --block-size 128 \
   --additional-config "$ADDITIONAL_CONFIG" \
+  "${KV_TRANSFER_ARGS[@]}" \
   "${SCHEDULING_ARGS[@]}" \
   "${MTP_ARGS[@]}" \
   "${UBATCH_ARGS[@]}" \

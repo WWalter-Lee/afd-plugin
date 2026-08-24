@@ -3801,6 +3801,22 @@ def _mtp_speculative_config(**overrides):
     return SimpleNamespace(**values)
 
 
+def _mooncake_pd_config(**overrides):
+    values = {
+        "kv_connector": "MooncakeHybridConnector",
+        "kv_role": "kv_consumer",
+        "engine_id": "dsv4-afd-decode",
+        "kv_port": 30100,
+        "kv_parallel_size": 1,
+        "kv_connector_extra_config": {
+            "prefill": {"dp_size": 2, "tp_size": 4},
+            "decode": {"dp_size": 1, "tp_size": 1},
+        },
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def test_dsv4_feature_validation_accepts_eager_u1_camp2p():
     fail_if_unsupported_npu_afd_features(_dsv4_config())
 
@@ -3845,6 +3861,127 @@ def test_dsv4_feature_validation_accepts_eager_hccl_p2p_a2f1():
     )
 
     fail_if_unsupported_npu_afd_features(config)
+
+
+def test_dsv4_feature_validation_accepts_mooncake_pd_eager_u1_tp1():
+    config = _dsv4_config(
+        cudagraph_mode="FULL_DECODE_ONLY",
+        data_parallel_size=1,
+        kv_transfer_config=_mooncake_pd_config(),
+    )
+    config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda config: config.additional_config["afd"].update(role="ffn"),
+            "only to Attention",
+        ),
+        (
+            lambda config: config.additional_config["afd"].update(
+                connector="CAMP2pAFDConnector"
+            ),
+            "requires P2pHcclAFDConnector",
+        ),
+        (
+            lambda config: setattr(
+                config.kv_transfer_config,
+                "kv_connector",
+                "MooncakeConnectorV1",
+            ),
+            "only MooncakeHybridConnector",
+        ),
+        (
+            lambda config: setattr(
+                config.kv_transfer_config,
+                "kv_role",
+                "kv_producer",
+            ),
+            "kv_role=kv_consumer",
+        ),
+        (
+            lambda config: setattr(config.model_config, "enforce_eager", False),
+            "supports only eager",
+        ),
+        (
+            lambda config: setattr(config.parallel_config, "use_ubatching", True),
+            "supports only U1",
+        ),
+        (
+            lambda config: setattr(
+                config,
+                "speculative_config",
+                _mtp_speculative_config(),
+            ),
+            "does not support MTP",
+        ),
+        (
+            lambda config: setattr(
+                config.kv_transfer_config,
+                "kv_parallel_size",
+                2,
+            ),
+            "kv_parallel_size=1",
+        ),
+        (
+            lambda config: config.kv_transfer_config.kv_connector_extra_config[
+                "decode"
+            ].update(dp_size=2),
+            "topology must match Attention DP/TP",
+        ),
+        (
+            lambda config: config.kv_transfer_config.kv_connector_extra_config.pop(
+                "prefill"
+            ),
+            "requires prefill DP/TP topology",
+        ),
+        (
+            lambda config: config.kv_transfer_config.kv_connector_extra_config[
+                "prefill"
+            ].update(tp_size=0),
+            "prefill.tp_size must be a positive integer",
+        ),
+    ],
+)
+def test_dsv4_feature_validation_rejects_unvalidated_mooncake_pd_modes(
+    mutation,
+    message,
+):
+    config = _dsv4_config(
+        cudagraph_mode="FULL_DECODE_ONLY",
+        data_parallel_size=1,
+        kv_transfer_config=_mooncake_pd_config(),
+    )
+    config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
+    mutation(config)
+
+    with pytest.raises(RuntimeError, match=message):
+        fail_if_unsupported_npu_afd_features(config)
+
+
+def test_dsv4_feature_validation_rejects_mooncake_pd_tp2_until_m9_extension():
+    config = _dsv4_config(
+        tensor_parallel_size=2,
+        data_parallel_size=1,
+        kv_transfer_config=_mooncake_pd_config(
+            kv_connector_extra_config={
+                "prefill": {"dp_size": 2, "tp_size": 4},
+                "decode": {"dp_size": 1, "tp_size": 2},
+            }
+        ),
+    )
+    config.additional_config["afd"].update(
+        connector="P2pHcclAFDConnector",
+        num_attention_ranks=2,
+        num_ffn_ranks=2,
+    )
+
+    with pytest.raises(RuntimeError, match="baseline supports only TP1"):
+        fail_if_unsupported_npu_afd_features(config)
 
 
 @pytest.mark.parametrize(
@@ -4055,10 +4192,6 @@ def test_dsv4_feature_validation_accepts_hccl_p2p_graph_a2f1():
         (
             lambda config: setattr(config, "speculative_config", object()),
             "MTP supports only P2pHcclAFDConnector",
-        ),
-        (
-            lambda config: setattr(config, "kv_transfer_config", object()),
-            "does not support PD",
         ),
     ],
 )

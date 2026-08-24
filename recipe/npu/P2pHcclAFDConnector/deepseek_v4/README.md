@@ -26,8 +26,11 @@ Supported execution boundary:
   counts;
 - full draft Graph U1 or U2 for equal TP1 ranks, plus component coverage for
   integer-multiple TP1 and equal TP2 topologies;
-- multiple speculative tokens, PD, sequence parallelism, PP/CP/DCP greater
-  than 1, and Attention-side gate are disabled.
+- M9 supports an initial Mooncake PD boundary with Decode TP1, eager/U1 and
+  MTP disabled; only Decode Attention is a `MooncakeHybridConnector` consumer,
+  while Decode FFN has no KV connector;
+- multiple speculative tokens, PD + Graph/U2/MTP/TP2 combinations, sequence
+  parallelism, PP/CP/DCP greater than 1, and Attention-side gate are disabled.
 
 The public communication API remains synchronous: every eager transfer still
 calls blocking `torch.distributed.send/recv`. Eager U2 additionally uses

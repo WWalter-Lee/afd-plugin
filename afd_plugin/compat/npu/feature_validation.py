@@ -249,8 +249,122 @@ def _fail_if_unsupported_deepseek_v4_features(
             raise RuntimeError(
                 "DeepSeek-V4 AFD graph U2 supports only P2pHcclAFDConnector"
             )
-    if getattr(vllm_config, "kv_transfer_config", None) is not None:
-        raise RuntimeError("DeepSeek-V4 AFD standalone baseline does not support PD")
+    _fail_if_unsupported_deepseek_v4_pd(vllm_config, afd_config)
+
+
+def _fail_if_unsupported_deepseek_v4_pd(
+    vllm_config: VllmConfig,
+    afd_config: AFDConfig,
+) -> None:
+    """Validate the first Mooncake PD + AFD functional boundary."""
+    kv_config = getattr(vllm_config, "kv_transfer_config", None)
+    if kv_config is None:
+        return
+
+    if afd_config.role != "attention":
+        raise RuntimeError(
+            "DeepSeek-V4 AFD Mooncake PD attaches KV transfer only to Attention"
+        )
+    if afd_config.connector != "P2pHcclAFDConnector":
+        raise RuntimeError(
+            "DeepSeek-V4 AFD Mooncake PD requires P2pHcclAFDConnector"
+        )
+    if getattr(kv_config, "kv_connector", None) != "MooncakeHybridConnector":
+        raise RuntimeError(
+            "DeepSeek-V4 AFD PD supports only MooncakeHybridConnector"
+        )
+    if getattr(kv_config, "kv_role", None) != "kv_consumer":
+        raise RuntimeError(
+            "DeepSeek-V4 AFD Decode Attention must use kv_role=kv_consumer"
+        )
+    if not bool(vllm_config.model_config.enforce_eager):
+        raise RuntimeError(
+            "DeepSeek-V4 AFD Mooncake PD M9 baseline supports only eager execution"
+        )
+
+    parallel_config = vllm_config.parallel_config
+    if bool(parallel_config.use_ubatching):
+        raise RuntimeError(
+            "DeepSeek-V4 AFD Mooncake PD M9 baseline supports only U1"
+        )
+    if vllm_config.speculative_config is not None:
+        raise RuntimeError(
+            "DeepSeek-V4 AFD Mooncake PD M9 baseline does not support MTP"
+        )
+    if int(parallel_config.tensor_parallel_size) != 1:
+        raise RuntimeError(
+            "DeepSeek-V4 AFD Mooncake PD M9 baseline supports only TP1"
+        )
+    if int(getattr(kv_config, "kv_parallel_size", 1)) != 1:
+        raise RuntimeError(
+            "DeepSeek-V4 AFD Mooncake PD requires kv_parallel_size=1"
+        )
+
+    engine_id = getattr(kv_config, "engine_id", None)
+    if not isinstance(engine_id, str) or not engine_id.strip():
+        raise RuntimeError(
+            "DeepSeek-V4 AFD Mooncake PD requires a non-empty engine_id"
+        )
+    kv_port = getattr(kv_config, "kv_port", None)
+    if (
+        not isinstance(kv_port, int)
+        or isinstance(kv_port, bool)
+        or not 1 <= kv_port <= 65535
+    ):
+        raise RuntimeError(
+            "DeepSeek-V4 AFD Mooncake PD requires kv_port in 1..65535"
+        )
+
+    extra_config = getattr(kv_config, "kv_connector_extra_config", None)
+    if not isinstance(extra_config, dict):
+        raise RuntimeError(
+            "DeepSeek-V4 AFD Mooncake PD requires kv_connector_extra_config"
+        )
+    prefill = _validate_mooncake_parallel_config(extra_config, "prefill")
+    decode = _validate_mooncake_parallel_config(extra_config, "decode")
+
+    if int(decode.get("pp_size", 1)) != 1:
+        raise RuntimeError("DeepSeek-V4 AFD Mooncake PD requires decode pp_size=1")
+    if prefill["tp_size"] < decode["tp_size"]:
+        raise RuntimeError(
+            "DeepSeek-V4 AFD Mooncake PD requires prefill TP >= decode TP"
+        )
+    expected_decode_dp = int(parallel_config.data_parallel_size)
+    expected_decode_tp = int(parallel_config.tensor_parallel_size)
+    if (
+        decode["dp_size"] != expected_decode_dp
+        or decode["tp_size"] != expected_decode_tp
+    ):
+        raise RuntimeError(
+            "DeepSeek-V4 AFD Mooncake decode topology must match Attention DP/TP: "
+            f"Mooncake DP={decode['dp_size']}, TP={decode['tp_size']}; "
+            f"Attention DP={expected_decode_dp}, TP={expected_decode_tp}"
+        )
+def _validate_mooncake_parallel_config(
+    extra_config: dict[str, object],
+    role: str,
+) -> dict[str, int]:
+    topology = extra_config.get(role)
+    if not isinstance(topology, dict):
+        raise RuntimeError(
+            f"DeepSeek-V4 AFD Mooncake PD requires {role} DP/TP topology"
+        )
+    for field in ("dp_size", "tp_size"):
+        value = topology.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise RuntimeError(
+                f"DeepSeek-V4 AFD Mooncake {role}.{field} must be a positive integer"
+            )
+    pp_size = topology.get("pp_size", 1)
+    if not isinstance(pp_size, int) or isinstance(pp_size, bool) or pp_size < 1:
+        raise RuntimeError(
+            f"DeepSeek-V4 AFD Mooncake {role}.pp_size must be a positive integer"
+        )
+    return {
+        "dp_size": int(topology["dp_size"]),
+        "tp_size": int(topology["tp_size"]),
+        "pp_size": int(pp_size),
+    }
 
 
 def _fail_if_unsupported_npu_async_moe_ubatching_features(
