@@ -10,11 +10,11 @@ from types import SimpleNamespace
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-RUNNER_PATH = REPO_ROOT / "recipe/npu/CAMP2pAFDConnector/deepseek_v4/run_validation.py"
-VALIDATOR_PATH = (
-    REPO_ROOT / "recipe/npu/CAMP2pAFDConnector/deepseek_v4/validate_golden.py"
-)
+CAMP_RECIPE_DIR = REPO_ROOT / "recipe/npu/CAMP2pAFDConnector/deepseek_v4"
 HCCL_RECIPE_DIR = REPO_ROOT / "recipe/npu/P2pHcclAFDConnector/deepseek_v4"
+COMMON_RECIPE_DIR = REPO_ROOT / "recipe/npu/deepseek_v4/common"
+RUNNER_PATH = COMMON_RECIPE_DIR / "run_validation.py"
+VALIDATOR_PATH = COMMON_RECIPE_DIR / "validate_golden.py"
 PERFORMANCE_RUNNER_PATH = HCCL_RECIPE_DIR / "run_performance.py"
 NATIVE_PERFORMANCE_RUNNER_PATH = HCCL_RECIPE_DIR / "run_native_performance.py"
 MTP_AUDIT_PATH = REPO_ROOT / "tools/dsv4/audit_mtp_contract.py"
@@ -101,12 +101,15 @@ def test_dsv4_validation_defaults_to_pinned_v023_native_golden():
     )
 
 
-def test_dsv4_role_scripts_offer_u1_graph_and_eager_u2():
-    recipe_dir = RUNNER_PATH.parent
+def test_dsv4_camp_role_scripts_are_connector_isolated():
     for role in ("attention", "ffn"):
-        script = (recipe_dir / f"afd_{role}.sh").read_text(encoding="utf-8")
-        assert "/mnt/workspace/code/.venvs/afd-v023-vllm-cann" in script
-        assert "/mnt/workspace/code/vllm-ascend-rfc-vllm-cann" in script
+        script = (CAMP_RECIPE_DIR / f"afd_{role}.sh").read_text(encoding="utf-8")
+        assert "recipe/npu/deepseek_v4/common/activate_role_runtime.sh" in script
+        assert '"connector":"CAMP2pAFDConnector"' in script
+        assert "P2pHcclAFDConnector" not in script
+        assert "ENABLE_MTP" not in script
+        assert "ENABLE_PD" not in script
+        assert "MOONCAKE" not in script
         assert 'EXECUTION_MODE="${EXECUTION_MODE:-eager}"' in script
         assert 'U_BATCHES="${U_BATCHES:-1}"' in script
         assert 'TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"' in script
@@ -120,40 +123,24 @@ def test_dsv4_role_scripts_offer_u1_graph_and_eager_u2():
         assert '"${UBATCH_ARGS[@]}"' in script
         assert '--max-model-len "$MAX_MODEL_LEN"' in script
         assert '--gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"' in script
-        assert 'ENABLE_MTP="${ENABLE_MTP:-0}"' in script
-        assert 'MTP_NUM_SPECULATIVE_TOKENS="${MTP_NUM_SPECULATIVE_TOKENS:-1}"' in (
-            script
-        )
-        assert 'MTP_DRAFT_EXECUTION="${MTP_DRAFT_EXECUTION:-eager}"' in script
         assert 'AFD_ASYNC_SCHEDULING="${AFD_ASYNC_SCHEDULING:-auto}"' in script
         assert "SCHEDULING_ARGS=(--async-scheduling)" in script
         assert "SCHEDULING_ARGS=(--no-async-scheduling)" in script
         assert '"${SCHEDULING_ARGS[@]}"' in script
-        assert '"method":"mtp"' in script
-        assert '"num_speculative_tokens":1' in script
-        assert "MTP_DRAFT_ENFORCE_EAGER=true" in script
-        assert "MTP_DRAFT_ENFORCE_EAGER=false" in script
-        assert '"enforce_eager":%s' in script
-        assert '"${MTP_ARGS[@]}"' in script
-        assert "MTP requires P2pHcclAFDConnector" in script
-        assert "MTP target Graph/U2 is not validated" not in script
-        assert "MTP requires equal Attention/FFN ranks" not in script
-        assert "graph execution requires equal Attention/FFN ranks" not in script
-        assert "MTP supports exactly one speculative token" in script
-        assert "graph U2 requires P2pHcclAFDConnector" in script
-        assert "AFD TP2 requires P2pHcclAFDConnector" in script
-        assert '--tensor-parallel-size "$TENSOR_PARALLEL_SIZE"' in script
+        assert "CAMP2p U2 supports only eager execution" in script
+        assert "--tensor-parallel-size 1" in script
         assert "--all2all-backend flashinfer_all2allv" in script
-        assert "U2 currently supports only EXECUTION_MODE=eager" not in script
 
-    attention_script = (recipe_dir / "afd_attention.sh").read_text(encoding="utf-8")
+    attention_script = (CAMP_RECIPE_DIR / "afd_attention.sh").read_text(
+        encoding="utf-8"
+    )
     assert 'HCCL_IF_BASE_PORT="${ATTENTION_HCCL_IF_BASE_PORT:-51000}"' in (
         attention_script
     )
     assert "ATTENTION_MAX_NUM_BATCHED_TOKENS" in attention_script
     assert "ATTENTION_DEVICES" in attention_script
 
-    ffn_script = (recipe_dir / "afd_ffn.sh").read_text(encoding="utf-8")
+    ffn_script = (CAMP_RECIPE_DIR / "afd_ffn.sh").read_text(encoding="utf-8")
     assert 'HCCL_IF_BASE_PORT="${FFN_HCCL_IF_BASE_PORT:-52000}"' in ffn_script
     assert "FFN_MAX_NUM_BATCHED_TOKENS" in ffn_script
     assert "FFN_DEVICES" in ffn_script
@@ -161,26 +148,50 @@ def test_dsv4_role_scripts_offer_u1_graph_and_eager_u2():
     assert "if ((shutdown_requested)); then" in ffn_script
 
 
-def test_dsv4_hccl_recipe_selects_hccl_connector_without_copying_validator():
+def test_dsv4_hccl_recipe_owns_connector_specific_launchers():
     for role in ("attention", "ffn"):
         script = (HCCL_RECIPE_DIR / f"afd_{role}.sh").read_text(encoding="utf-8")
-        assert "export AFD_CONNECTOR=P2pHcclAFDConnector" in script
-        assert "CAMP2pAFDConnector/deepseek_v4" in script
+        assert "readonly AFD_CONNECTOR=P2pHcclAFDConnector" in script
+        assert "recipe/npu/deepseek_v4/common/activate_role_runtime.sh" in script
+        assert "CAMP2pAFDConnector" not in script
+        assert 'ENABLE_MTP="${ENABLE_MTP:-0}"' in script
+        assert 'MTP_NUM_SPECULATIVE_TOKENS="${MTP_NUM_SPECULATIVE_TOKENS:-1}"' in (
+            script
+        )
+        assert 'MTP_DRAFT_EXECUTION="${MTP_DRAFT_EXECUTION:-eager}"' in script
+        assert '"method":"mtp"' in script
+        assert '"${MTP_ARGS[@]}"' in script
+        assert '--tensor-parallel-size "$TENSOR_PARALLEL_SIZE"' in script
 
     runner = (HCCL_RECIPE_DIR / "run_validation.py").read_text(encoding="utf-8")
     assert 'sys.argv.extend(["--connector", "P2pHcclAFDConnector"])' in runner
     assert "runpy.run_path" in runner
+    assert "recipe/npu/deepseek_v4/common/run_validation.py" in runner
+    assert "CAMP2pAFDConnector/deepseek_v4" not in runner
 
     performance_runner = PERFORMANCE_RUNNER_PATH.read_text(encoding="utf-8")
     assert "P2pHcclAFDConnector" in performance_runner
+    assert "recipe/npu/deepseek_v4/common/run_validation.py" in performance_runner
+    assert "CAMP2pAFDConnector/deepseek_v4" not in performance_runner
     assert '"bench",' in performance_runner
     assert '"serve",' in performance_runner
 
-    for role in ("attention", "ffn"):
-        shared_script = (RUNNER_PATH.parent / f"afd_{role}.sh").read_text(
-            encoding="utf-8"
-        )
-        assert "P2pHcclAFDConnector currently supports only" not in shared_script
+    attention = (HCCL_RECIPE_DIR / "afd_attention.sh").read_text(encoding="utf-8")
+    assert 'ENABLE_PD="${ENABLE_PD:-0}"' in attention
+    assert "Mooncake PD M9 baseline" in attention
+
+
+def test_dsv4_shared_recipe_is_connector_neutral():
+    common_runner = RUNNER_PATH.read_text(encoding="utf-8")
+    assert "CONNECTOR_RECIPE_DIRS" in common_runner
+    assert "COMMON_RECIPE_DIR" in common_runner
+    assert (COMMON_RECIPE_DIR / "validate_golden.py").is_file()
+    assert (COMMON_RECIPE_DIR / "activate_role_runtime.sh").is_file()
+
+    camp_runner = (CAMP_RECIPE_DIR / "run_validation.py").read_text(encoding="utf-8")
+    assert 'sys.argv.extend(["--connector", "CAMP2pAFDConnector"])' in camp_runner
+    assert "recipe/npu/deepseek_v4/common/run_validation.py" in camp_runner
+    assert "P2pHcclAFDConnector" not in camp_runner
 
 
 def test_dsv4_v023_native_baseline_has_explicit_mtp_switch():
@@ -257,12 +268,12 @@ def test_dsv4_hccl_a8f4_topology_derives_ffn_capacity_and_unused_devices():
     )
 
     assert topology == {
-            "attention_ranks": 8,
-            "ffn_ranks": 4,
-            "tensor_parallel_size": 1,
-            "attention_data_parallel_size": 8,
-            "ffn_data_parallel_size": 4,
-            "ratio": 2,
+        "attention_ranks": 8,
+        "ffn_ranks": 4,
+        "tensor_parallel_size": 1,
+        "attention_data_parallel_size": 8,
+        "ffn_data_parallel_size": 4,
+        "ratio": 2,
         "attention_devices": list(range(8)),
         "ffn_devices": list(range(8, 12)),
         "unused_devices": [12, 13, 14, 15],

@@ -107,9 +107,7 @@ def main() -> None:
                 }
             )
             if not matched:
-                mismatches.append(
-                    {"round": round_idx + 1, "prompt_index": prompt_idx}
-                )
+                mismatches.append({"round": round_idx + 1, "prompt_index": prompt_idx})
             print(
                 f"round={round_idx + 1} prompt={prompt_idx:02d} "
                 f"matched={matched} tokens={result['token_ids']}"

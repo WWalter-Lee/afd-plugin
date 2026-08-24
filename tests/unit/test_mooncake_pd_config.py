@@ -91,10 +91,9 @@ def test_mooncake_pd_config_cli_outputs_compact_json():
 
 
 def test_mooncake_pd_recipe_keeps_kv_transfer_off_ffn():
-    shared_recipe_dir = ROOT_DIR / "recipe/npu/CAMP2pAFDConnector/deepseek_v4"
     hccl_recipe_dir = ROOT_DIR / "recipe/npu/P2pHcclAFDConnector/deepseek_v4"
-    attention = (shared_recipe_dir / "afd_attention.sh").read_text()
-    ffn = (shared_recipe_dir / "afd_ffn.sh").read_text()
+    attention = (hccl_recipe_dir / "afd_attention.sh").read_text()
+    ffn = (hccl_recipe_dir / "afd_ffn.sh").read_text()
     prefill = (hccl_recipe_dir / "mooncake_pd/prefill.sh").read_text()
 
     assert "--role kv_consumer" in attention
@@ -138,6 +137,7 @@ def test_mooncake_pd_manual_entry_is_safe_and_size_capped():
     assert 'tail -c "${ARTIFACT_LOG_TAIL_BYTES}"' in script
     assert 'tail -n 50 >"${temp_dir}/kv-transfer-evidence.txt"' in script
     assert 'tail -n 200 >"${temp_dir}/fatal-markers.txt"' in script
+    assert "recipe/npu/deepseek_v4/common/validate_golden.py" in script
     assert 'ARTIFACT_LOG_TAIL_BYTES="262144"' in config
     assert 'ARTIFACT_MAX_BYTES="2097152"' in config
     assert "http://127.0.0.1:${FFN_PROCESS_PORT}" not in script

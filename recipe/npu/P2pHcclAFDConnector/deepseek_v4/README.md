@@ -1,5 +1,10 @@
 # DeepSeek-V4 HCCL P2P validation
 
+This directory owns the complete `P2pHcclAFDConnector` Attention and FFN
+launchers. It does not delegate to the CAMP2p recipe. Connector-neutral runtime
+bootstrap and validation helpers live under `recipe/npu/deepseek_v4/common/`;
+HCCL P2P, TP2, MTP, Graph U2, and Mooncake PD switches remain in this directory.
+
 For the pinned vLLM 0.23 + vLLM-Ascend installation and A8F8 deployment
 procedure, see the
 [Chinese installation and deployment guide](../../../../docs/npu/DEEPSEEK_V4_AFD_HCCL_P2P_INSTALL_DEPLOYMENT_GUIDE_ZH.md).

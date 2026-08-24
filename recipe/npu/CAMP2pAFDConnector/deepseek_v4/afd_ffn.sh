@@ -2,10 +2,7 @@
 set -eo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
-export DSV4_VLLM_VENV="${DSV4_RUNTIME_VENV:-/mnt/workspace/code/.venvs/afd-v023-vllm-cann}"
-source "${ROOT_DIR}/tools/dsv4/activate_runtime.sh"
-DSV4_VLLM_ASCEND_ROOT="${DSV4_VLLM_ASCEND_ROOT:-/mnt/workspace/code/vllm-ascend-rfc-vllm-cann}"
-source "${DSV4_VLLM_ASCEND_ROOT}/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/bin/set_env.bash"
+source "${ROOT_DIR}/recipe/npu/deepseek_v4/common/activate_role_runtime.sh"
 set -u
 
 MODEL_PATH="${MODEL_PATH:-/mnt/workspace/models/DeepSeek-V4-Flash-w8a8-mtp}"
@@ -13,7 +10,6 @@ API_HOST="${API_HOST:-127.0.0.1}"
 API_PORT="${API_PORT:-8911}"
 AFD_HOST="${AFD_HOST:-127.0.0.1}"
 AFD_PORT="${AFD_PORT:-29761}"
-AFD_CONNECTOR="${AFD_CONNECTOR:-CAMP2pAFDConnector}"
 ATTENTION_RANKS="${ATTENTION_RANKS:-8}"
 FFN_RANKS="${FFN_RANKS:-8}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
@@ -27,108 +23,24 @@ DBO_DECODE_TOKEN_THRESHOLD="${DBO_DECODE_TOKEN_THRESHOLD:-2}"
 DBO_PREFILL_TOKEN_THRESHOLD="${DBO_PREFILL_TOKEN_THRESHOLD:-12}"
 MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-8}"
 CUDAGRAPH_CAPTURE_SIZES="${CUDAGRAPH_CAPTURE_SIZES:-1 2 4 8}"
-ENABLE_MTP="${ENABLE_MTP:-0}"
-MTP_NUM_SPECULATIVE_TOKENS="${MTP_NUM_SPECULATIVE_TOKENS:-1}"
-MTP_DRAFT_EXECUTION="${MTP_DRAFT_EXECUTION:-eager}"
 AFD_ASYNC_SCHEDULING="${AFD_ASYNC_SCHEDULING:-auto}"
 
 export ASCEND_RT_VISIBLE_DEVICES="${FFN_DEVICES:-${ASCEND_RT_VISIBLE_DEVICES:-8,9,10,11,12,13,14,15}}"
 export HCCL_IF_IP="${HCCL_IF_IP:-192.169.91.106}"
 export HCCL_IF_BASE_PORT="${FFN_HCCL_IF_BASE_PORT:-52000}"
-export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-eth0}"
-export HCCL_SOCKET_IFNAME="${HCCL_SOCKET_IFNAME:-eth0}"
-export OMP_PROC_BIND=false
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-10}"
-export PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}"
 export HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-2048}"
-export HCCL_OP_EXPANSION_MODE=AIV
-export TASK_QUEUE_ENABLE=1
-export SOC_VERSION=ascend910_9362
-export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-18000}"
-export VLLM_PLUGINS=ascend,ascend_model,ascend_model_loader,ascend_kv_connector,afd
-unset VLLM_ASCEND_ENABLE_FLASHCOMM1
 
-if [[ ! "$TENSOR_PARALLEL_SIZE" =~ ^[12]$ ]]; then
-  echo "DeepSeek-V4 AFD supports TENSOR_PARALLEL_SIZE=1 or 2" >&2
+if [[ "$TENSOR_PARALLEL_SIZE" != "1" ]]; then
+  echo "DeepSeek-V4 CAMP2p recipe supports only TENSOR_PARALLEL_SIZE=1" >&2
   exit 2
 fi
-if ((FFN_RANKS % TENSOR_PARALLEL_SIZE != 0)); then
-  echo "FFN_RANKS must be divisible by TENSOR_PARALLEL_SIZE" >&2
+if [[ "$ATTENTION_RANKS" != "$FFN_RANKS" ]]; then
+  echo "DeepSeek-V4 CAMP2p requires equal Attention and FFN ranks" >&2
   exit 2
 fi
-if ((TENSOR_PARALLEL_SIZE > 1)); then
-  if [[ "$AFD_CONNECTOR" != "P2pHcclAFDConnector" ]]; then
-    echo "DeepSeek-V4 AFD TP2 requires P2pHcclAFDConnector" >&2
-    exit 2
-  fi
-  if [[ "$ATTENTION_RANKS" != "$FFN_RANKS" ]]; then
-    echo "DeepSeek-V4 AFD TP2 requires equal Attention and FFN ranks" >&2
-    exit 2
-  fi
-fi
-FFN_DP_SIZE=$((FFN_RANKS / TENSOR_PARALLEL_SIZE))
+source "${ROOT_DIR}/afd_plugin/_cann_ops_custom/vendors/afd-plugin/bin/set_env.bash"
 
-case "$AFD_CONNECTOR" in
-  CAMP2pAFDConnector)
-    source "${ROOT_DIR}/afd_plugin/_cann_ops_custom/vendors/afd-plugin/bin/set_env.bash"
-    ;;
-  P2pHcclAFDConnector)
-    ;;
-  *)
-    echo "Unsupported DeepSeek-V4 NPU connector: $AFD_CONNECTOR" >&2
-    exit 2
-    ;;
-esac
-
-case "$ENABLE_MTP" in
-  0)
-    MTP_ARGS=()
-    ;;
-  1)
-    if [[ "$AFD_CONNECTOR" != "P2pHcclAFDConnector" ]]; then
-      echo "DeepSeek-V4 MTP requires P2pHcclAFDConnector" >&2
-      exit 2
-    fi
-    if [[ "$MTP_NUM_SPECULATIVE_TOKENS" != "1" ]]; then
-      echo "DeepSeek-V4 MTP supports exactly one speculative token" >&2
-      exit 2
-    fi
-    case "$EXECUTION_MODE" in
-      eager)
-        if [[ "$MTP_DRAFT_EXECUTION" != "eager" ]]; then
-          echo "DeepSeek-V4 eager target requires MTP_DRAFT_EXECUTION=eager" >&2
-          exit 2
-        fi
-        MTP_DRAFT_ENFORCE_EAGER=true
-        ;;
-      full-decode-only)
-        case "$MTP_DRAFT_EXECUTION" in
-          eager) MTP_DRAFT_ENFORCE_EAGER=true ;;
-          graph) MTP_DRAFT_ENFORCE_EAGER=false ;;
-          *)
-            echo "MTP_DRAFT_EXECUTION must be eager or graph" >&2
-            exit 2
-            ;;
-        esac
-        ;;
-      *)
-        echo "DeepSeek-V4 MTP supports eager or full-decode-only" >&2
-        exit 2
-        ;;
-    esac
-    MTP_CONFIG="$(printf '{"method":"mtp","num_speculative_tokens":1,"enforce_eager":%s}' "$MTP_DRAFT_ENFORCE_EAGER")"
-    MTP_ARGS=(
-      --speculative-config
-      "$MTP_CONFIG"
-    )
-    ;;
-  *)
-    echo "ENABLE_MTP must be 0 or 1" >&2
-    exit 2
-    ;;
-esac
-
-ADDITIONAL_CONFIG="$(printf '{"afd":{"role":"ffn","connector":"%s","host":"%s","port":%s,"num_attention_ranks":%s,"num_ffn_ranks":%s}}' "$AFD_CONNECTOR" "$AFD_HOST" "$AFD_PORT" "$ATTENTION_RANKS" "$FFN_RANKS")"
+ADDITIONAL_CONFIG="$(printf '{"afd":{"role":"ffn","connector":"CAMP2pAFDConnector","host":"%s","port":%s,"num_attention_ranks":%s,"num_ffn_ranks":%s}}' "$AFD_HOST" "$AFD_PORT" "$ATTENTION_RANKS" "$FFN_RANKS")"
 
 case "$EXECUTION_MODE" in
   eager)
@@ -153,8 +65,8 @@ case "$U_BATCHES" in
     UBATCH_ARGS=()
     ;;
   2)
-    if [[ "$EXECUTION_MODE" == "full-decode-only" && "$AFD_CONNECTOR" != "P2pHcclAFDConnector" ]]; then
-      echo "DeepSeek-V4 graph U2 requires P2pHcclAFDConnector" >&2
+    if [[ "$EXECUTION_MODE" != "eager" ]]; then
+      echo "DeepSeek-V4 CAMP2p U2 supports only eager execution" >&2
       exit 2
     fi
     UBATCH_ARGS=(
@@ -164,7 +76,7 @@ case "$U_BATCHES" in
     )
     ;;
   *)
-    echo "DeepSeek-V4 AFD supports U_BATCHES=1 or 2, got $U_BATCHES" >&2
+    echo "DeepSeek-V4 CAMP2p supports U_BATCHES=1 or 2, got $U_BATCHES" >&2
     exit 2
     ;;
 esac
@@ -205,8 +117,8 @@ vllm serve "$MODEL_PATH" \
   --max-model-len "$MAX_MODEL_LEN" \
   --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
   --max-num-seqs "$MAX_NUM_SEQS" \
-  --data-parallel-size "$FFN_DP_SIZE" \
-  --tensor-parallel-size "$TENSOR_PARALLEL_SIZE" \
+  --data-parallel-size "$FFN_RANKS" \
+  --tensor-parallel-size 1 \
   --all2all-backend flashinfer_all2allv \
   --enable-expert-parallel \
   --seed 1024 \
@@ -218,7 +130,6 @@ vllm serve "$MODEL_PATH" \
   --block-size 128 \
   --additional-config "$ADDITIONAL_CONFIG" \
   "${SCHEDULING_ARGS[@]}" \
-  "${MTP_ARGS[@]}" \
   "${UBATCH_ARGS[@]}" \
   "${EXECUTION_ARGS[@]}" &
 vllm_pid=$!

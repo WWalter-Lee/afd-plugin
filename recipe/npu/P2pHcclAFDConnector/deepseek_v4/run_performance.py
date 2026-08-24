@@ -20,16 +20,15 @@ from typing import Any
 
 RECIPE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = RECIPE_DIR.parents[3]
-SHARED_RUNNER_PATH = (
-    REPO_ROOT / "recipe/npu/CAMP2pAFDConnector/deepseek_v4/run_validation.py"
-)
+SHARED_RUNNER_PATH = REPO_ROOT / "recipe/npu/deepseek_v4/common/run_validation.py"
 DEFAULT_MODEL = Path("/mnt/workspace/models/DeepSeek-V4-Flash-w8a8-mtp")
 TOTAL_NPUS = 16
 REPRODUCIBILITY_FILES = (
     Path(__file__).resolve(),
     SHARED_RUNNER_PATH,
-    REPO_ROOT / "recipe/npu/CAMP2pAFDConnector/deepseek_v4/afd_attention.sh",
-    REPO_ROOT / "recipe/npu/CAMP2pAFDConnector/deepseek_v4/afd_ffn.sh",
+    REPO_ROOT / "recipe/npu/deepseek_v4/common/activate_role_runtime.sh",
+    RECIPE_DIR / "afd_attention.sh",
+    RECIPE_DIR / "afd_ffn.sh",
 )
 _DEVICE_ROW = re.compile(
     r"^\|\s*\d+\s+\d+\s+\|\s*[0-9A-Fa-f:.]+\s+\|"
@@ -417,9 +416,7 @@ def _runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
                 if args.enable_mtp
                 else "A3-P8"
             ),
-            "topology_label": (
-                "A8F8-DP4TP2" if tensor_parallel_size == 2 else "A8F8"
-            ),
+            "topology_label": ("A8F8-DP4TP2" if tensor_parallel_size == 2 else "A8F8"),
             "npu_count": TOTAL_NPUS,
             "mtp_draft_execution": (
                 getattr(args, "mtp_draft_execution", "eager")

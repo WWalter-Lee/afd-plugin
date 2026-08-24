@@ -703,6 +703,11 @@ MTP M1 包的 `06_verify_install.sh` 成功当作 PD 安装通过。
 
 ## 17. 双机 Mooncake PD + AFD 手工安装与验证
 
+HCCL P2P 的 Attention/FFN launcher、MTP/Graph/PD 参数均由
+`recipe/npu/P2pHcclAFDConnector/deepseek_v4/` 独立维护，不再转调或修改
+`CAMP2pAFDConnector` launcher。连接器无关的运行栈激活、验证 runner 和 golden
+比较工具统一位于 `recipe/npu/deepseek_v4/common/`。
+
 ### 17.0 推荐：使用统一脚本入口
 
 第 17.1-17.11 节保留完整命令，主要用于理解流程和逐层排障。正常手工部署推荐
@@ -1124,7 +1129,7 @@ rg -n 'KV cache transfer for request .* took .* remote_session_id' \
 export PD_VALIDATION_ROOT=/mnt/workspace/validation/dsv4_afd_v023_mooncake_pd_m9_f0
 mkdir -p "${PD_VALIDATION_ROOT}"
 
-python recipe/npu/CAMP2pAFDConnector/deepseek_v4/validate_golden.py \
+python recipe/npu/deepseek_v4/common/validate_golden.py \
   --endpoint http://127.0.0.1:9000/v1/completions \
   --model dsv4-afd \
   --golden /mnt/workspace/validation/dsv4_v023_vllm_cann_native_baseline/golden_results.json \

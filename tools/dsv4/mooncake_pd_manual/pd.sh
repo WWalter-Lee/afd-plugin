@@ -119,7 +119,7 @@ FFN_SCRIPT="${AFD_PLUGIN_ROOT}/recipe/npu/P2pHcclAFDConnector/deepseek_v4/afd_ff
 PROXY_SCRIPT="${AFD_PLUGIN_ROOT}/recipe/npu/P2pHcclAFDConnector/deepseek_v4/mooncake_pd/proxy.sh"
 RUNTIME_CHECK="${AFD_PLUGIN_ROOT}/tools/dsv4/check_mooncake_runtime.sh"
 ROUNDTRIP_TOOL="${AFD_PLUGIN_ROOT}/tools/dsv4/check_mooncake_npu_roundtrip.py"
-GOLDEN_VALIDATOR="${AFD_PLUGIN_ROOT}/recipe/npu/CAMP2pAFDConnector/deepseek_v4/validate_golden.py"
+GOLDEN_VALIDATOR="${AFD_PLUGIN_ROOT}/recipe/npu/deepseek_v4/common/validate_golden.py"
 FATAL_PATTERN='EngineCore encountered a fatal error|AFD NPU FFN worker loop failed|Mooncake transfer failed|Communication_Error|507015|Traceback'
 
 is_true() {

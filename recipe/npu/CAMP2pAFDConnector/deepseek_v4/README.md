@@ -1,5 +1,11 @@
 # DeepSeek-V4 A8F8 eager/U1 AFD validation
 
+This directory is isolated to `CAMP2pAFDConnector`. HCCL P2P, MTP, Graph U2,
+and Mooncake PD options belong to
+`recipe/npu/P2pHcclAFDConnector/deepseek_v4/` and are intentionally absent from
+the CAMP2p launchers. Connector-neutral helpers live under
+`recipe/npu/deepseek_v4/common/`.
+
 This recipe is the pinned correctness baseline for one Atlas A3 node with 16
 logical NPUs:
 
