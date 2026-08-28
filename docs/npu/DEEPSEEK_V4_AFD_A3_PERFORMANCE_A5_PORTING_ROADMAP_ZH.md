@@ -1311,6 +1311,31 @@ NPU 组件也已通过：NPU0/NPU1 使用 `P2PHANDSHAKE + ascend` 注册 2 MiB b
 不证明当前 M9 F0-local、双机 F0-topology 或 F1 已完成，也不能据此创建 M9 正确性
 功能 tag。
 
+截至 `2026-08-28`，本机 M9 F0-local 基础闭环已完成，且明确不执行 golden：
+
+- CPU/Mock、诊断和手工工具回归 `36/36`，Mooncake PD 功能矩阵 `46/46`；
+- Mooncake NPU0 -> NPU1 连续两次 2 MiB 同步传输返回 0 且逐字节一致；
+- HCCL 组件覆盖 TP1/TP2、非等量 AF、eager/Graph、U2 和一 token MTP，四组
+  组合全部通过；
+- 同机 PD no-AFD control 使用 Prefill NPU0-7 DP2/TP4 和 Decode NPU8-15
+  DP8/TP1，完成两次完整冷启动；每次 batch 1/8/32、请求取消和取消后恢复均通过，
+  Decode 每轮记录 43 条成功 Mooncake KV transfer；
+- 两轮均正常按 Proxy、Decode、Prefill 顺序停止，停止后 8100/8910/9000 均关闭，
+  `npu-smi info` 无 NPU 进程；全过程 `ENABLE_BATCH_INVARIANT=0`、
+  `golden_checked=false`。
+
+本轮还补齐了同机 control 的严格设备不重叠/进程归属门禁、无 golden 的 `smoke`
+入口，以及有超时和 `/proc/net/tcp*` 回退的小型证据收集。结果汇总位于：
+
+```text
+/mnt/workspace/validation/dsv4_afd_m9_local_f0_20260828_112300/summary.json
+```
+
+上述结果只冻结“本机可验证的 M9 基础设施和组件闭环”。本机没有同时运行
+Prefill 8 + Attention 8 + FFN 8，因此不能据此声明完整 PD + AFD F0-topology
+通过，也不创建 M9 功能 tag。完整三段路径和各组合仍留到双 A3；一 token MTP
+之后的多 speculative token 仍是独立的后续功能开发项。
+
 ### 9.1 上游确定性遗留与 AFD 验收边界
 
 双 A3 验证中暴露的数值问题不归属 `afd-plugin`，登记为两个独立上游遗留：
