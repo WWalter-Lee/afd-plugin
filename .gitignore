@@ -13,6 +13,7 @@ __pycache__/
 afd_plugin/_cann_ops_custom/
 csrc/npu/output/
 extra-info/
+fusion_result.json
 kernel_meta/
 
 # Distribution / packaging
