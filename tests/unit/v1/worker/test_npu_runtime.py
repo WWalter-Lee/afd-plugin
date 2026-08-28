@@ -3875,6 +3875,41 @@ def test_dsv4_feature_validation_accepts_mooncake_pd_eager_u1_tp1():
 
 
 @pytest.mark.parametrize(
+    ("enforce_eager", "use_ubatching", "with_mtp"),
+    [
+        (True, False, False),
+        (True, True, False),
+        (False, False, False),
+        (False, True, False),
+        (True, False, True),
+        (True, True, True),
+        (False, False, True),
+        (False, True, True),
+    ],
+)
+def test_dsv4_feature_validation_accepts_mooncake_pd_combinations(
+    enforce_eager,
+    use_ubatching,
+    with_mtp,
+):
+    config = _dsv4_config(
+        cudagraph_mode="FULL_DECODE_ONLY",
+        data_parallel_size=1,
+        enable_dbo=use_ubatching,
+        use_ubatching=use_ubatching,
+        num_ubatches=2 if use_ubatching else 1,
+        ubatch_size=2,
+        kv_transfer_config=_mooncake_pd_config(),
+    )
+    config.model_config.enforce_eager = enforce_eager
+    if with_mtp:
+        config.speculative_config = _mtp_speculative_config(enforce_eager=True)
+    config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize(
     ("mutation", "message"),
     [
         (
@@ -3902,22 +3937,6 @@ def test_dsv4_feature_validation_accepts_mooncake_pd_eager_u1_tp1():
                 "kv_producer",
             ),
             "kv_role=kv_consumer",
-        ),
-        (
-            lambda config: setattr(config.model_config, "enforce_eager", False),
-            "supports only eager",
-        ),
-        (
-            lambda config: setattr(config.parallel_config, "use_ubatching", True),
-            "supports only U1",
-        ),
-        (
-            lambda config: setattr(
-                config,
-                "speculative_config",
-                _mtp_speculative_config(),
-            ),
-            "does not support MTP",
         ),
         (
             lambda config: setattr(
@@ -3963,24 +3982,105 @@ def test_dsv4_feature_validation_rejects_unvalidated_mooncake_pd_modes(
         fail_if_unsupported_npu_afd_features(config)
 
 
-def test_dsv4_feature_validation_rejects_mooncake_pd_tp2_until_m9_extension():
+def test_dsv4_feature_validation_accepts_mooncake_pd_eager_u1_tp2():
     config = _dsv4_config(
         tensor_parallel_size=2,
-        data_parallel_size=1,
+        data_parallel_size=4,
         kv_transfer_config=_mooncake_pd_config(
             kv_connector_extra_config={
                 "prefill": {"dp_size": 2, "tp_size": 4},
-                "decode": {"dp_size": 1, "tp_size": 2},
+                "decode": {"dp_size": 4, "tp_size": 2},
             }
         ),
     )
     config.additional_config["afd"].update(
         connector="P2pHcclAFDConnector",
-        num_attention_ranks=2,
-        num_ffn_ranks=2,
+        num_attention_ranks=8,
+        num_ffn_ranks=8,
     )
 
-    with pytest.raises(RuntimeError, match="baseline supports only TP1"):
+    fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize(
+    (
+        "enforce_eager",
+        "use_ubatching",
+        "with_mtp",
+        "draft_enforce_eager",
+    ),
+    [
+        (True, False, False, True),
+        (True, True, False, True),
+        (False, False, False, True),
+        (False, True, False, True),
+        (True, False, True, True),
+        (True, True, True, True),
+        (False, False, True, True),
+        (False, True, True, True),
+        (False, False, True, False),
+    ],
+)
+def test_dsv4_feature_validation_accepts_mooncake_pd_tp2_combinations(
+    enforce_eager,
+    use_ubatching,
+    with_mtp,
+    draft_enforce_eager,
+):
+    config = _dsv4_config(
+        cudagraph_mode="FULL_DECODE_ONLY",
+        tensor_parallel_size=2,
+        data_parallel_size=4,
+        enable_dbo=use_ubatching,
+        use_ubatching=use_ubatching,
+        num_ubatches=2 if use_ubatching else 1,
+        ubatch_size=2,
+        kv_transfer_config=_mooncake_pd_config(
+            kv_connector_extra_config={
+                "prefill": {"dp_size": 2, "tp_size": 4},
+                "decode": {"dp_size": 4, "tp_size": 2},
+            }
+        ),
+    )
+    config.model_config.enforce_eager = enforce_eager
+    if with_mtp:
+        config.speculative_config = _mtp_speculative_config(
+            enforce_eager=draft_enforce_eager
+        )
+    config.additional_config["afd"].update(
+        connector="P2pHcclAFDConnector",
+        num_attention_ranks=8,
+        num_ffn_ranks=8,
+    )
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
+def test_dsv4_feature_validation_rejects_mooncake_pd_tp2_full_draft_graph_u2():
+    config = _dsv4_config(
+        cudagraph_mode="FULL_DECODE_ONLY",
+        speculative_config=_mtp_speculative_config(enforce_eager=False),
+        tensor_parallel_size=2,
+        data_parallel_size=4,
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+        ubatch_size=2,
+        kv_transfer_config=_mooncake_pd_config(
+            kv_connector_extra_config={
+                "prefill": {"dp_size": 2, "tp_size": 4},
+                "decode": {"dp_size": 4, "tp_size": 2},
+            }
+        ),
+    )
+    config.model_config.enforce_eager = False
+    config.additional_config["afd"].update(
+        connector="P2pHcclAFDConnector",
+        num_attention_ranks=8,
+        num_ffn_ranks=8,
+    )
+
+    with pytest.raises(RuntimeError, match="TP2 full-draft MTP Graph U2"):
         fail_if_unsupported_npu_afd_features(config)
 
 

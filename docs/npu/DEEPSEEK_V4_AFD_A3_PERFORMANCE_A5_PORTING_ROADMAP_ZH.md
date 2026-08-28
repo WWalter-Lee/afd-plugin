@@ -4,7 +4,7 @@
 
 本文用于固化 DeepSeek-V4 AFD 在完成 CAMP2P eager/U1、Graph/U1，以及标准 HCCL P2P eager/U1、U2、Graph/U1 和 Graph/U2 正确性基线后的目标、开发顺序和验收门禁，供后续开发、验证、性能分析和 A5 迁移时直接使用。
 
-文档状态：`2026-08-21`。CAMP2P eager/U2 已冻结为 `dsv4-afd-a3-eager-u2-v1`；标准 HCCL send/recv connector 已在提交 `9578dd2cb70f9f8db54673a70e8f45fde6479245` 完成 A3 A8F8 eager/U1、U2 正确性闭环。A3-P4 的 A8F8 未调优性能参照与 U1/U2 双侧 profile 已完成：三轮重复性通过，但 U2 在 C32 比 U1 回退 37.570%，因此当前只冻结参照协议，不冻结 U2 性能基线。
+文档状态：`2026-08-28`。CAMP2P eager/U2 已冻结为 `dsv4-afd-a3-eager-u2-v1`；标准 HCCL send/recv connector 已在提交 `9578dd2cb70f9f8db54673a70e8f45fde6479245` 完成 A3 A8F8 eager/U1、U2 正确性闭环。A3-P4 的 A8F8 未调优性能参照与 U1/U2 双侧 profile 已完成：三轮重复性通过，但 U2 在 C32 比 U1 回退 37.570%，因此当前只冻结参照协议，不冻结 U2 性能基线。
 
 A3-P5 的 `A = k x F` 非等量协议和 A2F1/A4F2 NPU 组件验证已经完成。A3-P6 的 A8F4 实模加载在 64 GiB A3 上因 FFN EP4 专家权重峰值 HBM 不足而停止；A10F5 容量代理又被固定 vLLM-Ascend 的 256 experts/EP5 非均匀放置检查拒绝。该结论是当前硬件与固定栈组合的 E2E 门禁，不否定 connector 的非等量语义。A8F4 E2E 移到高 HBM 的 A5 实机验证；A3 保留现有 A8F8 同步 HCCL 性能参照，完成 MTP 功能门禁后再恢复新的调优和公平对照。
 
@@ -268,11 +268,15 @@ AFD world        -> [F0 ... F(F-1), A0 ... A(A-1)]
 
 | 级别 | 使用阶段 | 必须完成 | 不在本级完成 |
 |---|---|---|---|
-| F0 功能门禁 | 每个功能阶段 | CPU/Mock、NPU 组件、golden、batch、生命周期、fatal 日志和 NPU 清理 | 吞吐收益结论、全矩阵跑分和固定 profile |
+| F0-local 本机功能门禁 | M9 及后续功能开发 | CPU/Mock、配置矩阵、单机 NPU 组件、本机可执行的实模冒烟、batch、生命周期、fatal 日志和 NPU 清理 | golden、token exact、batch-invariant、跨机拓扑和性能结论 |
+| F0-topology 外部拓扑门禁 | 依赖双机或 A5 的功能 | 目标拓扑启动、请求成功、真实数据路径、batch、取消、异常、shutdown、二次启动和资源清理 | golden、token exact、正式性能结论 |
+| F1 正确性冻结门禁 | 全部计划功能开发完成后 | batch-invariant 专项、路径匹配 control/AFD、跨冷启动稳定性和 30/30 token exact | 正式性能结论 |
 | P1 轻量性能 guard | 已能稳定 E2E 的中间阶段 | 单一固定负载的一次候选运行，检查成功率、OOM/timeout、HBM 和数量级回退 | 三轮统计、调参、正式收益结论和常规 profile |
 | P2 正式性能验收 | 功能组合闭环后的 A3-P8 | 完整公平对照、至少三轮、波动门禁、双侧 profile 和收益归因 | 不再引入新功能或同时改变多个变量 |
 
-F0 是进入下一功能阶段的硬门禁。P1 只负责尽早发现灾难性回退，不用于证明性能收益；建议固定 A8F8、C32、输入 1024 token、精确输出 128 token、128 请求，完成预热后只测 1 轮，并复用最近的同模式基线。P1 必须满足请求 100% 成功、无 OOM/timeout；若配置 U2，还必须实际观测到双 stage。若 output throughput 相对最近可比基线回退超过 20%，或 HBM/等待出现异常，则暂停扩大功能范围并先定位。单轮 P1 数据不得用于调整正式收益阈值，也不得写成“AFD 已有性能收益”。
+从 M9 开始，F0 只回答“功能路径能否工作”，不包含 golden。F0-local 是进入下一实现阶段的硬门禁；依赖双机或 A5 的 F0-topology 不阻塞相互独立的本机功能开发，但在通过前不得声明对应拓扑已交付。F1 在全部计划功能开发完成后统一执行，未通过前不得创建正确性功能 tag 或进入正式 P2。M9 以前已经冻结的历史 F0 仍按各自报告中的原门禁解释，不追溯修改。
+
+P1 只负责尽早发现灾难性回退，不用于证明性能收益；建议固定 A8F8、C32、输入 1024 token、精确输出 128 token、128 请求，完成预热后只测 1 轮，并复用最近的同模式基线。P1 必须满足请求 100% 成功、无 OOM/timeout；若配置 U2，还必须实际观测到双 stage。若 output throughput 相对最近可比基线回退超过 20%，或 HBM/等待出现异常，则暂停扩大功能范围并先定位。单轮 P1 数据不得用于调整正式收益阈值，也不得写成“AFD 已有性能收益”。
 
 中间阶段不固定采集 profiler。只有 P1 出现超过 20% 的回退、异常 HCCL 等待、host 发射停顿或不明 HBM 增长时，才采集 Attention DP0 与 FFN DP0 的定向 profile；保持 `TORCH_PROFILER_WITH_STACK=0`，并使用与采集记录一致的 CANN 版本解析。功能阶段修复后只重跑 F0 和 P1，不补做完整 P2。
 
@@ -1255,23 +1259,33 @@ M9 分为功能门禁和性能门禁，二者不得混为一个准入条件。
 - Attention、FFN 生命周期和自动清理稳定；
 - 已明确 Mooncake PD 的 prefill/decode 角色、KV transfer、AF 子拓扑和启动顺序。
 
-M9 功能开发顺序：
+M9 按“本机先完成能完成的开发和验证，外部拓扑与确定性后置”的顺序推进：
 
 1. 审计固定目标栈中的 Mooncake connector/API 和已有部署脚本，冻结 P/D/AF
    进程、rank、端口、NIC 与 KV ownership；
 2. 建立不加载实模的最小 PD + AF connector 生命周期与 metadata 组件测试；
-3. 先支持 TP1、eager/U1 的 PD + A8F8，再扩展到 M8 冻结的 DP4/TP2；
-4. 完成 prefill -> decode KV transfer、decode Attention -> FFN HCCL P2P、请求
-   取消、异常、shutdown 和二次启动；
-5. 生成同平台 PD control/golden，执行串行 token exact、batch 和生命周期 F0；
-6. 再组合 U2、Graph 和 MTP，每个组合保留独立 fail-fast 与验证产物。
+3. 在本机依次完成 TP1/TP2、eager/U1/U2、Graph/U1/U2 和一 token MTP 的
+   配置、CPU/Mock、真实 NPU 组件及可执行实模 F0-local；
+4. 本机 F0-local 只检查启动、请求成功、真实 stage/消息路径、batch、取消、异常、
+   shutdown、二次启动和资源清理，暂不生成或比较 golden；
+5. 全部计划功能代码和 F0-local 完成后，再在双 A3 上完成 TP1、TP2 及各组合的
+   F0-topology；每次只增加一个变量并保存独立产物；
+6. 最后统一启用 batch-invariant，生成路径匹配的 PD control，执行跨冷启动稳定性
+   和 control/AFD 30/30 token exact 的 F1 正确性冻结门禁；
+7. F1 通过后才创建 M9 正确性功能 tag，并进入正式 P2 性能验收。
 
-截至 `2026-08-21`，M9 第 1 步审计和首个代码门禁已经落地：固定目标栈注册的
+截至 `2026-08-28`，M9 第 1 步审计和首个代码门禁已经落地：固定目标栈注册的
 KV connector 为 `MooncakeHybridConnector`；PD 只连接 Prefill 与 Decode Attention，
-Decode FFN 不配置 KV connector。插件当前只开放 `P2pHcclAFDConnector + TP1 +
+Decode FFN 不配置 KV connector。插件当前开放 `P2pHcclAFDConnector + TP1/TP2 +
 eager/U1 + MTP off + kv_consumer`，并校验 `engine_id`、Mooncake 端口以及
-Prefill/Decode DP/TP 元数据。结构化配置生成器、Prefill/Attention/Proxy recipe 和
-运行库预检已经加入；Graph、U2、MTP 和 TP2 的 PD 组合继续 fail-fast。
+Prefill/Decode DP/TP 元数据。TP1 使用 Decode DP8/TP1；TP2 使用 M8 已冻结的等量
+A8F8、Decode DP4/TP2 rank/peer/control payload 契约。结构化配置生成器、
+Prefill/Attention/Proxy recipe 和运行库预检已经加入。手工管理脚本和 no-AFD
+control 现已具备 eager/U2、Graph/U1、Graph/U2 和一 token MTP 的逐项配置入口，
+并把模式写入 control golden metadata，防止不同路径误比较；TP2 full-draft Graph
+U2 + MTP 继续 fail-fast。上述新增项都只是代码/配置门禁已开放，下一步先完成
+本机 F0-local 和剩余功能开发；双 A3 F0-topology 已进入后续外部验收队列，但不
+阻塞彼此独立的本机功能开发。外部拓扑未通过前不得写成双机实模交付完成。
 
 当前 A3 环境门禁已经补齐：`libgoogle-glog0v6t64`、`libjsoncpp25`、`libjemalloc2`
 和本地 Ascend Mooncake 0.3.9 wheel 已安装，扩展由目标 `afd-v023-vllm-cann`
@@ -1281,8 +1295,9 @@ Prefill/Decode DP/TP 解析及 CANN 9.1.0 泄漏检查均通过。最小 import 
 PD launchers 通过运行门禁继承该 preload，standalone AF 和 FFN 不受影响。安装 wheel
 使用现有本地构建产物，未修改 Mooncake、vLLM 或 vLLM-Ascend 工作树。两进程真实
 NPU 组件也已通过：NPU0/NPU1 使用 `P2PHANDSHAKE + ascend` 注册 2 MiB buffer，
-连续两次同步传输返回 0、逐字节一致，双方均正常析构退出。下一步启动 TP1 eager/U1
-实模 F0。
+连续两次同步传输返回 0、逐字节一致，双方均正常析构退出。下一步在本机完成全部
+可执行的组合 F0-local；完整 `Prefill DP2/TP4 + Decode A8F8` 需要 24 个逻辑 NPU，
+本机 16 个逻辑 NPU 无法同时容纳，因此只把该完整路径保留到双 A3 F0-topology。
 
 当前 contract 证据包括：插件 Mooncake feature gate 13/13、recipe/config/EngineCore
 71/71、固定 vLLM-Ascend `MooncakeHybridConnector` 5/5 和通用 Mooncake connector
@@ -1292,8 +1307,32 @@ NPU 组件也已通过：NPU0/NPU1 使用 `P2PHANDSHAKE + ascend` 注册 2 MiB b
 /mnt/workspace/validation/dsv4_afd_v023_mooncake_pd_m9_contract_20260821_181148/summary.json
 ```
 
-该汇总状态是 `real_transfer_component_passed_f0_pending`，不是 M9 F0 完成证明，
-不得据此创建 M9 功能 tag。
+该历史汇总状态是 `real_transfer_component_passed_f0_pending`。它证明当时的组件门禁，
+不证明当前 M9 F0-local、双机 F0-topology 或 F1 已完成，也不能据此创建 M9 正确性
+功能 tag。
+
+### 9.1 上游确定性遗留与 AFD 验收边界
+
+双 A3 验证中暴露的数值问题不归属 `afd-plugin`，登记为两个独立上游遗留：
+
+| ID | 现象与归属 | 当前处理 |
+|---|---|---|
+| `UPSTREAM-DSV4-BI-001` | vLLM-Ascend batch-invariant ReduceSum 不支持 DeepSeek-V4 HC 的非末轴求和，并错误覆盖无 `dim` 的 `aten::sum`；归属 vLLM-Ascend 适配层及官方自定义 OPP 交付 | 状态 `deferred_after_functional_development`；保留两文件补丁、独立 venv、自定义 OPP 和验证包，全部计划功能开发完成后统一复验 |
+| `UPSTREAM-DSV4-SHORT-EXTEND-001` | Mooncake KV-only 交接后 Decode 进行 N-1 short-extend 重算，和 one-shot Prefill 属于不同执行路径；旧 native golden 可能稳定地只匹配 21/30 | 保留为 vLLM-Ascend DSA/PD 路径等价性问题，不要求 AFD 插件把当前稳定输出改回旧路径 |
+
+以下是全部功能开发完成后的 F1 正确性冻结门禁，不是当前 F0-local 的进入条件：
+
+1. 同一路径先满足三轮和跨冷启动稳定；不稳定时不能进入 token exact 验收；
+2. `PD no-AFD control` 与 `PD + AFD` 必须使用同一 Prefill/Decode 路径、拓扑、
+   batch-invariant 配置和启动顺序，逐请求 token IDs 要求 30/30；
+3. 当前 PD 路径与旧 direct native golden 的差异只记录，不作为 AFD 失败；
+4. 只有 `PD no-AFD` 稳定而 `PD + AFD` 相对它发生新增分叉，才归属
+   `afd-plugin` 并阻塞 M9；
+5. 上述上游遗留不阻塞 M9 代码组合开发；F1 未通过前不创建 M9 正确性功能 tag，
+   也不开始正式性能验收。
+
+延后执行的双 A3 batch-invariant 补丁、安装、两次 10 x 3 和小包收集步骤见
+`DEEPSEEK_V4_BATCH_INVARIANT_DUAL_A3_VALIDATION_GUIDE_ZH.md`。
 
 standalone AF 的 `P8D-PERF-001` 在 M9 期间继续保持 Open，但不阻塞上述功能
 开发。进入 M9 性能结论和性能 tag 前，仍必须补齐：AFD 相对非 AFD 的公平
@@ -1383,11 +1422,12 @@ U3 仍不纳入当前路线。
 12. A3-P8/P8C/P8D 的 eager 性能缺口 `P8D-PERF-001` 仍为 Open；Graph/U2 P1 的 107.189 token/s 和 M4 P1 的 31.473 token/s 都不能直接关闭该问题。功能组合闭环后再做 Graph/U1、Graph/U2、MTP on/off 和同预算 native Graph 三轮 P2；
 13. A3-P7M7 full draft ACL Graph 已完成；恢复时核对专项报告、U1/U2 各 30/30、A4F2 组件、capture bucket、128/128 P1 和 cleanup，不再沿用旧的 6/30 结论；
 14. A3-P7M8 TP2 功能基线已完成；恢复时核对专项报告、三个 TP2 组件产物、原生 DP4/TP2 golden 和 A8F8 eager/U1 30/30 F0；不要把失败的 TP2 full-draft Graph U2 最大组合写成支持；
-15. 当前功能里程碑为 M9 Mooncake PD；固定栈 connector/API 审计、目标 venv Mooncake 环境、TP1 eager/U1 配置、metadata contract 和真实两进程 NPU round-trip 已通过，当前进入两台 A3 的实模 PD + A8F8 F0，随后复用 M8 的 DP4/TP2 契约；
-16. SP/CP/DCP 和 PP 全部后移到 M9 之后；更多 speculative token 保持独立里程碑；
-17. A5 到位后从硬件审计和独立工具链开始，不复用 A3 二进制，并重新生成原生 MTP golden；
-18. 每次阶段完成都保存日志、原始数据、解析结果和清理证据。
+15. 当前功能里程碑为 M9 Mooncake PD；固定栈 connector/API 审计、目标 venv Mooncake 环境、TP1 eager/U1 配置、metadata contract 和真实两进程 NPU round-trip 已通过；DP4/TP2 及 eager/U2、Graph/U1、Graph/U2、一 token MTP 的 control/AFD 配置已补齐，当前在本机继续完成代码、CPU/Mock、真实 NPU 组件和可执行实模 F0-local，双 A3 F0-topology 后置且不阻塞独立开发；
+16. `UPSTREAM-DSV4-BI-001` 和 `UPSTREAM-DSV4-SHORT-EXTEND-001` 归属 vLLM-Ascend/执行路径，不作为 afd-plugin 代码缺陷；batch-invariant 和 golden/token exact 统一后移到全部计划功能开发完成后的 F1，只有路径匹配 control 稳定而 AFD 相对它发生新增分叉才阻塞插件正确性冻结；
+17. SP/CP/DCP 和 PP 全部后移到 M9 之后；更多 speculative token 保持独立里程碑；
+18. A5 到位后从硬件审计和独立工具链开始，不复用 A3 二进制，并重新生成原生 MTP golden；
+19. 每次阶段完成都保存日志、原始数据、解析结果和清理证据。
 
 ## 13. 一句话路线
 
-在 vLLM 0.23 + `rfc/vllm_cann` 目标栈已经完成 HCCL P2P eager U1/U2、等量 Graph/U1/U2、原生 MTP/M0、eager/U1 + MTP/M1、target Graph/U1 + draft eager MTP/M2、eager/U2 + MTP/M3、target Graph/U2 + draft eager MTP/M4、eager 非等量 MTP/M5、非等量 Graph 组件/M6、full draft ACL Graph/M7，以及等量 A8F8 DP4/TP2 eager/U1 功能基线/M8。M8 的原生 TP2 golden 稳定且 AFD 实模 F0 达到 30/30；TP2 full-draft Graph U2 最大组合因 FFN AICore 异常保持 fail-fast。下一步直接进入 M9 Mooncake PD；先做 TP1 eager/U1，再复用 M8 的 TP2 control/rank 契约。SP/CP/DCP 和 PP 全部后移到 M9 之后，多 speculative token 保持独立里程碑。功能组合闭环后统一执行三轮 P2、MTP on/off 和同预算 native 公平对照。Attention-side gate 不纳入支持范围，`P8D-PERF-001` 仍保留，A3 数字不得直接外推到 A5。
+在 vLLM 0.23 + `rfc/vllm_cann` 目标栈已经完成 HCCL P2P eager U1/U2、等量 Graph/U1/U2、原生 MTP/M0、eager/U1 + MTP/M1、target Graph/U1 + draft eager MTP/M2、eager/U2 + MTP/M3、target Graph/U2 + draft eager MTP/M4、eager 非等量 MTP/M5、非等量 Graph 组件/M6、full draft ACL Graph/M7，以及等量 A8F8 DP4/TP2 eager/U1 功能基线/M8。M8 的原生 TP2 golden 稳定且 AFD 实模 F0 达到 30/30；TP2 full-draft Graph U2 最大组合因 FFN AICore 异常保持 fail-fast。M9 Mooncake PD 已具备 Decode DP8/TP1、DP4/TP2 及 eager/U2、Graph/U1、Graph/U2、一 token MTP 的配置入口；下一步在本机完成全部可执行开发和 F0-local，F0 不包含 golden。完整 24-NPU PD + AFD 路径随后在双 A3 完成 F0-topology；全部计划功能开发结束后再统一处理 batch-invariant、路径匹配 control 和 30/30 token exact 的 F1。SP/CP/DCP 和 PP 全部后移到 M9 之后，多 speculative token 保持独立里程碑。F1 后统一执行三轮 P2、MTP on/off 和同预算 native 公平对照。Attention-side gate 不纳入支持范围，`P8D-PERF-001` 仍保留，A3 数字不得直接外推到 A5。

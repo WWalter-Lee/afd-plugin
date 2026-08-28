@@ -49,12 +49,23 @@ def _request_completion(
     }
 
 
-def _load_prompts(path: Path) -> list[str]:
+def _load_prompt_source(path: Path) -> tuple[list[str], dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     golden = payload.get("golden")
     if not isinstance(golden, dict) or not golden:
         raise ValueError(f"prompt source has no golden records: {path}")
-    return [golden[str(index)]["prompt"] for index in range(len(golden))]
+    prompts = [golden[str(index)]["prompt"] for index in range(len(golden))]
+    return prompts, golden
+
+
+def _parse_metadata(entries: list[str]) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+    for entry in entries:
+        key, separator, value = entry.partition("=")
+        if not separator or not key or key in metadata:
+            raise ValueError(f"invalid or duplicate metadata entry: {entry}")
+        metadata[key] = value
+    return metadata
 
 
 def main() -> None:
@@ -65,11 +76,13 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=300)
+    parser.add_argument("--metadata", action="append", default=[])
     args = parser.parse_args()
     if args.rounds <= 0:
         parser.error("--rounds must be positive")
 
-    prompts = _load_prompts(args.prompt_source)
+    prompts, reference_golden = _load_prompt_source(args.prompt_source)
+    metadata = _parse_metadata(args.metadata)
     started_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     records: list[dict[str, Any]] = []
     for round_index in range(args.rounds):
@@ -85,6 +98,12 @@ def main() -> None:
                     "round": round_index + 1,
                     "prompt_index": prompt_index,
                     "prompt": prompt,
+                    "matched_reference": (
+                        result["prompt_token_ids"]
+                        == reference_golden[str(prompt_index)]["prompt_token_ids"]
+                        and result["token_ids"]
+                        == reference_golden[str(prompt_index)]["token_ids"]
+                    ),
                     **result,
                 }
             )
@@ -99,7 +118,11 @@ def main() -> None:
     for prompt_index, prompt in enumerate(prompts):
         runs = [record for record in records if record["prompt_index"] == prompt_index]
         expected = runs[0]["token_ids"]
-        stable = all(run["token_ids"] == expected for run in runs[1:])
+        expected_prompt = runs[0]["prompt_token_ids"]
+        stable = all(
+            run["prompt_token_ids"] == expected_prompt and run["token_ids"] == expected
+            for run in runs[1:]
+        )
         if not stable:
             mismatches.append(prompt_index)
         golden[str(prompt_index)] = {
@@ -115,6 +138,8 @@ def main() -> None:
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "endpoint": args.endpoint,
         "model": args.model,
+        "prompt_source": str(args.prompt_source),
+        "metadata": metadata,
         "sampling": {
             "temperature": 0.0,
             "top_p": 1.0,
@@ -125,6 +150,12 @@ def main() -> None:
         "prompt_count": len(prompts),
         "passed": not mismatches,
         "mismatched_prompt_indices": mismatches,
+        "reference_comparison": {
+            "exact_match_count": sum(
+                bool(record["matched_reference"]) for record in records
+            ),
+            "request_count": len(records),
+        },
         "golden": golden,
         "records": records,
     }

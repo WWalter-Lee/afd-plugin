@@ -31,10 +31,12 @@ Supported execution boundary:
   counts;
 - full draft Graph U1 or U2 for equal TP1 ranks, plus component coverage for
   integer-multiple TP1 and equal TP2 topologies;
-- M9 supports an initial Mooncake PD boundary with Decode TP1, eager/U1 and
-  MTP disabled; only Decode Attention is a `MooncakeHybridConnector` consumer,
+- M9 supports Mooncake PD with Decode DP8/TP1 or DP4/TP2, eager/U1 and MTP
+  disabled; only Decode Attention is a `MooncakeHybridConnector` consumer,
   while Decode FFN has no KV connector;
-- multiple speculative tokens, PD + Graph/U2/MTP/TP2 combinations, sequence
+- M9 deployment plumbing also exposes PD + eager/U2, Graph U1/U2 and one-token
+  MTP as F0 candidates; they are not frozen until their dual-A3 gates pass;
+- multiple speculative tokens, TP2 full-draft Graph U2 + MTP, sequence
   parallelism, PP/CP/DCP greater than 1, and Attention-side gate are disabled.
 
 The public communication API remains synchronous: every eager transfer still

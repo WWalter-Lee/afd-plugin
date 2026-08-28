@@ -157,14 +157,6 @@ case "$ENABLE_PD" in
     KV_TRANSFER_ARGS=()
     ;;
   1)
-    if [[ "$EXECUTION_MODE" != "eager" || "$U_BATCHES" != "1" ]]; then
-      echo "DeepSeek-V4 Mooncake PD M9 baseline requires eager/U1" >&2
-      exit 2
-    fi
-    if [[ "$ENABLE_MTP" != "0" || "$TENSOR_PARALLEL_SIZE" != "1" ]]; then
-      echo "DeepSeek-V4 Mooncake PD M9 baseline requires MTP off and TP1" >&2
-      exit 2
-    fi
     export VLLM_HOST_IP="${VLLM_HOST_IP:-${HCCL_IF_IP}}"
     source "${ROOT_DIR}/tools/dsv4/check_mooncake_runtime.sh"
     KV_TRANSFER_CONFIG="$(python "${ROOT_DIR}/tools/dsv4/mooncake_pd_config.py" \

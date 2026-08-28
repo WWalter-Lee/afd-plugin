@@ -256,7 +256,7 @@ def _fail_if_unsupported_deepseek_v4_pd(
     vllm_config: VllmConfig,
     afd_config: AFDConfig,
 ) -> None:
-    """Validate the first Mooncake PD + AFD functional boundary."""
+    """Validate the Mooncake PD + AFD topology and connector contract."""
     kv_config = getattr(vllm_config, "kv_transfer_config", None)
     if kv_config is None:
         return
@@ -277,23 +277,10 @@ def _fail_if_unsupported_deepseek_v4_pd(
         raise RuntimeError(
             "DeepSeek-V4 AFD Decode Attention must use kv_role=kv_consumer"
         )
-    if not bool(vllm_config.model_config.enforce_eager):
-        raise RuntimeError(
-            "DeepSeek-V4 AFD Mooncake PD M9 baseline supports only eager execution"
-        )
-
     parallel_config = vllm_config.parallel_config
-    if bool(parallel_config.use_ubatching):
+    if int(parallel_config.tensor_parallel_size) not in (1, 2):
         raise RuntimeError(
-            "DeepSeek-V4 AFD Mooncake PD M9 baseline supports only U1"
-        )
-    if vllm_config.speculative_config is not None:
-        raise RuntimeError(
-            "DeepSeek-V4 AFD Mooncake PD M9 baseline does not support MTP"
-        )
-    if int(parallel_config.tensor_parallel_size) != 1:
-        raise RuntimeError(
-            "DeepSeek-V4 AFD Mooncake PD M9 baseline supports only TP1"
+            "DeepSeek-V4 AFD Mooncake PD supports only TP1 or TP2"
         )
     if int(getattr(kv_config, "kv_parallel_size", 1)) != 1:
         raise RuntimeError(

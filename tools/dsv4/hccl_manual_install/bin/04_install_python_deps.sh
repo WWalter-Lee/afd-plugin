@@ -29,8 +29,9 @@ fi
 
 log "Installing Python build dependencies"
 "${python_bin}" -m pip install "${pip_args[@]}" --upgrade \
-  pip "setuptools>=64" "setuptools-scm>=8" wheel \
-  "cmake>=3.26" ninja pybind11
+  pip "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8" \
+  "setuptools-rust>=1.9.0" "packaging>=24.2" wheel jinja2 \
+  "cmake>=3.26.1" ninja pybind11
 
 log "Installing torch and Ascend Python runtime"
 "${python_bin}" -m pip install "${pip_args[@]}" \

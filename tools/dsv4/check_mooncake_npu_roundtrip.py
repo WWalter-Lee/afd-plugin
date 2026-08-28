@@ -15,20 +15,22 @@ from typing import Any
 BUFFER_BYTES = 2 * 1024 * 1024
 
 
-def _set_device_environment(device: int) -> None:
+def _set_device_environment(device: int, host: str, interface: str) -> None:
     os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(device)
-    os.environ.setdefault("HCCL_IF_IP", "127.0.0.1")
-    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
-    os.environ.setdefault("HCCL_SOCKET_IFNAME", "lo")
+    os.environ["HCCL_IF_IP"] = host
+    os.environ["GLOO_SOCKET_IFNAME"] = interface
+    os.environ["HCCL_SOCKET_IFNAME"] = interface
 
 
 def _producer(
     device: int,
+    host: str,
+    interface: str,
     ready_queue: Any,
     done_event: Any,
 ) -> None:
     try:
-        _set_device_environment(device)
+        _set_device_environment(device, host, interface)
         import torch
         import torch_npu  # noqa: F401
         from mooncake.engine import TransferEngine
@@ -42,7 +44,7 @@ def _producer(
         )
         engine = TransferEngine()
         initialize_ret = engine.initialize(
-            "127.0.0.1",
+            host,
             "P2PHANDSHAKE",
             "ascend",
             "",
@@ -74,11 +76,13 @@ def _producer(
 
 def _consumer(
     device: int,
+    host: str,
+    interface: str,
     remote: dict[str, int],
     result_queue: Any,
 ) -> None:
     try:
-        _set_device_environment(device)
+        _set_device_environment(device, host, interface)
         import torch
         import torch_npu  # noqa: F401
         from mooncake.engine import TransferEngine
@@ -91,7 +95,7 @@ def _consumer(
         )
         engine = TransferEngine()
         initialize_ret = engine.initialize(
-            "127.0.0.1",
+            host,
             "P2PHANDSHAKE",
             "ascend",
             "",
@@ -109,7 +113,7 @@ def _consumer(
                 f"consumer Mooncake memory registration failed: {register_ret}"
             )
 
-        session_id = f"127.0.0.1:{remote['rpc_port']}"
+        session_id = f"{host}:{remote['rpc_port']}"
         transfer_results = []
         for _ in range(2):
             destination.zero_()
@@ -154,6 +158,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--producer-device", type=int, default=0)
     parser.add_argument("--consumer-device", type=int, default=1)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--interface", default="lo")
     parser.add_argument("--timeout", type=int, default=180)
     args = parser.parse_args()
     if args.producer_device == args.consumer_device:
@@ -165,7 +171,13 @@ def main() -> int:
     done_event = context.Event()
     producer = context.Process(
         target=_producer,
-        args=(args.producer_device, ready_queue, done_event),
+        args=(
+            args.producer_device,
+            args.host,
+            args.interface,
+            ready_queue,
+            done_event,
+        ),
         name="mooncake-producer",
     )
     consumer = None
@@ -174,7 +186,13 @@ def main() -> int:
         remote = _get_result(ready_queue, "producer startup", args.timeout)
         consumer = context.Process(
             target=_consumer,
-            args=(args.consumer_device, remote, result_queue),
+            args=(
+                args.consumer_device,
+                args.host,
+                args.interface,
+                remote,
+                result_queue,
+            ),
             name="mooncake-consumer",
         )
         consumer.start()
@@ -187,6 +205,14 @@ def main() -> int:
                 "Mooncake child exit failure: "
                 f"producer={producer.exitcode}, consumer={consumer.exitcode}"
             )
+        result.update(
+            {
+                "host": args.host,
+                "interface": args.interface,
+                "producer_device": args.producer_device,
+                "consumer_device": args.consumer_device,
+            }
+        )
         print(json.dumps(result, sort_keys=True))
         return 0
     finally:

@@ -12,26 +12,31 @@ Usage: bash pd.sh <action> [config.env]
 Actions:
   init          Copy config.env.example to the requested config path.
   print-config  Print the non-secret effective role/topology configuration.
-  install       Install the M9 afd-plugin editable source and Mooncake wheel.
+  install       Install M9 afd-plugin and optionally the delivered Mooncake wheel.
   check         Validate versions, runtime, network, NPUs, and local round-trip.
   start         Start the configured prefill, decode, or proxy role.
   status        Check owned processes, readiness, and fatal log markers.
-  validate      Run proxy smoke, 30-request golden, batch, and cancellation gates.
+  smoke         Run F0 batch/cancellation/recovery checks without golden.
+  record-control  Record a stable PD no-AFD control golden from the proxy.
+  validate      Compare PD + AFD against the path-matched control golden.
   stop          Stop only process groups owned by this config.
   collect       Produce a redacted, size-capped support artifact.
 EOF
 }
 
 log() {
-  printf '[mooncake-pd:%s] %s\n' "${NODE_ROLE:-unconfigured}" "$*"
+  printf '[mooncake-pd:%s:%s] %s\n' \
+    "${DEPLOYMENT_VARIANT:-unconfigured}" "${NODE_ROLE:-unconfigured}" "$*"
 }
 
 warn() {
-  printf '[mooncake-pd:%s] WARNING: %s\n' "${NODE_ROLE:-unconfigured}" "$*" >&2
+  printf '[mooncake-pd:%s:%s] WARNING: %s\n' \
+    "${DEPLOYMENT_VARIANT:-unconfigured}" "${NODE_ROLE:-unconfigured}" "$*" >&2
 }
 
 die() {
-  printf '[mooncake-pd:%s] ERROR: %s\n' "${NODE_ROLE:-unconfigured}" "$*" >&2
+  printf '[mooncake-pd:%s:%s] ERROR: %s\n' \
+    "${DEPLOYMENT_VARIANT:-unconfigured}" "${NODE_ROLE:-unconfigured}" "$*" >&2
   exit 2
 }
 
@@ -54,20 +59,32 @@ set -a
 source "${CONFIG_FILE}"
 set +a
 
-: "${CODE_ROOT:=/mnt/workspace/code}"
+: "${CODE_ROOT:=/data/z00569729/code}"
 : "${VENV_ROOT:=${CODE_ROOT}/.venvs/afd-v023-vllm-cann}"
 : "${VLLM_ROOT:=${CODE_ROOT}/vllm-release-v0.23.0}"
 : "${VLLM_ASCEND_ROOT:=${CODE_ROOT}/vllm-ascend-rfc-vllm-cann}"
 : "${AFD_PLUGIN_ROOT:=${CODE_ROOT}/afd-plugin}"
-: "${CANN_ROOT:=${CODE_ROOT}/.ascend/cann-9.0.1/cann-9.0.1}"
-: "${MODEL_PATH:=/mnt/workspace/models/DeepSeek-V4-Flash-w8a8-mtp}"
-: "${RUN_ROOT:=/mnt/workspace/dsv4-afd-mooncake-pd}"
+: "${CANN_ROOT:=/usr/local/Ascend/cann-9.0.0}"
+: "${CANN_VERSION:=9.0.0}"
+: "${ATB_ROOT:=}"
+: "${MODEL_PATH:=/data/z00569729/models/DeepSeek-V4-Flash-w8a8-mtp}"
+: "${DEPLOYMENT_VARIANT:=pd_afd}"
+DEPLOYMENT_SLUG="${DEPLOYMENT_VARIANT//_/-}"
+: "${RUN_ROOT:=/data/z00569729/run/dsv4-mooncake-${DEPLOYMENT_SLUG}}"
 : "${STATE_ROOT:=${RUN_ROOT}/state/${NODE_ROLE}}"
 : "${LOG_ROOT:=${RUN_ROOT}/logs/${NODE_ROLE}}"
 : "${VALIDATION_ROOT:=${RUN_ROOT}/validation}"
 : "${OUTPUT_ROOT:=${RUN_ROOT}/output}"
+: "${NATIVE_GOLDEN_PATH:=${GOLDEN_PATH:-/data/z00569729/validation/dsv4_v023_vllm_cann_native_baseline/golden_results.json}}"
+: "${PD_CONTROL_GOLDEN_PATH:=/data/z00569729/validation/dsv4_m9_pd_control/golden_results.json}"
 : "${VLLM_COMMIT:=0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665}"
 : "${VLLM_ASCEND_COMMIT:=3da28f9414583d2d0b672a8f06d1fae142404bda}"
+: "${VLLM_ASCEND_WORKTREE_MODE:=clean}"
+: "${ENABLE_BATCH_INVARIANT:=0}"
+: "${BATCH_INVARIANT_OPP_ROOT:=${CODE_ROOT}/.ascend/custom-opp/batch-invariant-a3-1.0.0}"
+: "${MOONCAKE_INSTALL_MODE:=wheel}"
+: "${MOONCAKE_VERSION:=0.3.9}"
+: "${MOONCAKE_LIBRARY_DIR:=}"
 : "${MOONCAKE_WHEEL_SHA256:=0f9964801b24fd683d6016e1196cc0606fc87b0285b45d89c433650b9477ca12}"
 : "${PREFILL_API_PORT:=8100}"
 : "${DECODE_API_PORT:=8910}"
@@ -76,6 +93,8 @@ set +a
 : "${AFD_PORT:=29761}"
 : "${PREFILL_KV_PORT:=30000}"
 : "${DECODE_KV_PORT:=30100}"
+: "${CONTROL_DATA_PARALLEL_RPC_PORT:=29360}"
+: "${CONTROL_MASTER_PORT:=29361}"
 : "${PREFILL_HCCL_IF_BASE_PORT:=50000}"
 : "${ATTENTION_HCCL_IF_BASE_PORT:=51000}"
 : "${FFN_HCCL_IF_BASE_PORT:=52000}"
@@ -90,6 +109,15 @@ set +a
 : "${FFN_RANKS:=8}"
 : "${DECODE_DP_SIZE:=8}"
 : "${DECODE_TP_SIZE:=1}"
+: "${DECODE_EXECUTION_MODE:=eager}"
+: "${DECODE_U_BATCHES:=1}"
+: "${DECODE_ENABLE_MTP:=0}"
+: "${DECODE_MTP_DRAFT_EXECUTION:=eager}"
+: "${DECODE_MTP_NUM_SPECULATIVE_TOKENS:=1}"
+: "${DECODE_DBO_DECODE_TOKEN_THRESHOLD:=2}"
+: "${DECODE_DBO_PREFILL_TOKEN_THRESHOLD:=12}"
+: "${DECODE_MAX_CUDAGRAPH_CAPTURE_SIZE:=8}"
+: "${DECODE_CUDAGRAPH_CAPTURE_SIZES:=1 2 4 8}"
 : "${MAX_MODEL_LEN:=4096}"
 : "${MAX_NUM_BATCHED_TOKENS:=4096}"
 : "${MAX_NUM_SEQS:=16}"
@@ -106,6 +134,8 @@ set +a
 : "${STOP_TIMEOUT_SECONDS:=300}"
 : "${FORCE_KILL:=0}"
 : "${ALLOW_NPU_PROCESSES:=0}"
+: "${ALLOW_COLOCATED_PD_CONTROL:=0}"
+: "${COLOCATED_PREFILL_PID_FILE:=${RUN_ROOT}/state/prefill/prefill.pid}"
 : "${VALIDATION_ROUNDS:=3}"
 : "${VALIDATION_BATCH_SIZES:=1 8 32}"
 : "${RUN_CANCELLATION_TEST:=1}"
@@ -114,12 +144,15 @@ set +a
 
 PYTHON_BIN="${VENV_ROOT}/bin/python"
 PREFILL_SCRIPT="${AFD_PLUGIN_ROOT}/recipe/npu/P2pHcclAFDConnector/deepseek_v4/mooncake_pd/prefill.sh"
+CONTROL_DECODE_SCRIPT="${AFD_PLUGIN_ROOT}/recipe/npu/P2pHcclAFDConnector/deepseek_v4/mooncake_pd/decode_control.sh"
 ATTENTION_SCRIPT="${AFD_PLUGIN_ROOT}/recipe/npu/P2pHcclAFDConnector/deepseek_v4/afd_attention.sh"
 FFN_SCRIPT="${AFD_PLUGIN_ROOT}/recipe/npu/P2pHcclAFDConnector/deepseek_v4/afd_ffn.sh"
 PROXY_SCRIPT="${AFD_PLUGIN_ROOT}/recipe/npu/P2pHcclAFDConnector/deepseek_v4/mooncake_pd/proxy.sh"
 RUNTIME_CHECK="${AFD_PLUGIN_ROOT}/tools/dsv4/check_mooncake_runtime.sh"
 ROUNDTRIP_TOOL="${AFD_PLUGIN_ROOT}/tools/dsv4/check_mooncake_npu_roundtrip.py"
+FUNCTIONAL_SMOKE_TOOL="${AFD_PLUGIN_ROOT}/tools/dsv4/run_pd_functional_smoke.py"
 GOLDEN_VALIDATOR="${AFD_PLUGIN_ROOT}/recipe/npu/deepseek_v4/common/validate_golden.py"
+GOLDEN_GENERATOR="${AFD_PLUGIN_ROOT}/tools/dsv4/generate_golden.py"
 FATAL_PATTERN='EngineCore encountered a fatal error|AFD NPU FFN worker loop failed|Mooncake transfer failed|Communication_Error|507015|Traceback'
 
 is_true() {
@@ -141,6 +174,47 @@ require_dir() {
   [[ -d "$1" ]] || die "Missing directory: $1"
 }
 
+resolve_hostname() {
+  local node_name=""
+  if [[ -r /proc/sys/kernel/hostname ]]; then
+    IFS= read -r node_name </proc/sys/kernel/hostname || true
+  fi
+  if [[ -n "${node_name}" ]]; then
+    printf '%s\n' "${node_name}"
+  elif [[ -n "${HOSTNAME:-}" ]]; then
+    printf '%s\n' "${HOSTNAME}"
+  elif command -v hostname >/dev/null 2>&1; then
+    hostname
+  elif command -v uname >/dev/null 2>&1; then
+    uname -n
+  else
+    printf 'unknown\n'
+  fi
+}
+
+run_as_root() {
+  if (( EUID == 0 )); then
+    "$@"
+  else
+    require_command sudo
+    sudo "$@"
+  fi
+}
+
+install_system_packages() {
+  if command -v apt-get >/dev/null 2>&1; then
+    run_as_root apt-get update
+    run_as_root apt-get install -y \
+      iproute2 curl libgoogle-glog0v6t64 libjsoncpp25 libjemalloc2 netcat-openbsd
+  elif command -v dnf >/dev/null 2>&1; then
+    run_as_root dnf install -y iproute curl glog jsoncpp jemalloc nmap-ncat
+  elif command -v yum >/dev/null 2>&1; then
+    run_as_root yum install -y iproute curl glog jsoncpp jemalloc nmap-ncat
+  else
+    die "Unsupported package manager; install ip/ss, curl, glog, jsoncpp, jemalloc, and netcat manually"
+  fi
+}
+
 assert_integer() {
   [[ "$2" =~ ^[0-9]+$ ]] || die "$1 must be a non-negative integer: $2"
 }
@@ -158,19 +232,132 @@ read_pid() {
   printf '%s\n' "${pid}"
 }
 
+device_lists_are_disjoint() {
+  local left_value="$1"
+  local right_value="$2"
+  local item
+  local -a left_devices=()
+  local -a right_devices=()
+  local -A seen=()
+  IFS=',' read -r -a left_devices <<<"${left_value}"
+  IFS=',' read -r -a right_devices <<<"${right_value}"
+  (( ${#left_devices[@]} > 0 && ${#right_devices[@]} > 0 )) || return 1
+  for item in "${left_devices[@]}"; do
+    [[ "${item}" =~ ^[0-9]+$ && -z "${seen[${item}]+present}" ]] || return 1
+    seen["${item}"]=1
+  done
+  for item in "${right_devices[@]}"; do
+    [[ "${item}" =~ ^[0-9]+$ && -z "${seen[${item}]+present}" ]] || return 1
+    seen["${item}"]=1
+  done
+}
+
 port_is_listening() {
   local port="$1"
-  ss -ltn | awk -v expected=":${port}" '$4 ~ expected "$" {found=1} END {exit !found}'
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn | awk -v expected=":${port}" '$4 ~ expected "$" {found=1} END {exit !found}'
+    return
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -lnt | awk -v expected=":${port}" \
+      '$4 ~ expected "$" && $6 == "LISTEN" {found=1} END {exit !found}'
+    return
+  fi
+  local port_hex
+  printf -v port_hex '%04X' "${port}"
+  awk -v expected="${port_hex}" '
+    FNR > 1 {
+      split($2, address, ":")
+      if (toupper(address[2]) == expected && $4 == "0A") found=1
+    }
+    END {exit !found}
+  ' /proc/net/tcp /proc/net/tcp6
 }
 
 git_head() {
-  git -C "$1" rev-parse HEAD
+  git -c safe.directory="$1" -C "$1" rev-parse HEAD
+}
+
+validate_vllm_ascend_worktree() {
+  local status diff_sha
+  status="$(git -c safe.directory="${VLLM_ASCEND_ROOT}" \
+    -C "${VLLM_ASCEND_ROOT}" status --short --untracked-files=no)"
+  case "${VLLM_ASCEND_WORKTREE_MODE}" in
+    clean)
+      [[ -z "${status}" ]] || die "vLLM-Ascend worktree is dirty"
+      ;;
+    batch_invariant_patch)
+      [[ "${status}" == $' M tests/ut/test_batch_invariant.py\n M vllm_ascend/batch_invariant.py' ]] \
+        || die "vLLM-Ascend changes do not match the delivered batch-invariant patch"
+      diff_sha="$(git -c safe.directory="${VLLM_ASCEND_ROOT}" \
+        -C "${VLLM_ASCEND_ROOT}" diff -- \
+        tests/ut/test_batch_invariant.py vllm_ascend/batch_invariant.py \
+        | sha256sum | awk '{print $1}')"
+      [[ "${diff_sha}" == "cf97a0b6e509fbb128e847babbf8f01cc953f06cb3126936cc4111bbab60b897" ]] \
+        || die "vLLM-Ascend batch-invariant patch fingerprint mismatch"
+      ;;
+    *)
+      die "VLLM_ASCEND_WORKTREE_MODE must be clean or batch_invariant_patch"
+      ;;
+  esac
+}
+
+validate_afd_worktree() {
+  local status line path
+  local unexpected=()
+  status="$(git -c safe.directory="${AFD_PLUGIN_ROOT}" \
+    -C "${AFD_PLUGIN_ROOT}" status --short --untracked-files=all)"
+  [[ -n "${status}" ]] || return 0
+  while IFS= read -r line; do
+    path="${line:3}"
+    case "${path}" in
+      docs/npu/DEEPSEEK_V4_AFD_HCCL_P2P_INSTALL_DEPLOYMENT_GUIDE_ZH.md | \
+      docs/npu/DEEPSEEK_V4_AFD_A3_PERFORMANCE_A5_PORTING_ROADMAP_ZH.md | \
+      docs/npu/DEEPSEEK_V4_BATCH_INVARIANT_DUAL_A3_VALIDATION_GUIDE_ZH.md | \
+      afd_plugin/compat/npu/feature_validation.py | \
+      recipe/npu/P2pHcclAFDConnector/deepseek_v4/README.md | \
+      recipe/npu/P2pHcclAFDConnector/deepseek_v4/afd_attention.sh | \
+      recipe/npu/P2pHcclAFDConnector/deepseek_v4/mooncake_pd/decode_control.sh | \
+      recipe/npu/P2pHcclAFDConnector/deepseek_v4/mooncake_pd/prefill.sh | \
+      tests/unit/test_mooncake_pd_config.py | \
+      tests/unit/test_pd_functional_smoke.py | \
+      tests/unit/test_batch_invariant_manual_tool.py | \
+      tests/unit/v1/worker/test_npu_runtime.py | \
+      tools/dsv4/activate_runtime.sh | \
+      tools/dsv4/check_mooncake_runtime.sh | \
+      tools/dsv4/check_mooncake_npu_roundtrip.py | \
+      tools/dsv4/hccl_manual_install/bin/04_install_python_deps.sh | \
+      tools/dsv4/generate_golden.py | \
+      tools/dsv4/run_pd_functional_smoke.py | \
+      tools/dsv4/mooncake_pd_manual/README_ZH.md | \
+      tools/dsv4/mooncake_pd_manual/UPDATE11_RUNBOOK_ZH.md | \
+      tools/dsv4/mooncake_pd_manual/UPDATE12_RUNBOOK_ZH.md | \
+      tools/dsv4/mooncake_pd_manual/UPDATE13_RUNBOOK_ZH.md | \
+      tools/dsv4/mooncake_pd_manual/config.env.example | \
+      tools/dsv4/mooncake_pd_manual/pd.sh | \
+      tools/dsv4/vllm_ascend_batch_invariant/*)
+        ;;
+      *) unexpected+=("${line}") ;;
+    esac
+  done <<<"${status}"
+  if (( ${#unexpected[@]} > 0 )); then
+    printf '%s\n' "${unexpected[@]}" >&2
+    die "afd-plugin contains changes outside the delivered documentation/tooling overlay"
+  fi
+  warn "Using the delivered documentation/tooling overlay on afd-plugin ${AFD_PD_COMMIT}"
 }
 
 validate_role() {
   case "${NODE_ROLE:-}" in
     prefill|decode|proxy) ;;
     *) die "NODE_ROLE must be prefill, decode, or proxy: ${NODE_ROLE:-unset}" ;;
+  esac
+}
+
+validate_variant() {
+  case "${DEPLOYMENT_VARIANT}" in
+    pd_control|pd_afd) ;;
+    *) die "DEPLOYMENT_VARIANT must be pd_control or pd_afd: ${DEPLOYMENT_VARIANT}" ;;
   esac
 }
 
@@ -183,6 +370,7 @@ reject_placeholder() {
 
 validate_common_config() {
   validate_role
+  validate_variant
   reject_placeholder PREFILL_IP "${PREFILL_IP:-}"
   reject_placeholder DECODE_IP "${DECODE_IP:-}"
   [[ "${AFD_PD_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]] \
@@ -191,6 +379,76 @@ validate_common_config() {
   assert_integer STOP_TIMEOUT_SECONDS "${STOP_TIMEOUT_SECONDS}"
   assert_integer ARTIFACT_LOG_TAIL_BYTES "${ARTIFACT_LOG_TAIL_BYTES}"
   assert_integer ARTIFACT_MAX_BYTES "${ARTIFACT_MAX_BYTES}"
+  assert_integer DECODE_DBO_DECODE_TOKEN_THRESHOLD "${DECODE_DBO_DECODE_TOKEN_THRESHOLD}"
+  assert_integer DECODE_DBO_PREFILL_TOKEN_THRESHOLD "${DECODE_DBO_PREFILL_TOKEN_THRESHOLD}"
+  assert_integer DECODE_MAX_CUDAGRAPH_CAPTURE_SIZE "${DECODE_MAX_CUDAGRAPH_CAPTURE_SIZE}"
+  local capture_size
+  [[ -n "${DECODE_CUDAGRAPH_CAPTURE_SIZES//[[:space:]]/}" ]] \
+    || die "DECODE_CUDAGRAPH_CAPTURE_SIZES must not be empty"
+  for capture_size in ${DECODE_CUDAGRAPH_CAPTURE_SIZES}; do
+    assert_integer DECODE_CUDAGRAPH_CAPTURE_SIZES "${capture_size}"
+    (( capture_size > 0 )) || die "CUDAGRAPH capture sizes must be positive"
+  done
+  [[ "${NATIVE_GOLDEN_PATH}" != "${PD_CONTROL_GOLDEN_PATH}" ]] \
+    || die "Native and PD control golden paths must be different"
+  [[ "${PREFILL_DP_SIZE}" == "2" && "${PREFILL_TP_SIZE}" == "4" ]] \
+    || die "M9 baseline requires Prefill DP2/TP4"
+  case "${DECODE_DP_SIZE}:${DECODE_TP_SIZE}" in
+    8:1|4:2) ;;
+    *) die "M9 baseline supports Decode DP8/TP1 or DP4/TP2" ;;
+  esac
+  case "${DECODE_EXECUTION_MODE}" in
+    eager|full-decode-only) ;;
+    *) die "DECODE_EXECUTION_MODE must be eager or full-decode-only" ;;
+  esac
+  case "${DECODE_U_BATCHES}" in
+    1|2) ;;
+    *) die "DECODE_U_BATCHES must be 1 or 2" ;;
+  esac
+  case "${DECODE_ENABLE_MTP}" in
+    0|1) ;;
+    *) die "DECODE_ENABLE_MTP must be 0 or 1" ;;
+  esac
+  case "${ENABLE_BATCH_INVARIANT}" in
+    0) ;;
+    1)
+      [[ "${VLLM_ASCEND_WORKTREE_MODE}" == "batch_invariant_patch" ]] \
+        || die "ENABLE_BATCH_INVARIANT=1 requires VLLM_ASCEND_WORKTREE_MODE=batch_invariant_patch"
+      require_file "${BATCH_INVARIANT_OPP_ROOT}/vendors/batch_invariant/bin/set_env.bash"
+      ;;
+    *) die "ENABLE_BATCH_INVARIANT must be 0 or 1" ;;
+  esac
+  case "${ALLOW_COLOCATED_PD_CONTROL}" in
+    0) ;;
+    1)
+      [[ "${DEPLOYMENT_VARIANT}" == "pd_control" ]] \
+        || die "ALLOW_COLOCATED_PD_CONTROL requires DEPLOYMENT_VARIANT=pd_control"
+      [[ "${PREFILL_IP}" == "${DECODE_IP}" ]] \
+        || die "Colocated PD control requires identical Prefill and Decode IPs"
+      device_lists_are_disjoint "${PREFILL_DEVICES}" "${ATTENTION_DEVICES}" \
+        || die "Colocated PD control requires valid, disjoint Prefill and Decode devices"
+      ;;
+    *) die "ALLOW_COLOCATED_PD_CONTROL must be 0 or 1" ;;
+  esac
+  case "${DECODE_MTP_DRAFT_EXECUTION}" in
+    eager|graph) ;;
+    *) die "DECODE_MTP_DRAFT_EXECUTION must be eager or graph" ;;
+  esac
+  [[ "${DECODE_MTP_NUM_SPECULATIVE_TOKENS}" == "1" ]] \
+    || die "M9 MTP supports exactly one speculative token"
+  if [[ "${DECODE_ENABLE_MTP}" == "1" ]]; then
+    if [[ "${DECODE_EXECUTION_MODE}" == "eager" \
+      && "${DECODE_MTP_DRAFT_EXECUTION}" != "eager" ]]; then
+      die "Eager Decode requires DECODE_MTP_DRAFT_EXECUTION=eager"
+    fi
+  fi
+  if [[ "${DECODE_TP_SIZE}" == "2" \
+    && "${DECODE_EXECUTION_MODE}" == "full-decode-only" \
+    && "${DECODE_U_BATCHES}" == "2" \
+    && "${DECODE_ENABLE_MTP}" == "1" \
+    && "${DECODE_MTP_DRAFT_EXECUTION}" == "graph" ]]; then
+    die "TP2 full-draft Graph U2 + MTP is not validated"
+  fi
   require_command git
   require_dir "${AFD_PLUGIN_ROOT}"
   require_dir "${VLLM_ROOT}"
@@ -202,12 +460,23 @@ validate_common_config() {
     || die "vLLM-Ascend commit mismatch"
   [[ "$(git_head "${AFD_PLUGIN_ROOT}")" == "${AFD_PD_COMMIT}" ]] \
     || die "afd-plugin commit mismatch"
-  [[ -z "$(git -C "${VLLM_ROOT}" status --short)" ]] \
+  [[ -z "$(git -c safe.directory="${VLLM_ROOT}" -C "${VLLM_ROOT}" status --short)" ]] \
     || die "vLLM worktree is dirty"
-  [[ -z "$(git -C "${VLLM_ASCEND_ROOT}" status --short)" ]] \
-    || die "vLLM-Ascend worktree is dirty"
-  [[ -z "$(git -C "${AFD_PLUGIN_ROOT}" status --short)" ]] \
-    || die "afd-plugin worktree is dirty"
+  validate_vllm_ascend_worktree
+  validate_afd_worktree
+}
+
+export_batch_invariant_env() {
+  if [[ "${ENABLE_BATCH_INVARIANT}" == "1" ]]; then
+    export DSV4_EXTRA_OPP_ENV="${BATCH_INVARIANT_OPP_ROOT}/vendors/batch_invariant/bin/set_env.bash"
+    export VLLM_BATCH_INVARIANT=1
+    export HCCL_DETERMINISTIC=true
+    export LCCL_DETERMINISTIC=1
+    export ATB_MATMUL_SHUFFLE_K_ENABLE=0
+    export ATB_LLM_LCOC_ENABLE=0
+  else
+    unset DSV4_EXTRA_OPP_ENV VLLM_BATCH_INVARIANT
+  fi
 }
 
 local_role_ip() {
@@ -220,15 +489,71 @@ local_role_ip() {
 
 validate_local_network() {
   [[ "${NODE_ROLE}" == "proxy" ]] && return 0
-  require_command ip
-  ip link show dev "${NIC_NAME}" >/dev/null 2>&1 \
-    || die "Network interface not found: ${NIC_NAME}"
   local expected_ip
   expected_ip="$(local_role_ip)"
-  ip -o -4 addr show dev "${NIC_NAME}" \
-    | awk '{split($4, a, "/"); print a[1]}' \
-    | grep -Fxq "${expected_ip}" \
-    || die "${expected_ip} is not assigned to ${NIC_NAME}"
+  [[ -d "/sys/class/net/${NIC_NAME}" ]] \
+    || die "Network interface not found: ${NIC_NAME}"
+  if command -v ip >/dev/null 2>&1; then
+    ip -o -4 addr show dev "${NIC_NAME}" \
+      | awk '{split($4, a, "/"); print a[1]}' \
+      | grep -Fxq "${expected_ip}" \
+      || die "${expected_ip} is not assigned to ${NIC_NAME}"
+    return
+  fi
+  if command -v ifconfig >/dev/null 2>&1; then
+    ifconfig "${NIC_NAME}" 2>/dev/null \
+      | awk '
+          /^[[:space:]]*inet[[:space:]]/ {
+            for (i = 1; i <= NF; i++) {
+              if ($i == "inet" && i < NF) {
+                value = $(i + 1)
+                sub(/^addr:/, "", value)
+                print value
+              }
+            }
+          }
+        ' \
+      | grep -Fxq "${expected_ip}" \
+      || die "${expected_ip} is not assigned to ${NIC_NAME}"
+    return
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -ie 2>/dev/null \
+      | awk -v interface="${NIC_NAME}" '
+          /^[^[:space:]]/ {
+            current = $1
+            sub(/:.*/, "", current)
+          }
+          current == interface && /^[[:space:]]*inet[[:space:]]/ {
+            for (i = 1; i <= NF; i++) {
+              if ($i == "inet" && i < NF) {
+                value = $(i + 1)
+                sub(/^addr:/, "", value)
+                print value
+              }
+            }
+          }
+        ' \
+      | grep -Fxq "${expected_ip}" \
+      || die "${expected_ip} is not assigned to ${NIC_NAME}"
+    return
+  fi
+  "${PYTHON_BIN}" - "${NIC_NAME}" "${expected_ip}" <<'PY' \
+    || die "${expected_ip} is not the primary IPv4 assigned to ${NIC_NAME}"
+import fcntl
+import socket
+import struct
+import sys
+
+interface, expected = sys.argv[1:]
+request = struct.pack("256s", interface.encode()[:15])
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+    response = fcntl.ioctl(sock.fileno(), 0x8915, request)
+actual = socket.inet_ntoa(response[20:24])
+if actual != expected:
+    print(f"{interface}: expected {expected}, found {actual}", file=sys.stderr)
+    raise SystemExit(1)
+PY
 }
 
 wheel_sha256() {
@@ -242,32 +567,182 @@ validate_wheel() {
     || die "Mooncake wheel SHA256 mismatch"
 }
 
-npu_process_count() {
+validate_mooncake_install_mode() {
+  case "${MOONCAKE_INSTALL_MODE}" in
+    wheel|existing) ;;
+    *) die "MOONCAKE_INSTALL_MODE must be wheel or existing: ${MOONCAKE_INSTALL_MODE}" ;;
+  esac
+}
+
+validate_cann_version() {
+  local resolved version_text version_file expected_regex
+  [[ "${CANN_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || die "CANN_VERSION must use major.minor.patch format: ${CANN_VERSION}"
+  resolved="$(readlink -f "${CANN_ROOT}")"
+  version_text="${resolved}"
+  if [[ -x "${CANN_ROOT}/query_pkg_version.sh" ]]; then
+    version_text+=$'\n'"$("${CANN_ROOT}/query_pkg_version.sh" 2>&1 || true)"
+  fi
+  version_file="$(find "${CANN_ROOT}" -name version.info -type f -print -quit 2>/dev/null || true)"
+  if [[ -n "${version_file}" ]]; then
+    version_text+=$'\n'"$(head -n 20 "${version_file}" 2>/dev/null || true)"
+  fi
+  expected_regex="${CANN_VERSION//./\\.}"
+  grep -Eq "(^|[^0-9])${expected_regex}([^0-9]|$)" <<<"${version_text}" \
+    || die "CANN ${CANN_VERSION} not detected at ${resolved}"
+}
+
+resolve_atb_root() {
+  if [[ -n "${ATB_ROOT}" ]]; then
+    require_file "${ATB_ROOT}/set_env.sh"
+    return 0
+  fi
+  if [[ -f "${CANN_ROOT}/nnal/atb/set_env.sh" ]]; then
+    ATB_ROOT="${CANN_ROOT}/nnal/atb"
+    return 0
+  fi
+  if [[ -f /usr/local/Ascend/nnal/atb/set_env.sh ]]; then
+    ATB_ROOT=/usr/local/Ascend/nnal/atb
+    return 0
+  fi
+  die "NNAL/ATB was not found; set ATB_ROOT to a directory containing set_env.sh"
+}
+
+installed_mooncake_version() {
+  "${PYTHON_BIN}" -c \
+    'from importlib.metadata import version; print(version("mooncake-transfer-engine"))'
+}
+
+validate_installed_mooncake() {
+  local installed_version
+  installed_version="$(installed_mooncake_version 2>/dev/null)" \
+    || die "mooncake-transfer-engine is not installed in ${PYTHON_BIN}"
+  [[ "${installed_version}" == "${MOONCAKE_VERSION}" ]] \
+    || die "Mooncake version mismatch: expected ${MOONCAKE_VERSION}, got ${installed_version}"
+}
+
+write_mooncake_fingerprint() {
+  local output_path="$1"
+  local package_dir site_packages library library_dir candidate
+  site_packages="$("${PYTHON_BIN}" -c \
+    'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+  package_dir="$(PYTHONPATH="${site_packages}${PYTHONPATH:+:${PYTHONPATH}}" "${PYTHON_BIN}" -c \
+    'import importlib.util; s=importlib.util.find_spec("mooncake"); print(next(iter(s.submodule_search_locations or []), "") if s else "")')"
+  require_dir "${package_dir}"
+  library_dir="${MOONCAKE_LIBRARY_DIR}"
+  if [[ -z "${library_dir}" ]]; then
+    for candidate in "${package_dir}" /usr/local/lib /usr/local/lib64; do
+      if [[ -f "${candidate}/libtransfer_engine.so" \
+        && -f "${candidate}/ascend_transport.so" ]]; then
+        library_dir="${candidate}"
+        break
+      fi
+    done
+  fi
+  require_dir "${library_dir}"
+  : >"${output_path}"
+  while IFS= read -r -d '' library; do
+    printf '%s  %s\n' \
+      "$(sha256sum "${library}" | awk '{print $1}')" \
+      "${library#"${package_dir}"/}" >>"${output_path}"
+  done < <(find "${package_dir}" -type f -name '*.so' -print0 | sort -z)
+  if [[ "${library_dir}" != "${package_dir}" ]]; then
+    for library in \
+      "${library_dir}/libtransfer_engine.so" \
+      "${library_dir}/ascend_transport.so"; do
+      require_file "${library}"
+      printf '%s  runtime/%s\n' \
+        "$(sha256sum "${library}" | awk '{print $1}')" \
+        "$(basename "${library}")" >>"${output_path}"
+    done
+  fi
+  [[ -s "${output_path}" ]] || die "No Mooncake shared libraries found in ${package_dir}"
+}
+
+npu_process_pids() {
   npu-smi info | awk '
     /\| NPU +Chip +\| Process id/ {in_process_table=1; next}
-    in_process_table && /^\|[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]*\|[[:space:]]*[0-9]+/ {count++}
-    END {print count + 0}
-  '
+    in_process_table && /^\|[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]*\|[[:space:]]*[0-9]+/ {
+      split($0, fields, "|")
+      gsub(/[[:space:]]/, "", fields[3])
+      if (fields[3] ~ /^[0-9]+$/) print fields[3]
+    }
+  ' | sort -u
+}
+
+npu_process_count() {
+  local pids=()
+  mapfile -t pids < <(npu_process_pids)
+  printf '%s\n' "${#pids[@]}"
+}
+
+process_is_descendant_of() {
+  local current_pid="$1"
+  local ancestor_pid="$2"
+  local parent_pid
+  while [[ "${current_pid}" =~ ^[0-9]+$ ]] && (( current_pid > 1 )); do
+    [[ "${current_pid}" == "${ancestor_pid}" ]] && return 0
+    [[ -r "/proc/${current_pid}/status" ]] || return 1
+    parent_pid="$(awk '/^PPid:/ {print $2}' "/proc/${current_pid}/status")"
+    [[ "${parent_pid}" =~ ^[0-9]+$ ]] || return 1
+    current_pid="${parent_pid}"
+  done
+  return 1
+}
+
+validate_colocated_control_processes() {
+  [[ "${NODE_ROLE}" == "decode" && "${DEPLOYMENT_VARIANT}" == "pd_control" ]] \
+    || die "Existing NPU processes are allowed only for a colocated control Decode"
+  local prefill_pid actual_devices process_pid
+  prefill_pid="$(read_pid "${COLOCATED_PREFILL_PID_FILE}")" \
+    || die "Missing colocated Prefill PID: ${COLOCATED_PREFILL_PID_FILE}"
+  pid_is_alive "${prefill_pid}" \
+    || die "Colocated Prefill PID is not running: ${prefill_pid}"
+  owned_process "${prefill_pid}" \
+    || die "Colocated Prefill PID is not owned by this deployment: ${prefill_pid}"
+  actual_devices="$(tr '\0' '\n' <"/proc/${prefill_pid}/environ" \
+    | awk -F= '$1 == "PREFILL_DEVICES" {print $2; exit}')"
+  [[ "${actual_devices}" == "${PREFILL_DEVICES}" ]] \
+    || die "Colocated Prefill devices do not match this config"
+  while IFS= read -r process_pid; do
+    process_is_descendant_of "${process_pid}" "${prefill_pid}" \
+      || die "NPU process ${process_pid} is not owned by colocated Prefill ${prefill_pid}"
+  done < <(npu_process_pids)
+  log "Allowing only colocated Prefill NPU processes; Decode devices are disjoint"
 }
 
 check_npus() {
   require_command npu-smi
   local expected=8
-  [[ "${NODE_ROLE}" == "decode" ]] && expected=16
+  if [[ "${NODE_ROLE}" == "decode" && "${DEPLOYMENT_VARIANT}" == "pd_afd" ]]; then
+    expected=16
+  fi
   local detected
   detected="$(npu-smi info -l | awk -F: '/Chip Count/ {gsub(/[[:space:]]/, "", $2); sum += $2} END {print sum + 0}')"
   (( detected >= expected )) || die "${NODE_ROLE} requires ${expected} NPUs, detected ${detected}"
   local process_count
   process_count="$(npu_process_count)"
-  if (( process_count > 0 )) && ! is_true "${ALLOW_NPU_PROCESSES}"; then
-    die "Detected ${process_count} existing NPU processes"
+  if (( process_count > 0 )); then
+    if is_true "${ALLOW_NPU_PROCESSES}"; then
+      warn "ALLOW_NPU_PROCESSES permits ${process_count} existing NPU processes"
+    elif is_true "${ALLOW_COLOCATED_PD_CONTROL}"; then
+      validate_colocated_control_processes
+    else
+      die "Detected ${process_count} existing NPU processes"
+    fi
   fi
 }
 
 owned_pid_names() {
   case "${NODE_ROLE}" in
     prefill) printf '%s\n' prefill ;;
-    decode) printf '%s\n' attention ffn ;;
+    decode)
+      if [[ "${DEPLOYMENT_VARIANT}" == "pd_control" ]]; then
+        printf '%s\n' decode-control
+      else
+        printf '%s\n' attention ffn
+      fi
+      ;;
     proxy) printf '%s\n' proxy ;;
   esac
 }
@@ -289,26 +764,41 @@ ensure_not_running() {
 }
 
 check_start_ports() {
-  require_command ss
   local ports=()
   case "${NODE_ROLE}" in
     prefill) ports=("${PREFILL_API_PORT}" "${PREFILL_KV_PORT}" "${PREFILL_HCCL_IF_BASE_PORT}") ;;
-    decode) ports=("${DECODE_API_PORT}" "${FFN_PROCESS_PORT}" "${AFD_PORT}" "${DECODE_KV_PORT}" "${ATTENTION_HCCL_IF_BASE_PORT}" "${FFN_HCCL_IF_BASE_PORT}") ;;
+    decode)
+      if [[ "${DEPLOYMENT_VARIANT}" == "pd_control" ]]; then
+        ports=("${DECODE_API_PORT}" "${DECODE_KV_PORT}" \
+          "${ATTENTION_HCCL_IF_BASE_PORT}" "${CONTROL_DATA_PARALLEL_RPC_PORT}" \
+          "${CONTROL_MASTER_PORT}")
+      else
+        ports=("${DECODE_API_PORT}" "${FFN_PROCESS_PORT}" "${AFD_PORT}" \
+          "${DECODE_KV_PORT}" "${ATTENTION_HCCL_IF_BASE_PORT}" \
+          "${FFN_HCCL_IF_BASE_PORT}")
+      fi
+      ;;
     proxy) ports=("${PROXY_PORT}") ;;
   esac
   local port
   for port in "${ports[@]}"; do
-    port_is_listening "${port}" && die "Port is already listening: ${port}"
+    if port_is_listening "${port}"; then
+      die "Port is already listening: ${port}"
+    fi
   done
+  return 0
 }
 
 export_runtime_env() {
   local local_ip
   local_ip="$(local_role_ip)"
   export DSV4_CANN_ROOT="${CANN_ROOT}"
+  export DSV4_CANN_VERSION="${CANN_VERSION}"
+  export DSV4_ATB_ROOT="${ATB_ROOT}"
   export DSV4_RUNTIME_VENV="${VENV_ROOT}"
   export DSV4_VLLM_ROOT="${VLLM_ROOT}"
   export DSV4_VLLM_ASCEND_ROOT="${VLLM_ASCEND_ROOT}"
+  export_batch_invariant_env
   export MODEL_PATH VLLM_HOST_IP="${local_ip}" HCCL_IF_IP="${local_ip}"
   export GLOO_SOCKET_IFNAME="${NIC_NAME}" HCCL_SOCKET_IFNAME="${NIC_NAME}"
   export MC_MIN_PRC_PORT MC_MAX_PRC_PORT MAX_MODEL_LEN MAX_NUM_BATCHED_TOKENS
@@ -316,9 +806,19 @@ export_runtime_env() {
   export PREFILL_DEVICES PREFILL_DP_SIZE PREFILL_TP_SIZE DECODE_DP_SIZE DECODE_TP_SIZE
   export ATTENTION_DEVICES FFN_DEVICES ATTENTION_RANKS FFN_RANKS
   export PREFILL_HCCL_IF_BASE_PORT ATTENTION_HCCL_IF_BASE_PORT FFN_HCCL_IF_BASE_PORT
-  export AFD_HOST=127.0.0.1 AFD_PORT TENSOR_PARALLEL_SIZE=1
-  export EXECUTION_MODE=eager U_BATCHES=1 ENABLE_MTP=0
-  export MOONCAKE_ENGINE_ID MOONCAKE_KV_PORT
+  export CONTROL_DATA_PARALLEL_RPC_PORT CONTROL_MASTER_PORT MODEL_NAME
+  export AFD_HOST=127.0.0.1 AFD_PORT
+  export TENSOR_PARALLEL_SIZE="${DECODE_TP_SIZE}"
+  export EXECUTION_MODE="${DECODE_EXECUTION_MODE}"
+  export U_BATCHES="${DECODE_U_BATCHES}"
+  export ENABLE_MTP="${DECODE_ENABLE_MTP}"
+  export MTP_DRAFT_EXECUTION="${DECODE_MTP_DRAFT_EXECUTION}"
+  export MTP_NUM_SPECULATIVE_TOKENS="${DECODE_MTP_NUM_SPECULATIVE_TOKENS}"
+  export DBO_DECODE_TOKEN_THRESHOLD="${DECODE_DBO_DECODE_TOKEN_THRESHOLD}"
+  export DBO_PREFILL_TOKEN_THRESHOLD="${DECODE_DBO_PREFILL_TOKEN_THRESHOLD}"
+  export MAX_CUDAGRAPH_CAPTURE_SIZE="${DECODE_MAX_CUDAGRAPH_CAPTURE_SIZE}"
+  export CUDAGRAPH_CAPTURE_SIZES="${DECODE_CUDAGRAPH_CAPTURE_SIZES}"
+  export MOONCAKE_ENGINE_ID MOONCAKE_KV_PORT MOONCAKE_LIBRARY_DIR
 }
 
 wait_http() {
@@ -346,7 +846,13 @@ new_log() {
 start_prefill() {
   export_runtime_env
   export API_HOST=0.0.0.0 API_PORT="${PREFILL_API_PORT}"
-  export MOONCAKE_ENGINE_ID=dsv4-afd-prefill MOONCAKE_KV_PORT="${PREFILL_KV_PORT}"
+  export MOONCAKE_ENGINE_ID="dsv4-${DEPLOYMENT_SLUG}-prefill"
+  export MOONCAKE_KV_PORT="${PREFILL_KV_PORT}"
+  if [[ "${DEPLOYMENT_VARIANT}" == "pd_control" ]]; then
+    export ENABLE_AFD_PLUGIN=0
+  else
+    export ENABLE_AFD_PLUGIN=1
+  fi
   local log_path pid
   log_path="$(new_log prefill)"
   nohup setsid bash "${PREFILL_SCRIPT}" >"${log_path}" 2>&1 &
@@ -361,7 +867,30 @@ start_prefill() {
   log "Prefill started: pid=${pid}, log=${log_path}"
 }
 
-start_decode() {
+start_control_decode() {
+  export_runtime_env
+  export MOONCAKE_ENGINE_ID="dsv4-pd-control-decode"
+  export MOONCAKE_KV_PORT="${DECODE_KV_PORT}"
+  local log_path pid
+  log_path="$(new_log decode-control)"
+  API_HOST=0.0.0.0 API_PORT="${DECODE_API_PORT}" \
+    nohup setsid bash "${CONTROL_DECODE_SCRIPT}" >"${log_path}" 2>&1 &
+  pid=$!
+  printf '%s\n' "${pid}" >"${STATE_ROOT}/decode-control.pid"
+  sleep 3
+  pid_is_alive "${pid}" || die "Control Decode exited immediately; inspect ${log_path}"
+  if is_true "${WAIT_READY}"; then
+    wait_http "http://127.0.0.1:${DECODE_API_PORT}/health" "${pid}" \
+      || die "Control Decode readiness failed; inspect ${log_path}"
+  fi
+  if grep -Eq 'AFDDeepseekV4ForCausalLM|P2pHcclAFDConnector|AFD FFN EngineCore' \
+    "${log_path}"; then
+    die "PD control loaded AFD code; inspect ${log_path}"
+  fi
+  log "Control Decode started without AFD: pid=${pid}, log=${log_path}"
+}
+
+start_afd_decode() {
   export_runtime_env
   export MOONCAKE_ENGINE_ID=dsv4-afd-decode MOONCAKE_KV_PORT="${DECODE_KV_PORT}"
   local ffn_log attention_log ffn_pid attention_pid deadline ready_count
@@ -425,6 +954,7 @@ start_proxy() {
 
 status_action() {
   validate_role
+  validate_variant
   local overall=0 name pid cmdline log_path ready_count transfer_count
   while read -r name; do
     if pid="$(read_pid "${STATE_ROOT}/${name}.pid" 2>/dev/null)" && pid_is_alive "${pid}"; then
@@ -442,12 +972,24 @@ status_action() {
       ;;
     decode)
       curl -fsS --max-time 5 "http://127.0.0.1:${DECODE_API_PORT}/health" >/dev/null 2>&1 \
-        && log "Attention health: OK" || { warn "Attention health: NOT READY"; overall=1; }
-      log_path="${LOG_ROOT}/ffn.log"
-      ready_count="$( { grep -o 'AFD FFN EngineCore started; workers run connector loop' "${log_path}" 2>/dev/null || true; } | wc -l)"
-      log "FFN connector loops: ${ready_count}/${FFN_RANKS}"
-      (( ready_count >= FFN_RANKS )) || overall=1
-      transfer_count="$( { grep -c 'KV cache transfer for request .* took .* remote_session_id' "${LOG_ROOT}/attention.log" 2>/dev/null || true; } )"
+        && log "Decode health: OK" || { warn "Decode health: NOT READY"; overall=1; }
+      if [[ "${DEPLOYMENT_VARIANT}" == "pd_control" ]]; then
+        log_path="${LOG_ROOT}/decode-control.log"
+        if grep -Eq 'AFDDeepseekV4ForCausalLM|P2pHcclAFDConnector|AFD FFN EngineCore' \
+          "${log_path}" 2>/dev/null; then
+          warn "PD control contains AFD runtime markers"
+          overall=1
+        fi
+      else
+        log_path="${LOG_ROOT}/ffn.log"
+        ready_count="$( { grep -o 'AFD FFN EngineCore started; workers run connector loop' "${log_path}" 2>/dev/null || true; } | wc -l)"
+        log "FFN connector loops: ${ready_count}/${FFN_RANKS}"
+        (( ready_count >= FFN_RANKS )) || overall=1
+        log_path="${LOG_ROOT}/attention.log"
+        grep -Eq 'AFDDeepseekV4ForCausalLM|P2pHcclAFDConnector' "${log_path}" 2>/dev/null \
+          || { warn "PD + AFD Attention log has no AFD runtime marker"; overall=1; }
+      fi
+      transfer_count="$( { grep -c 'KV cache transfer for request .* took .* remote_session_id' "${log_path}" 2>/dev/null || true; } )"
       log "Successful Mooncake KV transfer records: ${transfer_count}"
       ;;
     proxy)
@@ -508,10 +1050,19 @@ stop_name() {
 }
 
 stop_action() {
+  validate_role
+  validate_variant
   mkdir -p "${STATE_ROOT}"
   case "${NODE_ROLE}" in
     proxy) stop_name proxy ;;
-    decode) stop_name attention; stop_name ffn ;;
+    decode)
+      if [[ "${DEPLOYMENT_VARIANT}" == "pd_control" ]]; then
+        stop_name decode-control
+      else
+        stop_name attention
+        stop_name ffn
+      fi
+      ;;
     prefill) stop_name prefill ;;
   esac
   log "Stop complete; run npu-smi info on NPU nodes"
@@ -519,16 +1070,20 @@ stop_action() {
 
 install_action() {
   validate_common_config
-  [[ "${NODE_ROLE}" == "proxy" ]] && { log "Proxy needs no Mooncake wheel install"; return 0; }
-  validate_wheel
+  [[ "${NODE_ROLE}" == "proxy" ]] && { log "Proxy needs no Mooncake install"; return 0; }
+  validate_mooncake_install_mode
   if is_true "${INSTALL_SYSTEM_PACKAGES}"; then
-    require_command sudo
-    sudo apt-get update
-    sudo apt-get install -y libgoogle-glog0v6t64 libjsoncpp25 libjemalloc2 netcat-openbsd
+    install_system_packages
   fi
   AFD_BUILD_ASCEND_OPS=0 "${PYTHON_BIN}" -m pip install \
     --no-build-isolation --no-deps --editable "${AFD_PLUGIN_ROOT}"
-  "${PYTHON_BIN}" -m pip install --no-deps --force-reinstall "${MOONCAKE_WHEEL}"
+  if [[ "${MOONCAKE_INSTALL_MODE}" == "wheel" ]]; then
+    validate_wheel
+    "${PYTHON_BIN}" -m pip install --no-deps --force-reinstall "${MOONCAKE_WHEEL}"
+  else
+    log "Keeping Mooncake already installed in the configured Python environment"
+  fi
+  validate_installed_mooncake
   "${PYTHON_BIN}" -m pip show vllm vllm-ascend vllm-afd-plugin mooncake-transfer-engine
   log "Install complete; next run: bash $0 check ${CONFIG_FILE}"
 }
@@ -537,34 +1092,53 @@ check_action() {
   validate_common_config
   validate_local_network
   require_command curl
-  require_command ss
   mkdir -p "${STATE_ROOT}" "${LOG_ROOT}" "${VALIDATION_ROOT}" "${OUTPUT_ROOT}"
   if [[ "${NODE_ROLE}" == "proxy" ]]; then
     require_file "${PROXY_SCRIPT}"
     require_file "${GOLDEN_VALIDATOR}"
+    require_file "${GOLDEN_GENERATOR}"
     ensure_not_running
     check_start_ports
     log "Proxy preflight passed"
     return 0
   fi
   require_file "${CANN_ROOT}/set_env.sh"
-  [[ "$(readlink -f "${CANN_ROOT}")" == *9.0.1* ]] || die "CANN_ROOT is not 9.0.1"
+  validate_cann_version
+  resolve_atb_root
   require_file "${MODEL_PATH}/config.json"
   require_file "${RUNTIME_CHECK}"
   require_file "${ROUNDTRIP_TOOL}"
-  validate_wheel
+  validate_mooncake_install_mode
+  if [[ "${MOONCAKE_INSTALL_MODE}" == "wheel" ]]; then
+    validate_wheel
+  fi
+  validate_installed_mooncake
   check_npus
   ensure_not_running
   check_start_ports
-  export DSV4_CANN_ROOT="${CANN_ROOT}" DSV4_RUNTIME_VENV="${VENV_ROOT}"
+  export DSV4_CANN_ROOT="${CANN_ROOT}" DSV4_CANN_VERSION="${CANN_VERSION}"
+  export DSV4_ATB_ROOT="${ATB_ROOT}"
+  export DSV4_RUNTIME_VENV="${VENV_ROOT}"
   export DSV4_VLLM_ROOT="${VLLM_ROOT}" DSV4_VLLM_ASCEND_ROOT="${VLLM_ASCEND_ROOT}"
+  export_batch_invariant_env
   bash "${RUNTIME_CHECK}" >"${STATE_ROOT}/runtime-check.log" 2>&1 \
     || { tail -n 100 "${STATE_ROOT}/runtime-check.log" >&2; die "Mooncake runtime check failed"; }
+  if [[ "${ENABLE_BATCH_INVARIANT}" == "1" ]]; then
+    bash -c 'source "$1"; exec python -c '\''import batch_invariant_ops; import vllm_ascend.batch_invariant as bi; assert bi.HAS_ASCENDC_BATCH_INVARIANT; print("batch-invariant backend: OK")'\''' \
+      batch-invariant-check "${AFD_PLUGIN_ROOT}/tools/dsv4/activate_v023_vllm_cann_runtime.sh" \
+      >"${STATE_ROOT}/batch-invariant-check.log" 2>&1 \
+      || { tail -n 100 "${STATE_ROOT}/batch-invariant-check.log" >&2; die "Batch-invariant runtime check failed"; }
+  fi
+  write_mooncake_fingerprint "${STATE_ROOT}/mooncake-libraries.sha256"
   if is_true "${RUN_LOCAL_ROUNDTRIP}"; then
-    bash -c 'source "$1"; exec python "$2" --producer-device "$3" --consumer-device "$4"' \
+    if ! bash -c 'source "$1"; exec python "$2" --producer-device "$3" --consumer-device "$4" --host "$5" --interface "$6"' \
       pd-roundtrip "${RUNTIME_CHECK}" "${ROUNDTRIP_TOOL}" \
       "${ROUNDTRIP_PRODUCER_DEVICE}" "${ROUNDTRIP_CONSUMER_DEVICE}" \
-      >"${STATE_ROOT}/roundtrip.json" 2>"${STATE_ROOT}/roundtrip.stderr"
+      "$(local_role_ip)" "${NIC_NAME}" \
+      >"${STATE_ROOT}/roundtrip.json" 2>"${STATE_ROOT}/roundtrip.stderr"; then
+      tail -n 100 "${STATE_ROOT}/roundtrip.stderr" >&2 || true
+      die "Mooncake local NPU round-trip failed; inspect ${STATE_ROOT}/roundtrip.stderr"
+    fi
   fi
   log "Preflight passed; runtime=${STATE_ROOT}/runtime-check.log"
 }
@@ -578,18 +1152,169 @@ start_action() {
   ensure_not_running
   case "${NODE_ROLE}" in
     prefill) require_file "${PREFILL_SCRIPT}"; start_prefill ;;
-    decode) require_file "${ATTENTION_SCRIPT}"; require_file "${FFN_SCRIPT}"; start_decode ;;
+    decode)
+      if [[ "${DEPLOYMENT_VARIANT}" == "pd_control" ]]; then
+        require_file "${CONTROL_DECODE_SCRIPT}"
+        start_control_decode
+      else
+        require_file "${ATTENTION_SCRIPT}"
+        require_file "${FFN_SCRIPT}"
+        start_afd_decode
+      fi
+      ;;
     proxy) require_file "${PROXY_SCRIPT}"; start_proxy ;;
   esac
 }
 
+control_golden_metadata_args() {
+  printf '%s\n' \
+    "baseline_kind=mooncake_pd_no_afd" \
+    "deployment_variant=pd_control" \
+    "cann_root=$(readlink -f "${CANN_ROOT}" 2>/dev/null || printf '%s' "${CANN_ROOT}")" \
+    "cann_version=${CANN_VERSION}" \
+    "vllm_commit=${VLLM_COMMIT}" \
+    "vllm_ascend_commit=${VLLM_ASCEND_COMMIT}" \
+    "afd_commit=${AFD_PD_COMMIT}" \
+    "model_path=${MODEL_PATH}" \
+    "prefill_dp_size=${PREFILL_DP_SIZE}" \
+    "prefill_tp_size=${PREFILL_TP_SIZE}" \
+    "decode_dp_size=${DECODE_DP_SIZE}" \
+    "decode_tp_size=${DECODE_TP_SIZE}" \
+    "execution_mode=${DECODE_EXECUTION_MODE}" \
+    "u_batches=${DECODE_U_BATCHES}" \
+    "mtp=${DECODE_ENABLE_MTP}" \
+    "mtp_draft_execution=${DECODE_MTP_DRAFT_EXECUTION}" \
+    "mtp_num_speculative_tokens=${DECODE_MTP_NUM_SPECULATIVE_TOKENS}" \
+    "batch_invariant=${ENABLE_BATCH_INVARIANT}" \
+    "mooncake_version=${MOONCAKE_VERSION}"
+}
+
+record_control_action() {
+  [[ "${NODE_ROLE}" == "proxy" ]] \
+    || die "record-control must run with NODE_ROLE=proxy"
+  [[ "${DEPLOYMENT_VARIANT}" == "pd_control" ]] \
+    || die "record-control requires DEPLOYMENT_VARIANT=pd_control"
+  validate_common_config
+  status_action
+  require_file "${NATIVE_GOLDEN_PATH}"
+  require_file "${GOLDEN_GENERATOR}"
+  local run_dir endpoint output_path reference_comparison
+  local metadata_args=()
+  run_dir="${VALIDATION_ROOT}/pd-control-$(date +%Y%m%d_%H%M%S)"
+  output_path="${run_dir}/golden_results.json"
+  endpoint="http://127.0.0.1:${PROXY_PORT}/v1/completions"
+  mkdir -p "${run_dir}" "$(dirname "${PD_CONTROL_GOLDEN_PATH}")" "${STATE_ROOT}"
+  while IFS= read -r metadata_entry; do
+    metadata_args+=(--metadata "${metadata_entry}")
+  done < <(control_golden_metadata_args)
+  if ! "${PYTHON_BIN}" "${GOLDEN_GENERATOR}" \
+    --endpoint "${endpoint}" --model "${MODEL_NAME}" \
+    --prompt-source "${NATIVE_GOLDEN_PATH}" --output "${output_path}" \
+    --rounds "${VALIDATION_ROUNDS}" "${metadata_args[@]}"; then
+    die "PD control was not stable; inspect ${output_path}"
+  fi
+  cp "${output_path}" "${PD_CONTROL_GOLDEN_PATH}"
+  reference_comparison="$("${PYTHON_BIN}" -c \
+    'import json,sys; d=json.load(open(sys.argv[1])); c=d["reference_comparison"]; print("{}/{}".format(c["exact_match_count"], c["request_count"]))' \
+    "${output_path}")"
+  {
+    printf 'status=pd_control_golden_recorded\n'
+    printf 'finished_at=%s\n' "$(date --iso-8601=seconds)"
+    printf 'pd_control_golden=%s\n' "${PD_CONTROL_GOLDEN_PATH}"
+    printf 'native_vs_pd_control=%s\n' "${reference_comparison}"
+  } >"${run_dir}/summary.env"
+  printf '%s\n' "${run_dir}" >"${STATE_ROOT}/last-validation-dir"
+  log "PD control golden recorded: ${PD_CONTROL_GOLDEN_PATH}"
+  log "Native semantic reference vs PD control: ${reference_comparison} (informational)"
+}
+
+functional_smoke_action() {
+  [[ "${NODE_ROLE}" == "proxy" ]] || die "smoke must run with NODE_ROLE=proxy"
+  validate_common_config
+  status_action
+  require_file "${FUNCTIONAL_SMOKE_TOOL}"
+  local run_dir endpoint cancel_rc
+  run_dir="${VALIDATION_ROOT}/f0-functional-$(date +%Y%m%d_%H%M%S)"
+  endpoint="http://127.0.0.1:${PROXY_PORT}/v1/completions"
+  mkdir -p "${run_dir}" "${STATE_ROOT}"
+  "${PYTHON_BIN}" "${FUNCTIONAL_SMOKE_TOOL}" \
+    --endpoint "${endpoint}" --model "${MODEL_NAME}" \
+    --batch-sizes "${VALIDATION_BATCH_SIZES}" \
+    --output "${run_dir}/batches.json"
+  if is_true "${RUN_CANCELLATION_TEST}"; then
+    set +e
+    curl -fsS --max-time 1 "${endpoint}" \
+      -H 'Content-Type: application/json' \
+      -d "{\"model\":\"${MODEL_NAME}\",\"prompt\":\"Write a detailed deterministic systems validation checklist.\",\"temperature\":0,\"seed\":1024,\"max_tokens\":512,\"stream\":false}" \
+      >"${run_dir}/cancellation-response.json" 2>"${run_dir}/cancellation.stderr"
+    cancel_rc=$?
+    set -e
+    printf '%s\n' "${cancel_rc}" >"${run_dir}/cancellation.exitcode"
+    [[ "${cancel_rc}" == "28" ]] \
+      || die "Cancellation gate expected curl exit 28, got ${cancel_rc}"
+    "${PYTHON_BIN}" "${FUNCTIONAL_SMOKE_TOOL}" \
+      --endpoint "${endpoint}" --model "${MODEL_NAME}" --batch-sizes "1" \
+      --output "${run_dir}/recovery.json"
+  fi
+  status_action
+  {
+    printf 'status=f0_functional_smoke_passed_no_golden\n'
+    printf 'finished_at=%s\n' "$(date --iso-8601=seconds)"
+    printf 'deployment_variant=%s\n' "${DEPLOYMENT_VARIANT}"
+    printf 'decode_topology=DP%s/TP%s\n' "${DECODE_DP_SIZE}" "${DECODE_TP_SIZE}"
+    printf 'execution_mode=%s\n' "${DECODE_EXECUTION_MODE}"
+    printf 'u_batches=%s\n' "${DECODE_U_BATCHES}"
+    printf 'mtp=%s\n' "${DECODE_ENABLE_MTP}"
+    printf 'mtp_draft_execution=%s\n' "${DECODE_MTP_DRAFT_EXECUTION}"
+    printf 'batch_invariant=%s\n' "${ENABLE_BATCH_INVARIANT}"
+    printf 'golden_checked=0\n'
+  } >"${run_dir}/summary.env"
+  printf '%s\n' "${run_dir}" >"${STATE_ROOT}/last-validation-dir"
+  log "F0 functional smoke passed without golden: ${run_dir}"
+}
+
+validate_control_golden() {
+  require_file "${PD_CONTROL_GOLDEN_PATH}"
+  local expected_metadata=()
+  while IFS= read -r metadata_entry; do
+    expected_metadata+=("${metadata_entry}")
+  done < <(control_golden_metadata_args)
+  "${PYTHON_BIN}" -c '
+import json
+import sys
+
+path = sys.argv[1]
+rounds = int(sys.argv[2])
+payload = json.load(open(path, encoding="utf-8"))
+if payload.get("passed") is not True:
+    raise SystemExit("PD control golden is not internally stable")
+if payload.get("rounds") != rounds or payload.get("prompt_count") != 10:
+    raise SystemExit("PD control golden must contain 10 prompts for the configured rounds")
+expected = dict(item.split("=", 1) for item in sys.argv[3:])
+actual = payload.get("metadata", {})
+mismatched = {
+    key: {"expected": value, "actual": actual.get(key)}
+    for key, value in expected.items()
+    if actual.get(key) != value
+}
+if mismatched:
+    raise SystemExit(f"PD control golden metadata mismatch: {mismatched}")
+sampling = payload.get("sampling", {})
+if sampling != {"temperature": 0.0, "top_p": 1.0, "max_tokens": 16, "seed": 1024}:
+    raise SystemExit(f"PD control golden sampling mismatch: {sampling}")
+' "${PD_CONTROL_GOLDEN_PATH}" "${VALIDATION_ROUNDS}" "${expected_metadata[@]}"
+}
+
 validate_action() {
   [[ "${NODE_ROLE}" == "proxy" ]] || die "validate must run with NODE_ROLE=proxy"
+  [[ "${DEPLOYMENT_VARIANT}" == "pd_afd" ]] \
+    || die "validate requires DEPLOYMENT_VARIANT=pd_afd; use record-control for pd_control"
+  validate_common_config
   status_action
-  require_file "${GOLDEN_PATH}"
+  validate_control_golden
   require_file "${GOLDEN_VALIDATOR}"
   local run_dir endpoint cancel_rc
-  run_dir="${VALIDATION_ROOT}/m9-f0-$(date +%Y%m%d_%H%M%S)"
+  run_dir="${VALIDATION_ROOT}/pd-afd-f0-$(date +%Y%m%d_%H%M%S)"
   mkdir -p "${run_dir}" "${STATE_ROOT}"
   endpoint="http://127.0.0.1:${PROXY_PORT}/v1/completions"
   curl -fsS --max-time 600 "${endpoint}" \
@@ -599,7 +1324,7 @@ validate_action() {
   read -r -a batch_sizes <<<"${VALIDATION_BATCH_SIZES}"
   "${PYTHON_BIN}" "${GOLDEN_VALIDATOR}" \
     --endpoint "${endpoint}" --model "${MODEL_NAME}" \
-    --golden "${GOLDEN_PATH}" --rounds "${VALIDATION_ROUNDS}" \
+    --golden "${PD_CONTROL_GOLDEN_PATH}" --rounds "${VALIDATION_ROUNDS}" \
     --batch-sizes "${batch_sizes[@]}" --output "${run_dir}/golden.json"
   if is_true "${RUN_CANCELLATION_TEST}"; then
     set +e
@@ -615,12 +1340,14 @@ validate_action() {
       >"${run_dir}/health-after-cancellation.json"
   fi
   {
-    printf 'status=proxy_validation_passed_decode_transfer_evidence_required\n'
+    printf 'status=pd_control_vs_pd_afd_passed_decode_transfer_evidence_required\n'
     printf 'finished_at=%s\n' "$(date --iso-8601=seconds)"
+    printf 'comparison=pd_control_vs_pd_afd\n'
+    printf 'matched_requests=%s\n' "$((VALIDATION_ROUNDS * 10))"
     printf 'golden=%s\n' "${run_dir}/golden.json"
   } >"${run_dir}/summary.env"
   printf '%s\n' "${run_dir}" >"${STATE_ROOT}/last-validation-dir"
-  log "Proxy validation passed: ${run_dir}"
+  log "Path-matched PD control vs PD + AFD validation passed: ${run_dir}"
   log "Run collect on proxy, decode, and prefill; Decode artifact must contain KV transfer evidence"
 }
 
@@ -633,6 +1360,7 @@ copy_log_tail() {
 
 collect_action() {
   validate_role
+  validate_variant
   require_command tar
   require_command sha256sum
   mkdir -p "${STATE_ROOT}" "${OUTPUT_ROOT}"
@@ -641,11 +1369,12 @@ collect_action() {
   COLLECT_TEMP_DIR="${temp_dir}"
   trap '[[ -z "${COLLECT_TEMP_DIR:-}" ]] || rm -rf -- "${COLLECT_TEMP_DIR}"' EXIT
   timestamp="$(date +%Y%m%d_%H%M%S)"
-  archive="${OUTPUT_ROOT}/dsv4-m9-pd-${NODE_ROLE}-${timestamp}.tar.gz"
+  archive="${OUTPUT_ROOT}/dsv4-m9-${DEPLOYMENT_SLUG}-${NODE_ROLE}-${timestamp}.tar.gz"
   {
+    printf 'deployment_variant=%s\n' "${DEPLOYMENT_VARIANT}"
     printf 'node_role=%s\n' "${NODE_ROLE}"
     printf 'collected_at=%s\n' "$(date --iso-8601=seconds)"
-    printf 'hostname=%s\n' "$(hostname)"
+    printf 'hostname=%s\n' "$(resolve_hostname)"
     printf 'prefill_ip=%s\n' "${PREFILL_IP}"
     printf 'decode_ip=%s\n' "${DECODE_IP}"
     printf 'nic_name=%s\n' "${NIC_NAME}"
@@ -653,12 +1382,24 @@ collect_action() {
     printf 'vllm_commit=%s\n' "$(git_head "${VLLM_ROOT}" 2>/dev/null || true)"
     printf 'vllm_ascend_commit=%s\n' "$(git_head "${VLLM_ASCEND_ROOT}" 2>/dev/null || true)"
     printf 'afd_commit=%s\n' "$(git_head "${AFD_PLUGIN_ROOT}" 2>/dev/null || true)"
-    printf 'mooncake_wheel_sha256=%s\n' "${MOONCAKE_WHEEL_SHA256}"
+    printf 'mooncake_install_mode=%s\n' "${MOONCAKE_INSTALL_MODE}"
+    printf 'mooncake_version=%s\n' "${MOONCAKE_VERSION}"
+    printf 'batch_invariant=%s\n' "${ENABLE_BATCH_INVARIANT}"
+    printf 'vllm_ascend_worktree_mode=%s\n' "${VLLM_ASCEND_WORKTREE_MODE}"
+    if [[ "${MOONCAKE_INSTALL_MODE}" == "wheel" ]]; then
+      printf 'mooncake_wheel_sha256=%s\n' "${MOONCAKE_WHEEL_SHA256}"
+    else
+      printf 'mooncake_wheel_sha256=not-used\n'
+    fi
+    if [[ -f "${STATE_ROOT}/mooncake-libraries.sha256" ]]; then
+      printf 'mooncake_library_set_sha256=%s\n' \
+        "$(sha256sum "${STATE_ROOT}/mooncake-libraries.sha256" | awk '{print $1}')"
+    fi
   } >"${temp_dir}/summary.env"
   {
-    git -C "${VLLM_ROOT}" status --short 2>/dev/null || true
-    git -C "${VLLM_ASCEND_ROOT}" status --short 2>/dev/null || true
-    git -C "${AFD_PLUGIN_ROOT}" status --short 2>/dev/null || true
+    git -c safe.directory="${VLLM_ROOT}" -C "${VLLM_ROOT}" status --short 2>/dev/null || true
+    git -c safe.directory="${VLLM_ASCEND_ROOT}" -C "${VLLM_ASCEND_ROOT}" status --short 2>/dev/null || true
+    git -c safe.directory="${AFD_PLUGIN_ROOT}" -C "${AFD_PLUGIN_ROOT}" status --short 2>/dev/null || true
   } >"${temp_dir}/git-status.txt"
   "${PYTHON_BIN}" -m pip show torch torch-npu vllm vllm-ascend vllm-afd-plugin mooncake-transfer-engine \
     >"${temp_dir}/python-packages.txt" 2>&1 || true
@@ -667,32 +1408,50 @@ collect_action() {
   fi
   if command -v ss >/dev/null 2>&1; then
     ss -ltnp >"${temp_dir}/ports.txt" 2>&1 || true
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -lntp >"${temp_dir}/ports.txt" 2>&1 || true
+  else
+    {
+      printf '# ss unavailable; raw Linux TCP socket tables\n'
+      printf '\n# /proc/net/tcp\n'
+      cat /proc/net/tcp
+      printf '\n# /proc/net/tcp6\n'
+      cat /proc/net/tcp6
+    } >"${temp_dir}/ports.txt" 2>&1 || true
   fi
   set +e
   status_action >"${temp_dir}/status.txt" 2>&1
   status_rc=$?
   set -e
   printf '%s\n' "${status_rc}" >"${temp_dir}/status.exitcode"
-  for name in prefill attention ffn proxy; do
+  for name in prefill decode-control attention ffn proxy; do
     log_path="${LOG_ROOT}/${name}.log"
     copy_log_tail "${log_path}" "${temp_dir}/${name}.tail.log"
   done
   cp "${STATE_ROOT}/runtime-check.log" "${temp_dir}/" 2>/dev/null || true
+  cp "${STATE_ROOT}/batch-invariant-check.log" "${temp_dir}/" 2>/dev/null || true
+  cp "${STATE_ROOT}/mooncake-libraries.sha256" "${temp_dir}/" 2>/dev/null || true
   cp "${STATE_ROOT}/roundtrip.json" "${temp_dir}/" 2>/dev/null || true
   cp "${STATE_ROOT}/roundtrip.stderr" "${temp_dir}/" 2>/dev/null || true
   if [[ -f "${STATE_ROOT}/last-validation-dir" ]]; then
     read -r validation_dir <"${STATE_ROOT}/last-validation-dir"
     case "${validation_dir}" in
       "${VALIDATION_ROOT}"/*)
-        for name in smoke.json golden.json cancellation.exitcode cancellation.stderr health-after-cancellation.json summary.env; do
+        for name in smoke.json golden.json golden_results.json cancellation.exitcode cancellation.stderr health-after-cancellation.json summary.env; do
           [[ -f "${validation_dir}/${name}" ]] && cp "${validation_dir}/${name}" "${temp_dir}/validation-${name}"
         done
         ;;
       *) warn "Ignoring validation path outside VALIDATION_ROOT: ${validation_dir}" ;;
     esac
   fi
+  local transfer_log="${LOG_ROOT}/attention.log"
+  if [[ "${NODE_ROLE}" == "decode" && "${DEPLOYMENT_VARIANT}" == "pd_control" ]]; then
+    transfer_log="${LOG_ROOT}/decode-control.log"
+  elif [[ "${NODE_ROLE}" == "prefill" ]]; then
+    transfer_log="${LOG_ROOT}/prefill.log"
+  fi
   { grep -Eh 'KV cache transfer for request .* took .* remote_session_id' \
-      "${LOG_ROOT}/attention.log" 2>/dev/null || true; } \
+      "${transfer_log}" 2>/dev/null || true; } \
     | tail -n 50 >"${temp_dir}/kv-transfer-evidence.txt"
   { grep -Enh "${FATAL_PATTERN}" "${LOG_ROOT}"/*.log 2>/dev/null || true; } \
     | tail -n 200 >"${temp_dir}/fatal-markers.txt"
@@ -714,14 +1473,31 @@ collect_action() {
 
 print_config_action() {
   validate_role
+  validate_variant
+  printf 'DEPLOYMENT_VARIANT=%s\n' "${DEPLOYMENT_VARIANT}"
   printf 'NODE_ROLE=%s\n' "${NODE_ROLE}"
   printf 'PREFILL_IP=%s\n' "${PREFILL_IP:-}"
   printf 'DECODE_IP=%s\n' "${DECODE_IP:-}"
   printf 'NIC_NAME=%s\n' "${NIC_NAME:-}"
   printf 'AFD_PD_COMMIT=%s\n' "${AFD_PD_COMMIT:-}"
+  printf 'MOONCAKE_INSTALL_MODE=%s\n' "${MOONCAKE_INSTALL_MODE}"
+  printf 'MOONCAKE_VERSION=%s\n' "${MOONCAKE_VERSION}"
+  printf 'MOONCAKE_LIBRARY_DIR=%s\n' "${MOONCAKE_LIBRARY_DIR:-auto}"
   printf 'CANN_ROOT=%s\n' "${CANN_ROOT}"
+  printf 'CANN_VERSION=%s\n' "${CANN_VERSION}"
+  printf 'ATB_ROOT=%s\n' "${ATB_ROOT:-auto}"
   printf 'VENV_ROOT=%s\n' "${VENV_ROOT}"
   printf 'MODEL_PATH=%s\n' "${MODEL_PATH}"
+  printf 'NATIVE_GOLDEN_PATH=%s\n' "${NATIVE_GOLDEN_PATH}"
+  printf 'PD_CONTROL_GOLDEN_PATH=%s\n' "${PD_CONTROL_GOLDEN_PATH}"
+  printf 'DECODE_TOPOLOGY=DP%s/TP%s\n' "${DECODE_DP_SIZE}" "${DECODE_TP_SIZE}"
+  printf 'DECODE_EXECUTION_MODE=%s\n' "${DECODE_EXECUTION_MODE}"
+  printf 'DECODE_U_BATCHES=%s\n' "${DECODE_U_BATCHES}"
+  printf 'DECODE_ENABLE_MTP=%s\n' "${DECODE_ENABLE_MTP}"
+  printf 'DECODE_MTP_DRAFT_EXECUTION=%s\n' "${DECODE_MTP_DRAFT_EXECUTION}"
+  printf 'ENABLE_BATCH_INVARIANT=%s\n' "${ENABLE_BATCH_INVARIANT}"
+  printf 'ALLOW_COLOCATED_PD_CONTROL=%s\n' "${ALLOW_COLOCATED_PD_CONTROL}"
+  printf 'VLLM_ASCEND_WORKTREE_MODE=%s\n' "${VLLM_ASCEND_WORKTREE_MODE}"
   printf 'STATE_ROOT=%s\n' "${STATE_ROOT}"
   printf 'LOG_ROOT=%s\n' "${LOG_ROOT}"
   printf 'OUTPUT_ROOT=%s\n' "${OUTPUT_ROOT}"
@@ -733,6 +1509,8 @@ case "${ACTION}" in
   check) check_action ;;
   start) start_action ;;
   status) status_action ;;
+  smoke) functional_smoke_action ;;
+  record-control) record_control_action ;;
   validate) validate_action ;;
   stop) stop_action ;;
   collect) collect_action ;;

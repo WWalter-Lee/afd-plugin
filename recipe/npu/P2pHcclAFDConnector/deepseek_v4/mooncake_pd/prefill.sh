@@ -36,7 +36,18 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export TASK_QUEUE_ENABLE=1
 export SOC_VERSION=ascend910_9362
 export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-18000}"
-export VLLM_PLUGINS=ascend,ascend_model,ascend_model_loader,ascend_kv_connector,afd
+case "${ENABLE_AFD_PLUGIN:-1}" in
+  0)
+    export VLLM_PLUGINS=ascend,ascend_model,ascend_model_loader,ascend_kv_connector
+    ;;
+  1)
+    export VLLM_PLUGINS=ascend,ascend_model,ascend_model_loader,ascend_kv_connector,afd
+    ;;
+  *)
+    echo "ENABLE_AFD_PLUGIN must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
 unset VLLM_ASCEND_ENABLE_FLASHCOMM1
 
 source "${ROOT_DIR}/tools/dsv4/check_mooncake_runtime.sh"
