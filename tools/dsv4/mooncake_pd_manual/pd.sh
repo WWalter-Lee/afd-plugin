@@ -141,6 +141,7 @@ DEPLOYMENT_SLUG="${DEPLOYMENT_VARIANT//_/-}"
 : "${RUN_CANCELLATION_TEST:=1}"
 : "${ARTIFACT_LOG_TAIL_BYTES:=262144}"
 : "${ARTIFACT_MAX_BYTES:=2097152}"
+: "${PORT_SNAPSHOT_TIMEOUT_SECONDS:=10}"
 
 PYTHON_BIN="${VENV_ROOT}/bin/python"
 PREFILL_SCRIPT="${AFD_PLUGIN_ROOT}/recipe/npu/P2pHcclAFDConnector/deepseek_v4/mooncake_pd/prefill.sh"
@@ -1358,6 +1359,34 @@ copy_log_tail() {
   tail -c "${ARTIFACT_LOG_TAIL_BYTES}" "${source_path}" >"${output_path}"
 }
 
+write_raw_tcp_tables() {
+  local output_path="$1"
+  {
+    printf '# socket utility unavailable or timed out; raw Linux TCP tables\n'
+    printf '\n# /proc/net/tcp\n'
+    cat /proc/net/tcp
+    printf '\n# /proc/net/tcp6\n'
+    cat /proc/net/tcp6
+  } >"${output_path}" 2>&1 || true
+}
+
+capture_port_snapshot() {
+  local output_path="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnp >"${output_path}" 2>&1 || true
+  elif command -v netstat >/dev/null 2>&1 \
+    && command -v timeout >/dev/null 2>&1; then
+    if timeout "${PORT_SNAPSHOT_TIMEOUT_SECONDS}" netstat -lntp \
+      >"${output_path}" 2>&1; then
+      return 0
+    fi
+    warn "netstat port snapshot timed out; using /proc/net/tcp*"
+    write_raw_tcp_tables "${output_path}"
+  else
+    write_raw_tcp_tables "${output_path}"
+  fi
+}
+
 collect_action() {
   validate_role
   validate_variant
@@ -1406,19 +1435,7 @@ collect_action() {
   if command -v npu-smi >/dev/null 2>&1; then
     npu-smi info >"${temp_dir}/npu-smi.txt" 2>&1 || true
   fi
-  if command -v ss >/dev/null 2>&1; then
-    ss -ltnp >"${temp_dir}/ports.txt" 2>&1 || true
-  elif command -v netstat >/dev/null 2>&1; then
-    netstat -lntp >"${temp_dir}/ports.txt" 2>&1 || true
-  else
-    {
-      printf '# ss unavailable; raw Linux TCP socket tables\n'
-      printf '\n# /proc/net/tcp\n'
-      cat /proc/net/tcp
-      printf '\n# /proc/net/tcp6\n'
-      cat /proc/net/tcp6
-    } >"${temp_dir}/ports.txt" 2>&1 || true
-  fi
+  capture_port_snapshot "${temp_dir}/ports.txt"
   set +e
   status_action >"${temp_dir}/status.txt" 2>&1
   status_rc=$?
@@ -1437,7 +1454,7 @@ collect_action() {
     read -r validation_dir <"${STATE_ROOT}/last-validation-dir"
     case "${validation_dir}" in
       "${VALIDATION_ROOT}"/*)
-        for name in smoke.json golden.json golden_results.json cancellation.exitcode cancellation.stderr health-after-cancellation.json summary.env; do
+        for name in batches.json recovery.json smoke.json golden.json golden_results.json cancellation.exitcode cancellation.stderr health-after-cancellation.json summary.env; do
           [[ -f "${validation_dir}/${name}" ]] && cp "${validation_dir}/${name}" "${temp_dir}/validation-${name}"
         done
         ;;

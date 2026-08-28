@@ -102,6 +102,10 @@ netstat -ie -> Python 标准库` 检查网卡主 IPv4，按 `ss -> netstat ->
 `/proc/sys/kernel/hostname`、Shell `HOSTNAME` 或 `uname -n` 获取主机名；无需为
 收集验收包额外安装 `hostname` RPM。
 
+`collect` 对 `netstat -lntp` 使用默认 10 秒超时；在大量 Mooncake/HCCL socket
+下超时会自动改为保存 `/proc/net/tcp*`，不会阻塞证据包生成。F0 证据包同时包含
+`batches.json` 和取消后的 `recovery.json`。
+
 Mooncake 运行时必须预加载 `libjemalloc.so.2`。脚本会自动检查 Debian/Ubuntu 的
 `/usr/lib/aarch64-linux-gnu`、openEuler/RPM 的 `/usr/lib64` 等常见位置，并回退
 到 `ldconfig`；特殊镜像可在角色配置中设置绝对路径

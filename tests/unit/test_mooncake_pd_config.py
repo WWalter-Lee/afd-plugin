@@ -147,6 +147,9 @@ def test_mooncake_pd_manual_entry_is_safe_and_size_capped():
     assert "RUN_LOCAL_ROUNDTRIP=0\n  check_action" in script
     assert '"${MODEL_NAME}"' in script
     assert 'tail -c "${ARTIFACT_LOG_TAIL_BYTES}"' in script
+    assert 'timeout "${PORT_SNAPSHOT_TIMEOUT_SECONDS}" netstat -lntp' in script
+    assert 'write_raw_tcp_tables "${output_path}"' in script
+    assert "batches.json recovery.json" in script
     assert 'tail -n 50 >"${temp_dir}/kv-transfer-evidence.txt"' in script
     assert 'tail -n 200 >"${temp_dir}/fatal-markers.txt"' in script
     assert "recipe/npu/deepseek_v4/common/validate_golden.py" in script
@@ -210,6 +213,7 @@ def test_mooncake_pd_manual_entry_is_safe_and_size_capped():
     assert "libatb.so =>" in runtime
     assert 'ARTIFACT_LOG_TAIL_BYTES="262144"' in config
     assert 'ARTIFACT_MAX_BYTES="2097152"' in config
+    assert 'PORT_SNAPSHOT_TIMEOUT_SECONDS="10"' in config
     assert "http://127.0.0.1:${FFN_PROCESS_PORT}" not in script
     assert 'DEPLOYMENT_VARIANT="CHANGE_ME"' in config
     assert 'PD_CONTROL_GOLDEN_PATH="/data/z00569729/validation/' in config
