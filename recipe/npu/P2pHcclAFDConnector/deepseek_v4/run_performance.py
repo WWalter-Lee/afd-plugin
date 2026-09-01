@@ -439,6 +439,16 @@ def _runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
                 "ffn_hccl_if_base_port": args.ffn_hccl_base_port,
                 "async_scheduling": args.async_scheduling,
                 "tensor_parallel_size": tensor_parallel_size,
+                "graph_u2_compute_overlap": getattr(
+                    args,
+                    "graph_u2_compute_overlap",
+                    "on",
+                ),
+                "graph_u2_hybrid_dag": getattr(
+                    args,
+                    "graph_u2_hybrid_dag",
+                    "on",
+                ),
             },
             "workload": {
                 "input_len": args.input_len,
@@ -485,6 +495,12 @@ def _set_service_environment(args: argparse.Namespace) -> None:
             "TORCH_PROFILER_WITH_STACK": "0",
             "AFD_ASYNC_SCHEDULING": args.async_scheduling,
             "TENSOR_PARALLEL_SIZE": str(tensor_parallel_size),
+            "AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP": (
+                "1" if getattr(args, "graph_u2_compute_overlap", "on") == "on" else "0"
+            ),
+            "AFD_HCCL_GRAPH_U2_HYBRID_DAG": (
+                "1" if getattr(args, "graph_u2_hybrid_dag", "on") == "on" else "0"
+            ),
         }
     )
     SHARED._set_mtp_environment(
@@ -772,6 +788,24 @@ def _parse_args() -> argparse.Namespace:
         default="eager",
     )
     parser.add_argument("--u-batches", type=int, choices=(1, 2), required=True)
+    parser.add_argument(
+        "--graph-u2-compute-overlap",
+        choices=("on", "off"),
+        default="on",
+        help=(
+            "Enable or disable the Graph/U2 side-compute overlap while keeping "
+            "the same source snapshot. This has no effect on U1."
+        ),
+    )
+    parser.add_argument(
+        "--graph-u2-hybrid-dag",
+        choices=("on", "off"),
+        default="on",
+        help=(
+            "Release each next-layer Attention stage from its own prior-layer "
+            "F2A receive. This has no effect when Graph/U2 overlap is off."
+        ),
+    )
     parser.add_argument(
         "--tensor-parallel-size",
         type=int,

@@ -13,22 +13,28 @@ The connector supports one or more consecutive Attention peers per FFN rank
 consume each other's messages. A Gloo control group carries stage token counts
 before the FFN side posts receives and prepares its aggregate receive buffers.
 
-Eager U2 keeps the same synchronous ``send/recv`` API but orders decoder
-transfers with connector-owned NPU streams and events. DeepSeek-V4 drives its
-two stages from one layer-major host loop, avoiding cross-thread DBO handoff
-without changing the HCCL message protocol or introducing ``isend/irecv``.
-Graph U2 captures the two stages into one FULL graph and deliberately bypasses
-the eager-only communication streams. MTP remains a merged stage-0 exchange;
-for ``A = k * F`` each FFN rank aggregates its ``k`` Attention peers before
-running the draft MoE and splits the result back to the same peers.
+U2 keeps the same point-to-point protocol but orders decoder transfers with
+connector-owned NPU streams and events. DeepSeek-V4 drives its two stages from
+one layer-major host loop, avoiding cross-thread DBO handoff without changing
+the HCCL message protocol or introducing ``isend/irecv``. Eager execution uses
+``dist.send/recv`` on dedicated communication streams. During Graph
+warmup/capture, graph-visible A2F sends and F2A receives remain on the parent
+capture stream, while model compute runs on an event-connected side stream.
+FFN releases each F2A send from its own side stream as soon as the matching
+compute completes, so Attention can close stage 0 before advancing to stage 1.
+MTP remains a merged stage-0 exchange; for
+``A = k * F`` each FFN rank aggregates its ``k`` Attention peers before running
+the draft MoE and splits the result back to the same peers.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import os
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 import torch.distributed as dist
@@ -170,6 +176,43 @@ class HCCLAttentionPipelineEvents:
 
 
 @dataclass(frozen=True, slots=True)
+class HCCLAttentionGraphEvents:
+    """Events connecting one logical Graph stage across physical streams."""
+
+    ready: Any
+    compute_done: Any
+    send_done: Any
+    recv_done: Any
+
+
+@dataclass(frozen=True, slots=True)
+class HCCLAttentionGraphStreamPlan:
+    """Map logical Attention Graph work onto physical NPU streams.
+
+    A ``None`` communication stream means that operation remains on the parent
+    capture stream. V1 therefore binds only compute to a side stream; a later
+    three-stream implementation can replace the plan without changing the DAG.
+    """
+
+    compute_stream: Any
+    send_stream: Any | None = None
+    recv_stream: Any | None = None
+
+    def resolve(
+        self,
+        operation: Literal["compute", "send", "recv"],
+        parent_stream: Any,
+    ) -> Any:
+        if operation == "compute":
+            return self.compute_stream
+        if operation == "send":
+            return self.send_stream if self.send_stream is not None else parent_stream
+        if operation == "recv":
+            return self.recv_stream if self.recv_stream is not None else parent_stream
+        raise ValueError(f"unknown Attention Graph stream operation: {operation}")
+
+
+@dataclass(frozen=True, slots=True)
 class HCCLPendingAttentionTransfer:
     """Attention stream state retained between proxy send and receive calls."""
 
@@ -187,6 +230,23 @@ class HCCLAttentionReceiveDependency:
 
 _MTP_HEADER_MAGIC = 0x4D545031
 _MTP_HEADER_PREFIX_SIZE = 4
+_GRAPH_U2_COMPUTE_OVERLAP_ENV = "AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP"
+_GRAPH_U2_HYBRID_DAG_ENV = "AFD_HCCL_GRAPH_U2_HYBRID_DAG"
+
+
+def _strict_binary_env_enabled(name: str, *, default: str = "1") -> bool:
+    raw = os.environ.get(name, default).strip()
+    if raw not in {"0", "1"}:
+        raise RuntimeError(f"{name} must be 0 or 1, got {raw!r}")
+    return raw == "1"
+
+
+def _graph_u2_compute_overlap_enabled() -> bool:
+    return _strict_binary_env_enabled(_GRAPH_U2_COMPUTE_OVERLAP_ENV)
+
+
+def _graph_u2_hybrid_dag_enabled() -> bool:
+    return _strict_binary_env_enabled(_GRAPH_U2_HYBRID_DAG_ENV)
 
 
 class P2pHcclAFDConnector(AFDConnectorBase):
@@ -259,6 +319,8 @@ class P2pHcclAFDConnector(AFDConnectorBase):
             int(vllm_config.parallel_config.num_ubatches),
         )
         self.stream_overlap_enabled = self.num_stages > 1
+        self.graph_u2_compute_overlap_enabled = _graph_u2_compute_overlap_enabled()
+        self.graph_u2_hybrid_dag_enabled = _graph_u2_hybrid_dag_enabled()
 
         self.data_pg_list: list[ProcessGroup] = []
         self.ids_pg_list: list[ProcessGroup] = []
@@ -277,8 +339,13 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         self.is_warmup = False
         self.a2f_send_stream = None
         self.f2a_recv_stream = None
+        self.attention_graph_compute_stream = None
+        self.attention_graph_stream_plan: HCCLAttentionGraphStreamPlan | None = None
         self.attention_pipeline_events: dict[
             tuple[int, int], HCCLAttentionPipelineEvents
+        ] = {}
+        self.attention_graph_events: dict[
+            tuple[int, int], HCCLAttentionGraphEvents
         ] = {}
         self.pending_attention_transfers: dict[int, HCCLPendingAttentionTransfer] = {}
         self.attention_receive_dependencies: dict[
@@ -385,7 +452,10 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         self.mtp_phase_graph_replay = False
         self.a2f_send_stream = None
         self.f2a_recv_stream = None
+        self.attention_graph_compute_stream = None
+        self.attention_graph_stream_plan = None
         self.attention_pipeline_events = {}
+        self.attention_graph_events = {}
         self.pending_attention_transfers = {}
         self.attention_receive_dependencies = {}
         self.control_plane.reset_pending_payload()
@@ -402,8 +472,8 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         )
 
     def _attention_stream_pipeline_active(self) -> bool:
-        # Compiled Graph U2 lowers the synchronous HCCL path into graph ops.
-        # Do not let Dynamo inspect the eager stream/event objects below.
+        # Dynamo lowers the synchronous HCCL path into graph ops. Stream/event
+        # scheduling belongs to the later NPUGraph warmup/capture phase.
         if torch.compiler.is_compiling():
             return False
         if not self.attention_stream_pipeline_ready:
@@ -415,14 +485,9 @@ class P2pHcclAFDConnector(AFDConnectorBase):
             # a vLLM model forward context and must retain the synchronous path.
             return False
         graph_ubatching = bool(getattr(forward_context, "afd_graph_ubatching", False))
-        layer_major = bool(getattr(forward_context, "afd_layer_major_u2", False))
-        # FULL_DECODE_ONLY may capture a previously unseen U2 shape during live
-        # execution, after Dynamo compilation has finished. Keep the eager
-        # communication streams for graph warmup, but never enter them while
-        # torch-npu is recording the parent graph.
-        if graph_ubatching and (
-            not layer_major or torch.npu.is_current_stream_capturing()
-        ):
+        # Graph U2 uses a dedicated receive path below. Keep this eager path
+        # disabled so A2F sends do not move off the parent capture stream.
+        if graph_ubatching:
             return False
         return bool(
             getattr(forward_context, "dbo_enabled", False)
@@ -438,10 +503,14 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         return bool(getattr(forward_context, "afd_layer_major_u2", False))
 
     def _initialize_attention_stream_pipeline(self) -> None:
-        """Create the eager U2 Attention communication streams and events."""
+        """Create eager communication and Graph compute streams/events."""
         device = torch.device("npu", self.local_rank)
         self.a2f_send_stream = torch.npu.Stream(device=device)
         self.f2a_recv_stream = torch.npu.Stream(device=device)
+        self.attention_graph_compute_stream = torch.npu.Stream(device=device)
+        self.attention_graph_stream_plan = HCCLAttentionGraphStreamPlan(
+            compute_stream=self.attention_graph_compute_stream,
+        )
         num_layers = int(self.vllm_config.model_config.hf_config.num_hidden_layers)
         self.attention_pipeline_events = {
             (layer_idx, stage_idx): HCCLAttentionPipelineEvents(
@@ -452,6 +521,149 @@ class P2pHcclAFDConnector(AFDConnectorBase):
             for layer_idx in range(num_layers)
             for stage_idx in range(self.num_stages)
         }
+        self.attention_graph_events = {
+            (layer_idx, stage_idx): HCCLAttentionGraphEvents(
+                ready=torch.npu.Event(),
+                compute_done=torch.npu.Event(),
+                send_done=torch.npu.Event(),
+                recv_done=torch.npu.Event(),
+            )
+            for layer_idx in range(num_layers + 1)
+            for stage_idx in range(self.num_stages)
+        }
+
+    def attention_graph_compute_pipeline_active(self) -> bool:
+        """Return whether Graph U2 should run model compute on its side stream."""
+        # Keep Python container inspection out of the Dynamo full-graph path.
+        # The synchronous HCCL ops are lowered while compiling; stream/event
+        # scheduling is selected later during NPUGraph warmup and capture.
+        if torch.compiler.is_compiling():
+            return False
+        graph_pipeline_ready = bool(
+            self.stream_overlap_enabled
+            and self.afd_config.role == "attention"
+            and self.attention_graph_stream_plan is not None
+            and self.attention_graph_events
+        )
+        if not graph_pipeline_ready:
+            return False
+        try:
+            forward_context = get_forward_context()
+        except AssertionError:
+            return False
+        return bool(
+            self.graph_u2_compute_overlap_enabled
+            and getattr(forward_context, "afd_graph_ubatching", False)
+            and getattr(forward_context, "afd_layer_major_u2", False)
+            and getattr(forward_context, "dbo_enabled", False)
+            and int(getattr(forward_context, "num_ubatches", 1)) > 1
+        )
+
+    def attention_graph_hybrid_dag_active(self) -> bool:
+        """Return whether Graph U2 uses per-stage receive-ready dependencies."""
+        return bool(
+            self.graph_u2_hybrid_dag_enabled
+            and self.attention_graph_compute_pipeline_active()
+        )
+
+    def _attention_graph_stream(
+        self,
+        operation: Literal["compute", "send", "recv"],
+        parent_stream: Any,
+    ) -> Any:
+        plan = self.attention_graph_stream_plan
+        if plan is None:
+            raise RuntimeError("HCCL P2P Attention Graph stream plan is unavailable")
+        return plan.resolve(operation, parent_stream)
+
+    @contextmanager
+    def _use_attention_graph_stream(
+        self,
+        operation: Literal["send", "recv"],
+        parent_stream: Any,
+    ) -> Iterator[Any]:
+        operation_stream = self._attention_graph_stream(operation, parent_stream)
+        if operation_stream is parent_stream:
+            yield operation_stream
+            return
+        with torch.npu.stream(operation_stream):
+            yield operation_stream
+
+    @contextmanager
+    def attention_graph_compute(
+        self,
+        *,
+        layer_idx: int,
+        stage_idx: int,
+        tensors: tuple[torch.Tensor, ...] = (),
+        wait_for_receive_layer_idx: int | None = None,
+    ) -> Iterator[None]:
+        """Fork Graph compute from the parent HCCL capture stream."""
+        if not self.attention_graph_compute_pipeline_active():
+            raise RuntimeError("HCCL P2P Attention Graph compute pipeline is inactive")
+        events = self._attention_graph_events(layer_idx, stage_idx)
+        parent_stream = torch.npu.current_stream()
+        if wait_for_receive_layer_idx is None:
+            events.ready.record(parent_stream)
+            ready_event = events.ready
+        else:
+            ready_event = self._attention_graph_events(
+                wait_for_receive_layer_idx,
+                stage_idx,
+            ).recv_done
+        compute_stream = self._attention_graph_stream("compute", parent_stream)
+        with torch.npu.stream(compute_stream):
+            ready_event.wait(compute_stream)
+            for tensor in tensors:
+                self._record_stream(tensor, compute_stream)
+            yield
+            events.compute_done.record(compute_stream)
+
+    def wait_for_attention_graph_compute(
+        self,
+        *,
+        layer_idx: int,
+        stage_idx: int,
+        tensors: tuple[torch.Tensor, ...] = (),
+    ) -> None:
+        """Release one logical send after the matching Graph compute."""
+        if not self.attention_graph_compute_pipeline_active():
+            raise RuntimeError("HCCL P2P Attention Graph compute pipeline is inactive")
+        parent_stream = torch.npu.current_stream()
+        events = self._attention_graph_events(layer_idx, stage_idx)
+        send_stream = self._attention_graph_stream("send", parent_stream)
+        events.compute_done.wait(send_stream)
+        for tensor in tensors:
+            self._record_stream(tensor, send_stream)
+
+    def join_attention_graph_compute(
+        self,
+        *,
+        layer_idx: int,
+        stage_idx: int,
+        tensors: tuple[torch.Tensor, ...] = (),
+    ) -> None:
+        """Join final side-stream compute back to the parent capture stream."""
+        if not self.attention_graph_compute_pipeline_active():
+            raise RuntimeError("HCCL P2P Attention Graph compute pipeline is inactive")
+        parent_stream = torch.npu.current_stream()
+        events = self._attention_graph_events(layer_idx, stage_idx)
+        events.compute_done.wait(parent_stream)
+        for tensor in tensors:
+            self._record_stream(tensor, parent_stream)
+
+    def _attention_graph_events(
+        self,
+        layer_idx: int,
+        stage_idx: int,
+    ) -> HCCLAttentionGraphEvents:
+        try:
+            return self.attention_graph_events[(layer_idx, stage_idx)]
+        except KeyError as exc:
+            raise RuntimeError(
+                "HCCL P2P Attention Graph event is not initialized: "
+                f"layer={layer_idx} stage={stage_idx}"
+            ) from exc
 
     def send_attn_output(
         self,
@@ -524,6 +736,27 @@ class P2pHcclAFDConnector(AFDConnectorBase):
                 group=group,
             )
             return
+        if (
+            metadata.phase == "decoder"
+            and self.attention_graph_compute_pipeline_active()
+        ):
+            events = self._attention_graph_events(
+                metadata.layer_idx,
+                metadata.stage_idx,
+            )
+            parent_stream = torch.npu.current_stream()
+            with self._use_attention_graph_stream(
+                "send",
+                parent_stream,
+            ) as send_stream:
+                self._send_tensor(
+                    hidden_states,
+                    dst=self.mapping.subgroup_index,
+                    group=group,
+                    stream=(None if send_stream is parent_stream else send_stream),
+                )
+                events.send_done.record(send_stream)
+            return
         self._send_tensor(
             hidden_states,
             dst=self.mapping.subgroup_index,
@@ -546,6 +779,27 @@ class P2pHcclAFDConnector(AFDConnectorBase):
                 src=self.mapping.subgroup_index,
                 group=group,
             )
+        if phase == "decoder" and self.attention_graph_compute_pipeline_active():
+            layer_idx = kwargs.get("layer_idx")
+            if layer_idx is None:
+                raise RuntimeError(
+                    "HCCL P2P Attention Graph receive requires layer_idx"
+                )
+            events = self._attention_graph_events(int(layer_idx), ubatch_idx)
+            parent_stream = torch.npu.current_stream()
+            with self._use_attention_graph_stream(
+                "recv",
+                parent_stream,
+            ) as recv_stream:
+                events.send_done.wait(recv_stream)
+                self._recv_tensor(
+                    ref_tensor,
+                    src=self.mapping.subgroup_index,
+                    group=group,
+                    stream=(None if recv_stream is parent_stream else recv_stream),
+                )
+                events.recv_done.record(recv_stream)
+            return ref_tensor
         self._recv_tensor(
             ref_tensor,
             src=self.mapping.subgroup_index,
@@ -646,8 +900,8 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         tensor: torch.Tensor,
     ) -> None:
         """Make the current compute stream consume one deferred F2A receive."""
-        # Dynamic Graph/U2 capture uses graph-visible send/recv on the current
-        # capture stream, so there is no connector-owned receive event to join.
+        # Graph U2 keeps F2A receives on the parent stream, so it has no
+        # connector-owned receive event to join here.
         if not self._attention_stream_pipeline_active():
             return
         dependency = self.attention_receive_dependencies.pop(stage_idx, None)
@@ -1026,10 +1280,7 @@ class P2pHcclAFDConnector(AFDConnectorBase):
             raise RuntimeError("DSV4 MTP draft Graph uses merged stage 0")
         if header_values[1] != speculative_step:
             raise RuntimeError("DSV4 MTP draft Graph speculative step mismatch")
-        if (
-            not torch.compiler.is_compiling()
-            and header_values[2] != num_tokens
-        ):
+        if not torch.compiler.is_compiling() and header_values[2] != num_tokens:
             raise RuntimeError(
                 "DSV4 MTP draft Graph local token count does not match the "
                 f"prepared header: {num_tokens} != {header_values[2]}",
@@ -1187,11 +1438,11 @@ class P2pHcclAFDConnector(AFDConnectorBase):
             if torch.compiler.is_compiling() or tensor.is_contiguous()
             else tensor.contiguous()
         )
+        if stream is not None:
+            self._record_stream(send_tensor, stream)
         if self._graph_transport_active():
             _graph_hccl_send(send_tensor, dst=dst, group=group)
             return
-        if stream is not None:
-            self._record_stream(send_tensor, stream)
         dist.send(send_tensor, dst=dst, group=group)
 
     def _recv_tensor(
@@ -1202,11 +1453,11 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         group: ProcessGroup,
         stream=None,
     ) -> None:
+        if stream is not None:
+            self._record_stream(tensor, stream)
         if self._graph_transport_active():
             _graph_hccl_recv(tensor, src=src, group=group)
             return
-        if stream is not None:
-            self._record_stream(tensor, stream)
         dist.recv(tensor, src=src, group=group)
 
     def _graph_transport_active(self) -> bool:

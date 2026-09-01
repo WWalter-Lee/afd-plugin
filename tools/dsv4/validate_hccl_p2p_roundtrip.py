@@ -98,6 +98,7 @@ def _validate_graph_transport(
     stages: int,
     step_idx: int,
     tensor_parallel_size: int,
+    multistream: bool,
 ) -> list[dict[str, object]]:
     import torch
     import torch.distributed as dist
@@ -178,8 +179,47 @@ def _validate_graph_transport(
     dist.barrier(group=connector.p2p_pg)
     graph = torch.npu.NPUGraph()
     connector.is_graph_capturing = True
+    graph_compute_stream = torch.npu.Stream() if multistream else None
+    graph_compute_events = (
+        {stage_idx: torch.npu.Event() for stage_idx in counts_by_stage}
+        if multistream
+        else None
+    )
+    graph_recv_events = (
+        {stage_idx: torch.npu.Event() for stage_idx in counts_by_stage}
+        if multistream and role == "ffn"
+        else None
+    )
     with torch.npu.graph(graph, pool=torch.npu.graph_pool_handle()):
-        if role == "attention":
+        if role == "attention" and multistream:
+            assert graph_compute_stream is not None
+            assert graph_compute_events is not None
+            prepared_hidden = {}
+            capture_stream = torch.npu.current_stream()
+            capture_ready = torch.npu.Event()
+            capture_ready.record(capture_stream)
+            for stage_idx, hidden in static_hidden.items():
+                with torch.npu.stream(graph_compute_stream):
+                    capture_ready.wait(graph_compute_stream)
+                    hidden.record_stream(graph_compute_stream)
+                    prepared_hidden[stage_idx] = hidden + 0
+                    graph_compute_events[stage_idx].record(graph_compute_stream)
+            for stage_idx, hidden in prepared_hidden.items():
+                graph_compute_events[stage_idx].wait(capture_stream)
+                context = AFDTransferContext(
+                    metadata=AFDTransferMetadata.create_attention_metadata(
+                        layer_idx=1,
+                        stage_idx=stage_idx,
+                        seq_len=int(hidden.shape[0]),
+                    ),
+                )
+                connector.send_attn_output(hidden, context)
+            for stage_idx in prepared_hidden:
+                returned_buffers[stage_idx] = connector.recv_ffn_output(
+                    returned_buffers[stage_idx],
+                    ubatch_idx=stage_idx,
+                )
+        elif role == "attention":
             for stage_idx, hidden in static_hidden.items():
                 context = AFDTransferContext(
                     metadata=AFDTransferMetadata.create_attention_metadata(
@@ -189,8 +229,35 @@ def _validate_graph_transport(
                     ),
                 )
                 connector.send_attn_output(hidden, context)
-                connector.recv_ffn_output(
+                returned_buffers[stage_idx] = connector.recv_ffn_output(
                     returned_buffers[stage_idx],
+                    ubatch_idx=stage_idx,
+                )
+        elif multistream:
+            assert graph_compute_stream is not None
+            assert graph_compute_events is not None
+            assert graph_recv_events is not None
+            ffn_outputs = {}
+            ffn_contexts = {}
+            capture_stream = torch.npu.current_stream()
+            for stage_idx in counts_by_stage:
+                payload = connector.recv_attn_output(
+                    ubatch_idx=stage_idx,
+                    layer_idx=1,
+                )
+                recv_done = graph_recv_events[stage_idx]
+                recv_done.record(capture_stream)
+                with torch.npu.stream(graph_compute_stream):
+                    recv_done.wait(graph_compute_stream)
+                    payload.hidden_states.record_stream(graph_compute_stream)
+                    ffn_outputs[stage_idx] = payload.hidden_states + 1
+                    ffn_contexts[stage_idx] = payload.context
+                    graph_compute_events[stage_idx].record(graph_compute_stream)
+            for stage_idx, ffn_output in ffn_outputs.items():
+                graph_compute_events[stage_idx].wait(capture_stream)
+                connector.send_ffn_output(
+                    ffn_output,
+                    ffn_contexts[stage_idx],
                     ubatch_idx=stage_idx,
                 )
         else:
@@ -217,6 +284,7 @@ def _validate_graph_transport(
                     "stage": stage_idx,
                     "tokens": int(hidden.shape[0]),
                     "captured": True,
+                    "multistream": multistream,
                 }
             )
     else:
@@ -249,6 +317,7 @@ def _validate_graph_transport(
                     ],
                     "input_ids_external": True,
                     "fan_in_out": True,
+                    "multistream": multistream,
                 }
             )
 
@@ -493,6 +562,7 @@ def _worker(
     steps: int,
     enable_mtp: bool,
     graph_transport: bool,
+    graph_multistream: bool,
     mtp_graph_transport: bool,
     tensor_parallel_size: int,
     result_path: Path,
@@ -884,6 +954,7 @@ def _worker(
                     stages=stages,
                     step_idx=2,
                     tensor_parallel_size=tensor_parallel_size,
+                    multistream=graph_multistream,
                 )
             )
         if mtp_graph_transport:
@@ -955,6 +1026,7 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=2)
     parser.add_argument("--enable-mtp", action="store_true")
     parser.add_argument("--graph-transport", action="store_true")
+    parser.add_argument("--graph-multistream", action="store_true")
     parser.add_argument("--mtp-graph-transport", action="store_true")
     parser.add_argument("--tensor-parallel-size", type=int, choices=(1, 2), default=1)
     parser.add_argument("--timeout", type=float, default=300)
@@ -967,6 +1039,10 @@ def main() -> None:
         parser.error("--steps must be positive")
     if args.mtp_graph_transport and not args.enable_mtp:
         parser.error("--mtp-graph-transport requires --enable-mtp")
+    if args.graph_multistream and not args.graph_transport:
+        parser.error("--graph-multistream requires --graph-transport")
+    if args.graph_multistream and args.stages != 2:
+        parser.error("--graph-multistream requires --stages 2")
     if args.mtp_graph_transport and not args.graph_transport:
         parser.error("--mtp-graph-transport requires --graph-transport")
     if attention_size < ffn_size or attention_size % ffn_size != 0:
@@ -1012,6 +1088,7 @@ def main() -> None:
                 args.steps,
                 args.enable_mtp,
                 args.graph_transport,
+                args.graph_multistream,
                 args.mtp_graph_transport,
                 args.tensor_parallel_size,
                 result_paths[(role, role_rank)],
@@ -1079,6 +1156,7 @@ def main() -> None:
         "steps": args.steps,
         "enable_mtp": args.enable_mtp,
         "graph_transport": args.graph_transport,
+        "graph_multistream": args.graph_multistream,
         "mtp_graph_transport": args.mtp_graph_transport,
         "results": results,
         "exit_codes": exit_codes,

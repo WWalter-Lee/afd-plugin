@@ -111,7 +111,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self.mtp_ffn_model: torch.nn.Module | None = None
 
     def _initialize_ffn_stream_pipeline(self, device: torch.device) -> None:
-        """Create eager U2 receive, compute, and send streams for FFN."""
+        """Create U2 FFN streams/events shared by eager and Graph."""
         self.ffn_recv_stream = torch.npu.Stream(device=device)
         self.ffn_compute_stream = torch.npu.Stream(device=device)
         self.ffn_send_stream = torch.npu.Stream(device=device)
@@ -517,19 +517,38 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         if input_ids_cache is None:
             input_ids_cache = self._ffn_input_ids_cache = {}
         input_ids_cache.clear()
-        stream_overlap = bool(
+        graph_stream_overlap = bool(
+            getattr(self, "ffn_stream_overlap_enabled", False)
+            and getattr(
+                self.connector,
+                "graph_u2_compute_overlap_enabled",
+                True,
+            )
+            and len(stage_ids) > 1
+            and (
+                is_graph_capturing
+                or (
+                    bool(getattr(self, "use_aclgraph", False))
+                    and bool(getattr(self.connector, "is_warmup", False))
+                )
+            )
+        )
+        eager_stream_overlap = bool(
             getattr(self, "ffn_stream_overlap_enabled", False)
             and len(stage_ids) > 1
-            and not is_graph_capturing
+            and not graph_stream_overlap
             and aclgraph_runtime_mode in (None, CUDAGraphMode.NONE)
         )
-        if stream_overlap:
+        compute_stream_overlap = graph_stream_overlap or eager_stream_overlap
+        if compute_stream_overlap:
             assert isinstance(self.connector, P2pHcclAFDConnector)
-            assert self.ffn_recv_stream is not None
             assert self.ffn_compute_stream is not None
             assert self.ffn_send_stream is not None
+        if eager_stream_overlap:
+            assert self.ffn_recv_stream is not None
         try:
             for layer_idx in layer_indices:
+                graph_pending_send_events: list[Any] = []
                 for stage_idx in stage_ids:
                     stage_input_ids = (
                         input_ids_by_stage.get(stage_idx)
@@ -537,7 +556,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                         else None
                     )
                     recv_event = None
-                    if stream_overlap:
+                    if eager_stream_overlap:
                         previous_send_event = (
                             self.ffn_send_events[(layer_idx - 1, stage_idx)]
                             if layer_idx > 0
@@ -560,6 +579,9 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                             max_num_tokens=self.max_num_tokens,
                             input_ids=stage_input_ids,
                         )
+                        if graph_stream_overlap:
+                            recv_event = self.ffn_recv_events[(layer_idx, stage_idx)]
+                            recv_event.record(torch.npu.current_stream())
                     if layer_idx == 0 and num_hash_layers > 0:
                         if payload.input_ids is None:
                             raise RuntimeError(
@@ -589,7 +611,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                         compute_kwargs = {}
                         if hash_input_ids is not None:
                             compute_kwargs["input_ids"] = hash_input_ids
-                        if stream_overlap:
+                        if compute_stream_overlap:
                             assert recv_event is not None
                             compute_event = self.ffn_compute_events[
                                 (layer_idx, stage_idx)
@@ -620,6 +642,8 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                                 wait_event=compute_event,
                                 done_event=send_event,
                             )
+                            if graph_stream_overlap:
+                                graph_pending_send_events.append(send_event)
                         else:
                             rank_ffn_output = self.model.compute_ffn_output(
                                 hidden_states=hidden_states,
@@ -632,7 +656,11 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                                 context,
                                 stage_idx=stage_idx,
                             )
-            if stream_overlap:
+                if graph_pending_send_events:
+                    current_stream = torch.npu.current_stream()
+                    for send_event in graph_pending_send_events:
+                        send_event.wait(current_stream)
+            if eager_stream_overlap:
                 current_stream = torch.npu.current_stream()
                 final_layer_idx = layer_indices[-1]
                 for stage_idx in stage_ids:

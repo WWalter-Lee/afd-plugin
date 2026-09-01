@@ -418,6 +418,221 @@ def test_attention_layer_major_u2_runs_layer_then_stage(
         assert model._mtp_hidden_buffer.tolist() == [[4.0], [5.0], [13.0]]
 
 
+@pytest.mark.parametrize("hybrid_dag", [True, False])
+def test_attention_graph_u2_builds_stage_local_receive_dependencies(
+    monkeypatch,
+    hybrid_dag,
+):
+    events = []
+    active_context = [None]
+    pending_recv_layers = {}
+
+    @contextmanager
+    def use_forward_context(forward_context):
+        previous = active_context[0]
+        active_context[0] = forward_context
+        try:
+            yield
+        finally:
+            active_context[0] = previous
+
+    class FakeConnector:
+        def require_attention_pipeline_idle(self):
+            events.append(("idle",))
+
+        def wait_for_attention_stage_receive(self, *, stage_idx, tensor):
+            assert tensor is not None
+            events.append(("wait_recv", pending_recv_layers.pop(stage_idx), stage_idx))
+
+        def reset_attention_pipeline_state(self):
+            events.append(("reset",))
+
+        def attention_graph_compute_pipeline_active(self):
+            return True
+
+        def attention_graph_hybrid_dag_active(self):
+            return hybrid_dag
+
+        @contextmanager
+        def attention_graph_compute(
+            self,
+            *,
+            layer_idx,
+            stage_idx,
+            tensors,
+            wait_for_receive_layer_idx,
+        ):
+            assert tensors
+            events.append(
+                (
+                    "fork",
+                    layer_idx,
+                    stage_idx,
+                    wait_for_receive_layer_idx,
+                )
+            )
+            yield
+            events.append(("compute_done", layer_idx, stage_idx))
+
+        def wait_for_attention_graph_compute(
+            self,
+            *,
+            layer_idx,
+            stage_idx,
+            tensors,
+        ):
+            assert tensors
+            events.append(("join", layer_idx, stage_idx))
+
+        def join_attention_graph_compute(
+            self,
+            *,
+            layer_idx,
+            stage_idx,
+            tensors,
+        ):
+            assert tensors
+            events.append(("final_join", layer_idx, stage_idx))
+
+    class FakeEmbedding(nn.Module):
+        def forward(self, input_ids):
+            return input_ids.float().unsqueeze(-1)
+
+    class FakeLayer(nn.Module):
+        def __init__(self, layer_idx):
+            super().__init__()
+            self.layer_idx = layer_idx
+
+        def forward_attention_to_remote_ffn_input(
+            self,
+            _positions,
+            hidden_states,
+            _residual,
+            _scaling,
+        ):
+            stage_idx = active_context[0].ubatch_idx
+            events.append(("compute", self.layer_idx, stage_idx))
+            continuation = (hidden_states, hidden_states, hidden_states)
+            return hidden_states + self.layer_idx + 1, continuation
+
+        def dispatch_remote_ffn(self, hidden_states):
+            stage_idx = active_context[0].ubatch_idx
+            events.append(("send", self.layer_idx, stage_idx))
+            return SimpleNamespace(output=hidden_states + 10)
+
+        def receive_remote_ffn(self, transfer):
+            stage_idx = active_context[0].ubatch_idx
+            events.append(("recv", self.layer_idx, stage_idx))
+            pending_recv_layers[stage_idx] = self.layer_idx
+            return transfer.output
+
+        def complete_remote_ffn(self, ffn_output, _continuation):
+            stage_idx = active_context[0].ubatch_idx
+            events.append(("complete", self.layer_idx, stage_idx))
+            return ffn_output
+
+    connector = FakeConnector()
+    model = object.__new__(adapter.AFDDeepseekV4Model)
+    nn.Module.__init__(model)
+    model.afd_role = "attention"
+    model.config = SimpleNamespace(num_hidden_layers=2)
+    model.mtp_enabled = False
+    model.hc_mult = 1
+    model.start_layer = 0
+    model.end_layer = 2
+    model.layers = nn.ModuleList([FakeLayer(0), FakeLayer(1)])
+    model.embed_tokens = FakeEmbedding()
+    model.aux_hidden_state_layers = ()
+    model.hc_head = lambda hidden_states, *_args: hidden_states.squeeze(1)
+    model.hc_head_fn = None
+    model.hc_head_scale = None
+    model.hc_head_base = None
+    model.norm = nn.Identity()
+
+    def stage(input_ids, stage_idx):
+        forward_context = SimpleNamespace(
+            additional_kwargs={
+                "afd_metadata": SimpleNamespace(connector=connector),
+            },
+            ubatch_idx=stage_idx,
+        )
+        return SimpleNamespace(
+            context=SimpleNamespace(forward_context=forward_context),
+            input_ids=input_ids,
+            inputs_embeds=None,
+            intermediate_tensors=None,
+            positions=torch.arange(input_ids.shape[0]),
+        )
+
+    monkeypatch.setattr(adapter, "override_forward_context", use_forward_context)
+    monkeypatch.setattr(
+        adapter.native,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+
+    outputs = model.forward_ubatches_layer_major(
+        [stage(torch.tensor([1, 2]), 0), stage(torch.tensor([10]), 1)]
+    )
+
+    assert [output.tolist() for output in outputs] == [
+        [[24.0], [25.0]],
+        [[33.0]],
+    ]
+    schedule = [event for event in events if event[0] in {"compute", "send", "recv"}]
+    assert schedule == [
+        ("compute", 0, 0),
+        ("compute", 0, 1),
+        ("send", 0, 0),
+        ("recv", 0, 0),
+        ("send", 0, 1),
+        ("recv", 0, 1),
+        ("compute", 1, 0),
+        ("compute", 1, 1),
+        ("send", 1, 0),
+        ("recv", 1, 0),
+        ("send", 1, 1),
+        ("recv", 1, 1),
+    ]
+    for layer_idx in range(2):
+        assert events.index(("send", layer_idx, 0)) < events.index(
+            ("recv", layer_idx, 0)
+        )
+        assert events.index(("recv", layer_idx, 0)) < events.index(
+            ("send", layer_idx, 1)
+        )
+    for layer_idx in range(2):
+        for stage_idx in range(2):
+            assert events.index(("join", layer_idx, stage_idx)) < events.index(
+                ("send", layer_idx, stage_idx)
+            )
+            assert events.index(("recv", layer_idx, stage_idx)) < events.index(
+                ("wait_recv", layer_idx, stage_idx),
+            )
+    expected_dependencies = (
+        [
+            ("fork", 0, 0, None),
+            ("fork", 0, 1, None),
+            ("fork", 1, 0, 0),
+            ("fork", 1, 1, 0),
+            ("fork", 2, 0, 1),
+            ("fork", 2, 1, 1),
+        ]
+        if hybrid_dag
+        else [
+            ("fork", 0, 0, None),
+            ("fork", 0, 1, None),
+            ("fork", 1, 0, None),
+            ("fork", 1, 1, None),
+            ("fork", 2, 0, None),
+            ("fork", 2, 1, None),
+        ]
+    )
+    assert [event for event in events if event[0] == "fork"] == expected_dependencies
+    assert ("final_join", 2, 0) in events
+    assert ("final_join", 2, 1) in events
+
+
 @pytest.mark.parametrize("role", ["attention", "ffn"])
 def test_mtp_constructor_enforces_role_ownership(
     mtp_construction_env,

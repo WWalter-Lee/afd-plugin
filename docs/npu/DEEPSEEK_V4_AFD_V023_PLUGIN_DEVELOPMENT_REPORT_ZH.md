@@ -6,14 +6,14 @@
 
 | 项目 | 固定口径 |
 |---|---|
-| 报告截止日期 | 2026-08-25 |
+| 报告截止日期 | 主功能基线 2026-08-25；Graph/U2 混合 DAG 实现更新 2026-08-31 |
 | vLLM | `releases/v0.23.0`，`0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665` |
 | vLLM-Ascend | `rfc/vllm_cann`，`3da28f9414583d2d0b672a8f06d1fae142404bda` |
-| afd-plugin | `feat/dsv4-afd-mooncake-pd`，已提交 HEAD `49bb4a1dda5f7a59dcfbb45ea36d3ad1b2b89193` |
+| afd-plugin | `feat/dsv4-afd-mooncake-pd`，当前已提交 HEAD `6c636961d3791df545ae065811368dc8beb1e4ab` |
 | 开发范围 | 从 `99ee0ef6` 的 v0.23 兼容迁移到当前 Mooncake PD M9 |
 | 主要模型 | `DeepSeek-V4-Flash-w8a8-mtp` |
-| 功能验证工具链 | CANN 9.0.1、Python 3.12、`torch_npu 2.10.0.post2`、`afd-v023-vllm-cann` venv |
-| 当前工作树 | M9 手工安装和部署脚本仍有未提交改动，不能作为已冻结功能基线 |
+| 功能验证工具链 | 历史功能基线使用 CANN 9.0.1；2026-08-29 Graph/U2 多流增量固定 CANN 9.0.0；Python 3.12、`torch_npu 2.10.0.post2`、`afd-v023-vllm-cann` venv |
+| 当前工作树 | M9 手工部署与 Graph/U2 多流增量仍有未提交改动；只能按各自证据标记状态，不能整体视为冻结基线 |
 
 早期在 `zingercode_vllm-ascend` 中直接修改上游源码的探索不属于本文范围；本文只讨论迁移到 v0.23 后以 `afd-plugin` 为唯一 AFD 扩展边界的实现。
 
@@ -72,13 +72,13 @@ DeepSeek-V4 的拆分边界放在远端 MoE，而不是把整个 FFN 子层搬�
 |---|---|---|---|
 | AF 分离 | 已冻结功能基线 | DeepSeek-V4 角色化加载、A8F8、HCCL P2P eager U1/U2 | 不代表异步 HCCL |
 | Microbatch | 功能通过、性能未闭环 | U1/U2、两个 microbatch、真实双 stage | U3；正式性能收益 |
-| NPU Graph（ACL Graph） | 已冻结功能基线 | `FULL_DECODE_ONLY`、U1/U2、target/full-draft | Graph U3；TP2 最大组合 |
+| NPU Graph（ACL Graph） | P8F 功能增量通过；混合 DAG 单轮实机 smoke 通过、性能待闭环 | `FULL_DECODE_ONLY`、U1/U2、target/full-draft；P8F 的 parent-HCCL + side compute/send 已有证据；混合 DAG A8F8 Graph capture/replay、10/10 serial 和 batch32 通过 | 混合 DAG 完整 F0/on-off/profile；Graph U3；TP2 最大组合；C64 补位退化与正式净收益 |
 | MTP | 已冻结功能基线 | M0-M7、eager/Graph、U1/U2、1 个 MTP layer、1 speculative token | 更多 speculative token |
 | AF 非等量拓扑 | 组件闭环 | A1F1、A2F1、A4F2，eager/Graph/MTP 组件 | A8F4 实模 E2E 与性能 |
 | TP2 | 已冻结功能基线 | 等量 A8F8、DP4/TP2、eager/U1 | CAMP2P TP2、非等量 TP2、TP3、最大 Graph+MTP 组合 |
 | PD 分离 | 进行中 | Mooncake contract、runtime、两进程 NPU round-trip | 双机实模 F0、TP2、Graph、U2、MTP |
 | v0.23/plugin 工程底座 | 已冻结功能基线 | 同栈 golden、兼容层、部署和验证工具 | 旧栈性能数字不能作为 v0.23 基线 |
-| 正式性能验收 | 未完成 | 已有 P1、三轮参照和双侧 profile | 尚无可发布的目标栈性能 tag |
+| 正式性能验收 | 未完成 | 已有 P1、Graph U1/优化前 U2/优化后 U2 三轮对照和双侧 profile | pre-U2 稳定性超限，尚无可发布的目标栈性能 tag |
 
 ### 2.3 特性关系
 
@@ -107,6 +107,187 @@ Prefill --Mooncake KV--> Decode Attention --HCCL--> Decode FFN
 - MTP 在 target decoder 之后新增 draft AF phase，并分别与 Microbatch、Graph 组合。
 - AF 非等量和 TP2 改变 rank/peer/shape 解释，不改变远端 MoE 的模型边界。
 - PD 分离在 AF 外层增加 Prefill/Decode KV 数据面，复用已有 Decode AF 能力。
+
+### 2.4 2026-08-29 第一版多流优化（历史）
+
+本次不是新增一种 connector，也不是把同步 HCCL 改成异步 HCCL。优化对象严格限定为
+`P2pHcclAFDConnector` 的 A8F8、TP1、MTP off、PD off、`FULL_DECODE_ONLY`、Graph/U2：
+
+1. Graph-visible `_send/_recv` 保留在原始 parent capture stream，确保 HCCL op 顺序和 replay 可见性不变。
+2. Attention 每层先把 U0/U1 计算排到 side compute stream，再由 parent 依次 join/send，目标是 `send(U0)` 覆盖 `compute(U1)`。
+3. FFN parent 依次 recv U0/U1，收到一个 stage 就把 MoE 排到 side compute stream，目标是 `recv(U1)` 覆盖 `compute(U0)`，`send(U0)` 覆盖 `compute(U1)`。
+4. 把远端 MoE 从“send 后立即 recv”的原子接口拆成 dispatch/receive 两阶段，给 layer-major调度器留下跨 stage 排序空间。
+5. 新增真实 NPU Graph 多流组件门禁，并用 A8F8 F0 和 CANN 时间线验证设备端重叠。
+
+当前状态：预期重叠已在每个稳定 step 按 43 层精确出现，功能和生命周期通过。同提交 C32 三轮对照已完成：优化后 U2 为 `139.300 token/s`、CV `5.635%`，相对优化前 U2 均值 `+11.217%`，相对稳定 Graph/U1 `+3.284%`。优化前 U2 的 CV 为 `10.628%`、未通过 10% 门槛，因此 `P8D-PERF-001` 和性能 tag 仍未闭环。
+
+### 2.5 2026-08-29 ubatch 严格闭环增量
+
+2.4 节记录的是第一版 Graph/U2 多流 DAG 及其三轮性能结果。本节是在该版本之后的依赖正确性增量：原 DAG 每层为 `compute0, compute1, send0, send1, recv0, recv1`，导致 U0 已发送后仍要等待 U1 发送才能接收自己的 FFN output；下一层 U0 Attention 计算也被 U1 receive阻塞。最终实现改为：
+
+```text
+Attention:
+compute(L,0), compute(L,1), send(L,0), recv(L,0),
+compute(L+1,0), send(L,1), recv(L,1), compute(L+1,1)
+
+FFN:
+recv(L,0), compute(L,0), send(L,0),
+recv(L,1), compute(L,1), send(L,1)
+```
+
+该版本的 A8F8 C32 单轮 profile guard 达到 128/128、0 failed，设备时间线 860/860 层严格满足 `send0 -> recv0 -> send1 -> recv1`。但端到端吞吐从第一版多流 profile 的151.655 降至 119.810 token/s，回退 20.998%。因此本增量只证明依赖关系和结果正确，不覆盖 2.4 节历史三轮数据，也不创建性能 tag。当时计划验证 connector 级 Graph-safe异步 `send0`；实际采用的同 layer DAG 和结果见 2.6 节。
+
+### 2.6 2026-08-31 同 layer 跨 stage FFN 流水增量
+
+最终需求不是 P8E 的跨 layer 对角流水，而是同一 layer 内 `FFN compute U1` 与 `FFN recv U2` 重叠。P8F 将调度固定为：
+
+```text
+Attention parent, layer L:
+send U1 -> post recv U1 -> send U2 -> post recv U2 -> record layer-ready
+
+Attention side compute:
+wait layer-ready -> compute layer L+1 U1/U2
+
+FFN, layer L:
+parent recv U1 -> side compute U1 -> side send U1(wait compute)
+parent recv U2 -> side compute U2 -> side send U2(wait compute)
+parent join both sends -> layer L+1
+```
+
+这里的 `post recv` 是 graph op 已排入设备流，不是 recv 已完成。若要求 Attention 必须等U1 recv 完成后才 send U2，U2 数据就只能在 FFN 完成并回送 U1 后到达，与 `compute U1` / `recv U2` 重叠目标互斥。当前实现保持 Attention Graph HCCL 在 parent capture stream；两个 current-layer recv 都排入后才记录 `ready` event，下一层任一 side compute 都必须等待该 event，因此不会重新形成跨 layer 对角流水。
+
+最终 16 卡 C32 profiler guard 为 128/128、0 failed、140.116 token/s、p50 TPOT 159.936 ms。相对 P8E 的 119.810 token/s 提升 16.948%，相对第一版允许跨 layer 对角重叠的 151.655 token/s 仍低 7.609%。FFN step 69/70 的 86 个 layer-stage 配对中，70 个满足 `recv U1 < recv U2 < send U1`；U2 recv 有 80.477% 落在 U1 FFN 执行窗口，排除直接收发 AICPU 后真实 device kernel 覆盖 80.327%。该单轮结果证明 DAG 生效，不是正式 P2 性能收益，`P8D-PERF-001` 继续 Open。
+
+#### 2.6.1 无 profiler 三点三轮结果
+
+同一 P8F worktree 随后完成 C16/C32/C64 各三轮，输入 1024、精确输出 128、每轮
+`4 x concurrency` 请求。九轮共 1344/1344 成功、0 failed、172032 个 output token；
+warmup、U2、fatal log、NPU monitor、shutdown 和 cleanup gate 全部通过。
+
+| 并发 | throughput 原始值（token/s） | 均值 | CV | p50 TPOT 均值 | p99 TTFT 均值 | token/s/NPU | 稳定性 |
+|---:|---|---:|---:|---:|---:|---:|---|
+| 16 | 112.409 / 138.771 / 102.291 | 117.824 | 13.051% | 99.871 ms | 9485.457 ms | 7.364 | 未通过 |
+| 32 | 133.647 / 116.987 / 128.176 | 126.270 | 5.491% | 177.366 ms | 25150.606 ms | 7.892 | 通过 |
+| 64 | 39.580 / 41.137 / 40.490 | 40.403 | 1.581% | 1778.321 ms | 237559.907 ms | 2.525 | 通过但性能不可接受 |
+
+整体 `passed=false` 的直接原因是 C16 CV 超过 10%。C64 的 CV 虽通过，但吞吐相对 C32
+下降 68.003%，不能把“低波动”写成“性能通过”。三轮 C64 的首批 64 请求单独折算仍有
+109.815 / 108.329 / 102.663 token/s；详细 ITL 显示后续三个补位波次从首波约
+`0.274-0.299 s` 放大到约 `1.57-1.99 s`。stage `(4,4)` 已在启动时 capture，且无
+live eager fallback，问题集中在满载持续运行和请求补位之后。
+
+现有 C32 profile 已把 16/86 个未重叠 FFN 配对定位到远端 Attention U2 send 尚未 ready；
+但无 profiler C64 数据不能证明二者因果。后续需要 C64 单波次对照和第二波补位窗口的
+Attention/FFN 同窗口 profile，并分别核对 prefill、DP 补位不齐、MoE all-to-all 与 layer
+barrier。第一版跨 layer 多流和 P8E 仍缺同源码无 profiler 三点三轮对照，所以当前不能
+宣称 P8F 的正式净收益。
+
+证据目录：
+
+```text
+/mnt/workspace/validation/dsv4_afd_v023_hccl_graph_u2_same_layer_cross_stage_perf_c16_c32_c64_r3_20260831
+```
+
+### 2.7 2026-08-31 混合 DAG 与物理 stream 解耦候选
+
+在 P8F 已验证版本之上，当前工作树新增混合 DAG 候选。它不改变 A/F wire protocol，也不
+立即增加物理 stream；先把依赖关系从“整层双 stage barrier”改为“同 stage receive 完成后
+释放下一层同 stage 计算”，并把逻辑 compute/send/recv 到物理 stream 的映射集中到
+`HCCLAttentionGraphStreamPlan`。
+
+```text
+逻辑依赖（每个 stage 独立）：
+A_compute(L,S) -> A_send(L,S) -> A_recv(L,S) -> A_continue+compute(L+1,S)
+
+V1 物理映射：
+compute -> connector-owned side compute stream
+send    -> parent capture stream
+recv    -> parent capture stream
+
+V1 parent issue 顺序：
+send(L,S0) -> recv(L,S0) -> send(L,S1) -> recv(L,S1)
+```
+
+Graph 构造仍是单线程 layer-major；设备执行时，`compute(L+1,S0)` 只等待
+`recv_done(L,S0)`，因此可与 parent 上随后执行的 S1 exchange 重叠。S1 下一层计算仍等待
+`recv_done(L,S1)`。最终 layer 的 continuation 计算通过 `join_attention_graph_compute` 显式
+汇回 parent，避免 Graph 返回前仍有 side-stream 工作。
+
+逻辑 DAG 不直接持有“第几条物理流”的假设。当前 V1 计划只把 compute 映射到 side
+stream；后续 Attention 三流实验可把 send/recv 映射到独立 stream，但必须先通过最小 HCCL
+Graph component 的连续 capture/replay 门禁。`AFD_HCCL_GRAPH_U2_HYBRID_DAG=0` 或
+`--graph-u2-hybrid-dag off` 可在同一源码恢复 P8F 的整层 ready barrier，用于公平对照。
+
+真实 A8F8 单轮 smoke 已在 2026-08-31 完成：`FULL_DECODE_ONLY`、U2、batch32，10/10
+串行 prompt 逐 token 一致，batch32 `valid=true`、32 choices 完整，8 个 Attention worker
+均观察到 ACL Graph replay，双 stage、日志、关闭顺序和 NPU 清理门禁通过。证据目录：
+
+```text
+/mnt/workspace/validation/dsv4_afd_v023_hccl_graph_u2_hybrid_dag_smoke_20260831_codex3
+```
+
+该 smoke 不等同于 30/30 + batch 1/8/32 的完整 F0；完整 F0、最小 Graph component 和
+A1F1 连续 capture/replay 仍需补齐。随后完成的 CANN 9.0.0 C32 on/off 与双侧 profile 见
+2.7.1 节。
+
+#### 2.7.1 CANN 9.0.0 C32 性能与 profile 对照
+
+本轮固定 afd-plugin `6c636961d3791df545ae065811368dc8beb1e4ab`、vLLM
+`0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665`、vLLM-Ascend
+`3da28f9414583d2d0b672a8f06d1fae142404bda`，运行栈固定为：
+
+```text
+CANN: /mnt/workspace/code/.ascend/cann-9.0.0/cann-9.0.0
+ATB:  /mnt/workspace/code/.ascend/cann-9.0.0/nnal/atb
+venv: /mnt/workspace/code/.venvs/afd-v023-vllm-cann
+```
+
+两组均为 A8F8/TP1、`FULL_DECODE_ONLY`、Graph/U2、MTP off、async scheduling off、C32、
+input 1024、output 128、128 请求/轮、3 轮；`graph-u2-compute-overlap=on` 保持不变，
+唯一实验变量是 `graph-u2-hybrid-dag=on/off`。
+
+| 模式 | 三轮 output throughput，token/s | 均值 | CV | token/s/NPU | p50 TPOT | p90 TPOT | p99 TPOT |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 整层 barrier，hybrid off | 121.695 / 142.886 / 114.236 | 126.272 | 9.611% | 7.892 | 186.525 ms | 220.264 ms | 239.696 ms |
+| 混合 DAG，hybrid on | 135.374 / 141.692 / 125.861 | 134.309 | 4.845% | 8.394 | 172.687 ms | 211.340 ms | 239.833 ms |
+
+hybrid on 相对 off 的吞吐均值为 `+6.365%`，p50/p90 TPOT 为 `-7.419%/-4.052%`，
+p99 TPOT 基本不变（`+0.057%`）。p50/p90/p99 TTFT 分别为 `-1.415%/-17.157%/-12.170%`。
+两组 768/768 正式请求成功，U2 `observed_two_stages=true`；warmup、fatal log、双侧退出、
+NPU monitor 和 cleanup gate 均通过。三组同序号差值为 `+11.240%/-0.836%/+10.177%`；
+虽然两组 CV 都通过预设 10% 门槛，3 轮样本仍不足以把 `+6.365%` 当成跨负载精确收益。
+
+双侧 profile 固定 Attention DP0、FFN DP0、`skip_first=64, wait=2, warmup=1,
+active=20, repeat=1`、`with_stack=false`。raw `profiler_info_0.json` 和离线 parser 均为
+CANN 9.0.0，四份 trace 都生成非空 `step_trace_time.csv`、`kernel_details.csv`、
+`communication.json`、`trace_view.json` 和数据库。Attention matched steady steps 67-80 的
+中位数如下，时间单位已从 us 转为 ms：
+
+| Attention DP0 指标，中位数 | hybrid off | hybrid on | 变化 |
+|---|---:|---:|---:|
+| Computing | 38.855 ms | 38.940 ms | +0.218% |
+| Communication(Not Overlapped) | 18.855 ms | 9.405 ms | -50.118% |
+| Overlapped | 14.795 ms | 29.277 ms | +97.882% |
+| Overlapped / Communication | 43.939% | 75.646% | +31.707 pp |
+| Stage | 53.216 ms | 43.128 ms | -18.958% |
+| Bubble | 31.948 ms | 32.048 ms | +0.313% |
+
+这组 trace 说明吞吐方向与目标机制一致：Attention compute 基本不变，收益来自更多通信被
+下一层同 stage compute 覆盖。FFN 的 active step 边界包含跨请求 receive 等待，on/off
+分别只有 7/6 个非零计算 step，不能直接比较 FFN 20-step aggregate；FFN trace 只作为
+Graph 执行和通信因果证据。profile-on 的 128/128 workload 和 raw profile gate 通过，但
+Attention 正常 shutdown 后 CANN 9.0.0 TBE 队列线程产生 `EOFError`，使通用 fatal-log gate
+失败；异常发生在 workload 和 raw 数据落盘之后，仍按门禁失败披露，不把该单轮 profile
+吞吐用于正式收益。
+
+证据目录：
+
+```text
+/mnt/workspace/validation/dsv4_afd_v023_cann900_hccl_graph_u2_hybrid_off_c32_r3_20260831_codex1
+/mnt/workspace/validation/dsv4_afd_v023_cann900_hccl_graph_u2_hybrid_on_c32_r3_20260831_codex1
+/mnt/workspace/validation/dsv4_afd_v023_cann900_hccl_graph_u2_hybrid_off_c32_profile_20260831_codex1
+/mnt/workspace/validation/dsv4_afd_v023_cann900_hccl_graph_u2_hybrid_on_c32_profile_20260831_codex1
+```
 
 ## 3. 工程底座：vLLM 0.23 和 plugin 兼容边界
 
@@ -451,7 +632,9 @@ NPU Graph 把一段稳定的 NPU 算子与通信序列在 warmup 后 capture，�
 
 1. 启动期根据 capture size、U1/U2 stage layout、LoRA/MTP signature 构造 graph key。
 2. A/F 两侧按同一 layer-major 顺序 warmup；connector 注册 graph-visible HCCL `_send/_recv`。
-3. capture 时把 compute stream 与 connector-owned 通信依赖纳入同一 Graph。
+3. capture 时 Graph-visible HCCL 保留在 parent capture stream；U2 模型计算通过 event
+   fork 到 side compute stream。混合 DAG 下，每个 stage 的下一层计算由自己的
+   `recv_done` 释放，最终 continuation 再 join 回 parent。
 4. input IDs 和需要在 CPU 解析的动态 header 放在 Graph 外准备，避免固化请求数据。
 5. 在线 step 命中 key 时 A/F 双侧 replay；任一侧 key miss 时整步走 eager。
 6. full-draft 模式分别维护 target decoder Graph 和 MTP draft Graph，按 target 后 draft 的顺序 replay。
@@ -464,6 +647,8 @@ NPU Graph 把一段稳定的 NPU 算子与通信序列在 warmup 后 capture，�
 - 数据生命周期：IDs、MTP header 等动态控制数据在 Graph 外预传或写入稳定 buffer。
 - A/F 决策同步：禁止 Attention 单边在线 capture，key miss 整步 eager。
 - U2 capture：warmup/capture/replay 全部采用 layer-major。
+- U2 stream plan：逻辑 compute/send/recv 先映射到统一 plan；V1 只把 compute 放到 side
+  stream，HCCL 留在 parent。独立 send/recv stream 仍需先过最小 Graph component 门禁。
 - full-draft：target 与 draft 使用独立 cache、key、buffer 和 capture/replay。
 
 ### 6.4 修改点与代码对应
@@ -472,6 +657,12 @@ NPU Graph 把一段稳定的 NPU 算子与通信序列在 warmup 后 capture，�
 |---|---|---|---|
 | Graph HCCL send/recv | `afd_plugin/connectors/npu/p2p_hccl.py::_graph_hccl_send`、`_graph_hccl_recv` | 调用 `torch.ops.npu_define._send/_recv`，shape 参数保持 `None` | 让标准 HCCL 语义进入 NPU Graph 且不固化动态 token 长度 |
 | eager/Graph 分派 | `P2pHcclAFDConnector._send_tensor`、`_recv_tensor` | 编译/capture 使用 Graph op，普通请求使用 `dist.send/recv` | 一套 connector 覆盖两种执行模式 |
+| Attention Graph stream plan | `P2pHcclAFDConnector.attention_graph_stream_plan`、`HCCLAttentionGraphStreamPlan` | 逻辑 compute/send/recv 独立映射到物理 stream；V1 为 side/parent/parent | 后续改物理 stream 不重写模型 DAG |
+| Attention Graph fork/join | `P2pHcclAFDConnector.attention_graph_compute`、`wait_for_attention_graph_compute`、`join_attention_graph_compute` | compute 等待 stage-local ready/recv_done；send 等 compute_done；最终结果 join parent | 建立可 capture 的跨 stream 依赖闭环 |
+| Attention Graph/U2 混合 DAG | `afd_plugin/model_executor/models/deepseek_v4.py::_forward_ubatches_graph_compute_pipeline` | 首层从 parent fork；后续层的每个 stage 只等待同 stage 上一层 recv_done | 允许 `compute(L+1,S0)` 与 S1 exchange 重叠 |
+| 远端 MoE 两阶段接口 | `afd_plugin/model_executor/models/deepseek_v2.py::RemoteFFNProxy.dispatch_remote_ffn`、`receive_remote_ffn` | send 与 receive 之间返回 transfer handle | 允许 layer-major 调度跨 stage 插入工作 |
+| FFN Graph/U2 DAG | `afd_plugin/v1/worker/npu/ffn_model_runner.py::_ffn_forward` | recv/send 留 parent；每收到一个 stage 就排 MoE，parent 等 compute event 后先 send 同 stage，再 recv 下一 stage | 建立无环的 `recv0 -> compute0 -> send0 -> recv1` |
+| 公平对照开关 | `p2p_hccl.py::_graph_u2_compute_overlap_enabled`、`_graph_u2_hybrid_dag_enabled`，以及 performance runner 对应 CLI | 分别控制 side compute 与 stage-local 混合 DAG，均默认开启 | 同源码比较串行、P8F barrier 和混合 DAG |
 | Graph 运行状态 | `afd_plugin/v1/worker/cuda_graph.py::graph_run_mode` | 统一区分 warmup、capture、replay、eager | 防止两侧对当前 step 状态理解不一致 |
 | FFN decoder key | `cuda_graph.py::make_ffn_graph_key` | 保存 stage 和每个 Attention peer 的精确 token layout | 防止同聚合、不同 peer shape 错图复用 |
 | MTP draft key | `cuda_graph.py::make_mtp_ffn_graph_key` | 合并 target stages，并保留 draft 的 peer layout | 为 full-draft Graph 建立独立 shape 身份 |
@@ -495,6 +686,82 @@ torch.ops.npu_define._send.default(
     None,
 )
 ```
+
+普通 `dist.send/recv` 与 graph-visible `_send/_recv` 的差别不是 HCCL wire protocol，而是capture 语义。普通接口在 Python 调用时立即提交并等待；Graph op 在 capture 时成为图节点，replay 时由图恢复。connector 必须在同一位置明确分派：
+
+```python
+if self._graph_transport_active():
+    _graph_hccl_send(send_tensor, dst=dst, group=group)
+    return
+dist.send(send_tensor, dst=dst, group=group)
+```
+
+修改点一在当前混合 DAG 中进一步拆成逻辑事件和物理 stream plan。首层仍从 parent fork；
+后续层直接等待上一层同 stage 的 `recv_done`：
+
+```python
+ready_event = events.ready
+if wait_for_receive_layer_idx is None:
+    events.ready.record(parent_stream)
+else:
+    ready_event = previous_stage_events.recv_done
+
+with torch.npu.stream(compute_stream):
+    ready_event.wait(compute_stream)
+    for tensor in tensors:
+        self._record_stream(tensor, compute_stream)
+    yield
+    events.compute_done.record(compute_stream)
+
+events.compute_done.wait(send_stream)
+send(...)
+events.send_done.record(send_stream)
+
+events.send_done.wait(recv_stream)
+recv(...)
+events.recv_done.record(recv_stream)
+```
+
+当前 layer-major 主机调度先为两个 stage 排首层 Attention compute，再按 stage 构造
+join/send/receive。整层 exchange 的 Graph 节点构造后，再构造下一层 compute 节点；设备是否
+可并发由 event DAG 决定，不由 Python 调用先后决定：
+
+```python
+for stage_idx in stage_ids:
+    enqueue_attention_compute(layer=first_layer, stage_idx=stage_idx)
+
+for layer_offset, layer in enumerate(layers):
+    for stage_idx in stage_ids:
+        wait_for_compute(layer_idx=layer.layer_idx, stage_idx=stage_idx, ...)
+        transfer = layer.dispatch_remote_ffn(hidden[stage_idx])
+        hidden[stage_idx] = layer.receive_remote_ffn(transfer)
+
+    if layer_offset + 1 < len(layers):
+        for stage_idx in stage_ids:
+            enqueue_attention_compute(
+                layer=layers[layer_offset + 1],
+                stage_idx=stage_idx,
+                wait_for_receive_layer_idx=layer.layer_idx,
+            )
+```
+
+FFN 侧 parent 每收到一个 stage 就把 MoE 排到 compute stream，并在进入下一 stage receive之前等待 compute event、发送当前 stage：
+
+```python
+for stage_idx in stage_ids:
+    payload = self.connector.recv_attn_output(...)
+    recv_event.record(torch.npu.current_stream())
+    with torch.npu.stream(self.ffn_compute_stream):
+        recv_event.wait(self.ffn_compute_stream)
+        output = self.model.compute_ffn_output(...)
+        compute_event.record(self.ffn_compute_stream)
+    compute_event.wait(torch.npu.current_stream())
+    _send_ffn_output(self.connector, output, context, stage_idx=stage_idx)
+```
+
+该顺序是当前 parent-stream Graph HCCL 下的无环版本。恢复第一版 `recv0, compute0, recv1, compute1, send0, send1` 会与 Attention 的`send0, recv0, send1` 形成环：Attention 等待 FFN `send0`，FFN Graph 又在 `send0` 前排入尚无对端 `send1` 的 `recv1`。实际试验在 capture 期等待 pending HCCL work 超过 60 秒。
+
+外部 `cann-recipes-infer` 提交[`c6c7315f`](https://gitcode.com/yijie19/cann-recipes-infer/commit/c6c7315f4bc0cd2dd1646540bdd1a4799e36a561?ref=dsv4-asyn)可参考的是按 microbatch 分 event、`record_stream` 和 recv/compute/send DAG；它使用自己运行时中的普通 `dist.send/recv`，不能直接替换本插件的 graph-visible `_send/_recv`。原[CAMP2P U2 指南](CAM_P2P_CONNECTOR_USER_GUIDE.md) 可参考 stage 独立 communicator 和消息身份，但当前能力门禁明确拒绝 CAMP2P Graph/U2。本次实现仅修改 afd-plugin，复用 torch-npu 已有的NPUGraph 多 stream/event 与 `_send/_recv`，不需要修改 vLLM-Ascend。失败实验、接口差异和设备时间线详见[Graph/U2 专项报告](DEEPSEEK_V4_AFD_HCCL_P2P_GRAPH_U2_VALIDATION_REPORT_ZH.md#8-2026-08-29-graphu2-多流重叠增量)。
 
 修改点二：Graph key 不只保存 FFN 聚合 token 总数，而是按 stage 保存每个 Attention peer 的精确 token layout：
 
@@ -562,19 +829,128 @@ graph_info = self._mtp_acl_graphs.get(mtp_graph_key)
 - 用精确 layout key 和整步 fallback 保证动态请求下的数值与通信正确性。
 - NPU Graph 与 Microbatch、MTP、非等量拓扑建立了可组合但可独立门禁的实现边界。
 - full-draft Graph 消除了 M2 阶段 draft 只能 eager 的限制，同时保留 target/draft 独立状态。
+- 严格 ubatch 闭环消除了 U0 receive 对 U1 send 的直接依赖，但同时暴露 FFN stage-local
+  compute/join 的端到端代价；调度正确性和性能收益必须分开验收。
+- P8F 把最终目标收敛为同 layer 跨 stage：FFN parent 接收 U2 时 side stream 执行 U1，
+  同时用 current-layer 双 recv 之后的 Attention `ready` event 禁止跨 layer 对角计算。
+- 当前混合 DAG 候选取消整层双 recv barrier，改成 `recv_done(L,S) -> compute(L+1,S)`；
+  stream plan 将逻辑依赖与 V1 的 side/parent/parent 物理映射分开，为后续三流实验保留接口。
 
 ### 6.6 验证结果与支持边界
 
 - Graph/U1：30/30 golden，batch 1/8/32、capture/replay、两次冷启动、退出和清理通过。
 - Graph/U2：两次独立冷启动各 30/30，真实双 stage；P1 为 `107.189 token/s`，仅是单轮候选信号。
+- Graph/U2 多流增量：A8F8 组件 16 进程通过，实模 F0 为 30/30，batch 1/8/32、双 stage、
+  fatal log、双侧 rc=0 和 NPU cleanup 通过；单轮 C32 profile 为 128/128、151.655 token/s，
+  只作带 profiler 功能 guard。
+- CANN 时间线：Attention 20 个 step 每步 43 个 send 与 U1 计算重叠；FFN 稳态 13 个 step
+  每步 43 个 receive 和 43 个 send 与计算重叠。说明目标 DAG 已实现，不等于正式吞吐收益。
+- FFN 全 rank 诊断：8 个 rank 均为 `Model ID=46`、`OP State=static`，确认 FFN Graph 已开启；
+  63 个首层 stage0 dispatch 样本中，预计 rank 等待与 duration 相关系数为 `0.999997`，各 rank
+  结束时间偏差中位数 `3 us`。稳态 Graph replay API 发出时间已相差 `3.947-6.026 ms`，因此
+  `MoeDistributeDispatchV2` 的毫秒级耗时主要是 MC2 等待 host/rank 到达，不是 MoE 内核持续
+  计算。Graph 前最后一次 input-ID receive 完成时间与 replay API 的相关系数为
+  `0.974-0.998`，下一轮定位应转向 Attention metadata/input-ID 发送准备及 FFN host 控制路径。
+  证据见 Graph/U2 专项报告 8.5.4；直接增加 barrier 不会缩短关键路径。
+- 同提交 C32 三轮：Graph/U1 `134.871 token/s`、CV `5.705%`；优化前 Graph/U2
+  `125.251 token/s`、CV `10.628%`；优化后 Graph/U2 `139.300 token/s`、CV `5.635%`。
+  优化后相对 pre-U2 均值 `+11.217%`、相对 U1 `+3.284%`；三组 1152/1152 请求成功。
+  pre-U2 只因 CV 超过 10% 未通过，因此前一个百分比仍是候选证据，不是冻结收益。
+- 严格闭环增量：connector 79 项、DeepSeek-V4 构造 18 项、NPU runtime 181 项，共 278 项
+  相关回归通过；定向调度用例覆盖 eager、Graph overlap 和 Graph baseline。A8F8 C32 profile
+  128/128、0 failed，profile、fatal log、NPU monitor 和 cleanup gate 全部通过。
+- 严格闭环 Attention 时间线：20 个稳定 step、每 step 43 层，共 860/860 层精确满足
+  `send0 -> recv0 -> send1 -> recv1`，0 mismatch。`send0` 结束到 `recv0` 开始的 p50/p90
+  从约 404/510 us 降为 3.5/4.25 us；stage1（第二个 ubatch）send 860/860 次、recv
+  840/860 次与下一层 stage0 compute 重叠，840 正好是 20 step x 42 个非末层。
+- Attention 稳定窗口中，未重叠通信从 339.654 降至 81.961 ms，下降 75.870%；
+  `Computing + Communication(Not Overlapped) + Free` 从 1681.749 降至 1357.006 ms，
+  下降 19.310%。但 Bubble 从 316.332 增至 646.229 ms，不能只依据 overlap 分类宣称
+  端到端性能收益。
+- 严格闭环单轮 profile 吞吐为 119.810 token/s、p50 TPOT 189.514 ms；相对第一版多流
+  profile 的 151.655 token/s、157.069 ms，吞吐回退 20.998%。该点只冻结依赖正确性，
+  不替代上一版三轮对照，不创建性能 tag。
+- 恢复 FFN 跨 stage 重叠的实验在 Graph capture 期等待 pending HCCL work 超过 60 秒；
+  原因是 Attention 要等 `recv0` 才 `send1`，而 FFN 把 `recv1` 排在 `send0` 前，形成环依赖。
+  实验中止后 cleanup gate 通过，该 P8E 控制版本保留 stage-local 无环顺序。
+- 上一条描述的是要求 `recv0` **完成**后才 `send1` 的 P8E 负实验。P8F 改用 issue/post
+  语义：Attention parent 依次排入 `send0, recv0, send1, recv1`，FFN side send 等待各自
+  compute event，FFN parent 不等 send0 完成便排入 recv1，因此没有该完成态环依赖。
+- P8F 相关三个测试文件 279 项通过；最终 A8F8 C32 profile 为 128/128、0 failed、
+  140.116 token/s、p50 TPOT 159.936 ms，profile/log/NPU monitor/shutdown/cleanup 全通过。
+  相对 P8E +16.948%，相对第一版跨 layer 多流 -7.609%，仍只是单轮 profiler guard。
+- P8F FFN step 69/70 共 86 个同 layer 配对：70/86 满足
+  `recv U1 < recv U2 < send U1`，86/86 满足 `send U1 < send U2`；U2 recv 在 U1 FFN
+  执行窗口中的覆盖为 80.477%，排除直接收发 AICPU 后真实 kernel 覆盖为 80.327%，
+  纯 AI/MIX Core 覆盖为 7.268%。step 69 layer 0 的 439.428 us U2 recv 全部与 U1
+  `hcom_alltoallv__703_347_1` 重叠。
+- 16/86 未重叠配对表示远端 U2 send 当时尚未 ready，不是 FFN 本地先算 U2。P8F 的原始
+  结论是不重新引入跨 layer 对角；当前混合 DAG 候选则有意恢复受 stage-local `recv_done`
+  约束的对角重叠，必须重新执行死锁、golden、capture/replay 和性能门禁。
 - full-draft Graph M7：U1/U2 各 30/30，A4F2 组件 capture/replay，P1 128/128、`27.510 token/s`，仅作功能 guard。
 - 仅支持 `FULL_DECODE_ONLY`；Graph/U3 fail-fast。
+
+严格闭环 profile 的整轮运行时间为 2026-08-29 17:28:40-17:39:29（UTC+8），服务启动
+耗时 456.248 秒。Attention DP0 实际采集窗口为 17:37:01.679-17:37:37.523，FFN DP0
+为 17:36:25.649-17:37:30.595；两侧 schedule 均为 `skip_first=64, wait=2,
+warmup=1, active=20, repeat=1`，`with_stack=false`。raw profile 的 `cann_version` 和离线
+parser 都是 9.0.0；daemon 期提示改用 offline parser，随后 `ASCEND_PROFILER_OUTPUT` 已成功
+生成 `kernel_details.csv`、`step_trace_time.csv`、`trace_view.json` 和数据库。
+
+Attention 20 个稳定 step 的完整时间分解如下。`wall` 按
+`Computing + Communication(Not Overlapped) + Free` 计算；Overlap 不重复计入 wall：
+
+| Attention 20-step aggregate | 第一版多流 | 严格闭环 |
+|---|---:|---:|
+| Computing | 780.187 ms | 778.236 ms |
+| Communication(Not Overlapped) | 339.654 ms | 81.961 ms |
+| Overlapped | 5.020 ms | 588.615 ms |
+| Communication | 344.674 ms | 670.576 ms |
+| Free | 561.909 ms | 496.810 ms |
+| Bubble | 316.332 ms | 646.229 ms |
+| wall | 1681.749 ms | 1357.006 ms |
+
+FFN raw profile 和离线产物有效，但本轮 DP0 step schedule 与 Graph capture/角色启动窗口错位：
+step 67-73 才有完整计算，后续 step 主要只剩通信。因此不能把 FFN 的 20-step 汇总与
+Attention 或第一版 profile 直接做公平 aggregate；当前只用 FFN trace 验证 Graph 已执行、
+stage0 receive 后 MoE 被立即排入 compute stream，以及全服务通信因果。该不确定性必须在
+下一轮重新对齐的双侧 profile 中消除；无 profiler 三点三轮已完成，但未通过整体性能门禁。
 
 详细证据：
 
 - [Graph/U1 报告](DEEPSEEK_V4_AFD_HCCL_P2P_GRAPH_U1_VALIDATION_REPORT_ZH.md)
 - [Graph/U2 报告](DEEPSEEK_V4_AFD_HCCL_P2P_GRAPH_U2_VALIDATION_REPORT_ZH.md)
 - [Full Draft Graph 报告](DEEPSEEK_V4_AFD_HCCL_P2P_MTP_FULL_DRAFT_GRAPH_VALIDATION_REPORT_ZH.md)
+
+严格闭环增量证据目录：
+
+```text
+/mnt/workspace/validation/dsv4_afd_v023_hccl_graph_u2_multistream_profile_c32_20260829
+/mnt/workspace/validation/dsv4_afd_v023_hccl_graph_u2_stage_interleave_profile_c32_20260829
+/mnt/workspace/validation/dsv4_afd_v023_hccl_graph_u2_wavefront_profile_c32_20260829
+/mnt/workspace/validation/dsv4_afd_v023_hccl_graph_u2_stage_interleave_profile_c32_20260829/profiles/attention/4ff038c993bf40219c03182f786a9def_2913927_20260829173735418_ascend_pt
+/mnt/workspace/validation/dsv4_afd_v023_hccl_graph_u2_stage_interleave_profile_c32_20260829/profiles/ffn/4ff038c993bf40219c03182f786a9def_2913870_20260829173644048_ascend_pt
+```
+
+P8F 最终同 layer 跨 stage 证据目录：
+
+```text
+/mnt/workspace/validation/dsv4_afd_v023_hccl_graph_u2_same_layer_cross_stage_profile_c32_20260831
+/mnt/workspace/validation/dsv4_afd_v023_hccl_graph_u2_same_layer_cross_stage_profile_c32_20260831/profiles/attention/4ff038c993bf40219c03182f786a9def_3220405_20260831122635409_ascend_pt
+/mnt/workspace/validation/dsv4_afd_v023_hccl_graph_u2_same_layer_cross_stage_profile_c32_20260831/profiles/ffn/4ff038c993bf40219c03182f786a9def_3220188_20260831122557508_ascend_pt
+```
+
+开发期间的 capture 负样本和仍含跨 layer 对角调度的中间 side-send 样本分别保存在：
+
+```text
+/mnt/workspace/validation/dsv4_afd_v023_hccl_graph_u2_cross_stage_profile_c32_20260831
+/mnt/workspace/validation/dsv4_afd_v023_hccl_graph_u2_cross_stage_side_send_profile_c32_20260831
+```
+
+最终两侧 raw profile 均由采集时相同的 CANN 9.0.0 离线解析，`with_stack=false`，已生成
+`kernel_details.csv`、`step_trace_time.csv`、`trace_view.json`、communication 文件和数据库。
+Attention 与 FFN active window 仍未完全对齐，因此 FFN 的同 role layer 配对可用于证明
+目标重叠，但不能把双侧 aggregate 直接相减或升级为正式性能结论。
 
 ## 7. 特性四：MTP
 
@@ -1184,7 +1560,10 @@ F0 是功能门禁；P1 只判断是否出现明显回退；只有 P2 才能支�
 
 ### 11.3 Profile 口径
 
-- 历史目标栈 profile 使用 CANN 9.0.1 采集并由同版本解析；当前 CANN 9.1.0 环境不重新解析这些 raw profile。
+- 历史目标栈 profile 使用 CANN 9.0.1 采集并由同版本解析；2026-08-29 Graph/U2 多流、
+  严格闭环及 2026-08-31 P8F profile 使用 CANN 9.0.0 采集并由 9.0.0 解析。不同 CANN
+  的 raw profile 不交叉
+  解析或直接比较。
 - 性能 profile 固定 `TORCH_PROFILER_WITH_STACK=0`，避免 Python stack 事件改变 eager 调度。
 - `Free` 表示既无计算也无非重叠通信的设备区间，不等同于 `aclrtFree`。
 - Attention 和 FFN 必须使用同一采集窗口对照，分别报告 Computing、Communication、Free 和 Bubble。
@@ -1201,8 +1580,33 @@ F0 是功能门禁；P1 只判断是否出现明显回退；只有 P2 才能支�
 | P8D 相对 U1 | -46.197% | 仍未关闭性能缺口 |
 | MTP M3 U2 相对 M1 U1 | -42.583% | MTP 组合再次确认缺口 |
 | Graph/U2 P1 | 107.189 token/s | 单轮且执行模式改变，只是候选信号 |
+| Graph/U2 多流 C32 profile guard | 151.655 token/s；设备时间线出现预期 43 层重叠 | 单轮且含 profiler 开销，只证明功能和重叠存在 |
+| Graph/U1 C32 三轮 | 134.871 token/s，CV 5.705% | 稳定参照点 |
+| 优化前 Graph/U2 C32 三轮 | 125.251 token/s，CV 10.628%，相对 U1 -7.133% | 功能全过但稳定性门禁失败 |
+| 优化后 Graph/U2 C32 三轮 | 139.300 token/s，CV 5.635%；相对 pre-U2 +11.217%，相对 U1 +3.284% | 优化后点稳定；pre-U2 波动使净收益不能冻结 |
+| 严格闭环 Graph/U2 C32 profile guard | 119.810 token/s、p50 TPOT 189.514 ms；相对第一版多流 profile 吞吐 -20.998% | 860/860 层依赖正确，但端到端性能候选失败 |
+| 严格闭环 Attention 稳定窗口 | non-overlap communication -75.870%，wall -19.310%，Bubble +104.288% | 局部 Attention 改善不能替代全服务吞吐门禁 |
+| P8F 同 layer 跨 stage C32 profile guard | 140.116 token/s、p50 TPOT 159.936 ms；相对 P8E +16.948%，相对第一版跨 layer 多流 -7.609% | FFN `compute U1` / `recv U2` 重叠已恢复，Attention 无跨 layer 对角；仍是单轮 profiler guard |
+| P8F 无 profiler C16/C32/C64 三轮 | 均值 117.824 / 126.270 / 40.403 token/s；CV 13.051% / 5.491% / 1.581% | 功能与生命周期门禁通过；整体性能门禁失败，C64 相对 C32 -68.003% |
+| 混合 DAG C32 三轮 | off 126.272 token/s、CV 9.611%；on 134.309 token/s、CV 4.845%；on/off `+6.365%` | 两组稳定性与功能门禁通过；3 轮 C32 候选收益，尚非跨负载 baseline |
+| 混合 DAG Attention profile | non-overlap communication `-50.118%`，overlap ratio `43.939% -> 75.646%`，stage `-18.958%` | 机制与吞吐方向一致；FFN step 窗口错位，不能直接做 20-step aggregate |
 
-双侧 profile 显示同步 U2 增加 HCCL/MC2 调用与等待，通信和 Python stage 成本没有被当前 microbatch 计算量覆盖。后续正式关闭条件是：同一固定栈、同预算 native/AFD、Graph U1/U2、MTP on/off、三轮 P2、稳定性、延迟、HBM、`tokens/s/NPU` 和双侧 profile 全部完成。
+双侧 profile 已证明目标 stream/event DAG 确实产生重叠，三轮对照也证明优化后 U2 点通过稳定性门槛。但 pre-U2 对照波动超限，优化后相对稳定 U1 仅 `+3.284%`，因此不能宣称 `+11.217%` 是可发布净收益。后续正式关闭条件是：稳定复测 pre-U2、同预算 native/AFD、MTP on/off、延迟、HBM、`tokens/s/NPU` 和必要的双侧同窗口 profile 全部完成。
+
+P8E 进一步表明：若把 `recv0 -> send1` 解释成 recv0 **完成**后才允许 send1，就会取消
+FFN 原有的跨 stage overlap；再把 FFN `recv1` 放到 `send0` 完成前会形成完成态环依赖。
+P8F 不要求这个互斥的完成顺序，而是保持 Attention parent 的
+`send0, post recv0, send1, post recv1` issue 顺序，并让 FFN compute/send 使用 event 连接的
+side stream。最终 FFN 70/86 层已出现同 layer U1 执行与 U2 recv 重叠，同时 Attention
+下一层 compute 必须等待当前层双 recv 后记录的 `ready` event，不存在跨 layer 对角流水。
+该版本收回了 P8E 大部分性能损失，但单轮结果仍不能关闭 `P8D-PERF-001`。
+
+当前混合 DAG 候选在 P8F 之上将 Attention 下一层计算改为等待同 stage 的 `recv_done`，
+有意恢复受数据依赖约束的跨 layer 对角重叠。A8F8 单轮功能 smoke、CANN 9.0.0 C32
+on/off 三轮和双侧 profile 已完成；三轮吞吐候选提升 `6.365%`，Attention 时间线显示
+non-overlap communication 降低 `50.118%`。该结果可以证明调度机制生效并支持继续推进，
+但仍缺完整 F0、更多/交错轮次、native 同预算、MTP 与多并发点，不能关闭
+`P8D-PERF-001` 或创建性能 tag。
 
 详细证据见 [A3-P8 同步 HCCL 性能报告](DEEPSEEK_V4_AFD_A3_P8_SYNC_HCCL_PERFORMANCE_REPORT_ZH.md)。
 
@@ -1221,7 +1625,22 @@ F0 是功能门禁；P1 只判断是否出现明显回退；只有 P2 才能支�
 ### 12.2 性能待办
 
 - [ ] 关闭 `P8D-PERF-001`。
-- [ ] Graph U1/U2 三轮 P2。
+- [x] 执行 Graph/U1、优化前 U2、优化后 U2 同提交 C32 三轮公平对照。
+- [x] 验证严格闭环 860/860 层 `send0 -> recv0 -> send1 -> recv1`，并记录单轮性能回退。
+- [x] 验证 P8F 同 layer `FFN compute U1` / `recv U2` 重叠，并移除 Attention 跨 layer 对角流水。
+- [ ] 交错执行或增加轮数，使 pre-U2 CV 不超过 10% 后复核多流净收益。
+- [x] P8F 同 layer 流水完成无 profiler C16/C32/C64 各三轮；C16 CV 超限且 C64 绝对性能退化，不能关闭性能问题。
+- [ ] 第一版多流和 P8E 严格闭环执行同源码无 profiler C16/C32/C64 各三轮，补齐控制组。
+- [ ] P8F 执行 C64 单波次对照，并在第二波补位窗口采集 Attention/FFN 同窗口 profile。
+- [x] 混合 DAG 完成 A8F8 单轮 Graph capture/replay、10/10 serial golden、batch32、
+  双 stage、生命周期和 NPU 清理 smoke。
+- [x] 混合 DAG 完成同源码 `--graph-u2-hybrid-dag on/off` C32 三轮对照和 Attention/FFN
+  DP0 双侧 profile；两组 CV 通过，Attention 时间线验证目标 overlap。
+- [ ] 混合 DAG 继续完成最小 Graph component、A1F1 连续 capture/replay 和 A8F8 完整 F0。
+- [ ] 在最小 HCCL Graph component 中验证独立 send stream + compute event；连续
+  capture/replay 100 次无 pending work 后再接入 connector。
+- [ ] 若 side-stream HCCL 仍不能稳定 capture，将 U2 拆为两个 compute Graph segment，
+  HCCL 留在 Graph 外调度。
 - [ ] MTP on/off 三轮公平对照。
 - [ ] 同预算 native Graph 对照和 `tokens/s/NPU`。
 - [ ] A/F 双侧同窗口 profile，报告 compute、non-overlap communication、Free、Bubble 和等待分布。

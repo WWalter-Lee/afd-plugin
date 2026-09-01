@@ -21,6 +21,7 @@ _ENV_NAMES = (
     "AFD_NPU_ATTENTION_PROFILER_SKIP_FIRST",
     "AFD_NPU_ATTENTION_PROFILER_DIR",
     "AFD_NPU_ATTENTION_PROFILER_WITH_STACK",
+    "AFD_NPU_ATTENTION_PROFILER_RANKS",
     "AFD_NPU_FFN_PROFILER_ENABLE",
     "AFD_NPU_FFN_PROFILER_WAIT",
     "AFD_NPU_FFN_PROFILER_WARMUP",
@@ -29,6 +30,7 @@ _ENV_NAMES = (
     "AFD_NPU_FFN_PROFILER_SKIP_FIRST",
     "AFD_NPU_FFN_PROFILER_DIR",
     "AFD_NPU_FFN_PROFILER_WITH_STACK",
+    "AFD_NPU_FFN_PROFILER_RANKS",
     "VLLM_ASCEND_MODEL_RUNNER_PROFILER_ENABLE",
     "VLLM_ASCEND_FFN_PROFILER_ENABLE",
     "VLLM_TORCH_PROFILER_DIR",
@@ -53,10 +55,12 @@ def test_npu_profiler_defaults_are_disabled():
     assert attention.skip_first == 1500
     assert attention.trace_dir == "/tmp/profile/attn"
     assert attention.with_stack is False
+    assert attention.ranks == frozenset({0})
     assert ffn.enabled is False
     assert ffn.active == 20
     assert ffn.trace_dir == "/tmp/profile/ffn"
     assert ffn.with_stack is False
+    assert ffn.ranks == frozenset({0})
 
 
 def test_npu_profiler_uses_only_plugin_owned_enable_env(monkeypatch):
@@ -116,6 +120,34 @@ def test_create_npu_profiler_skips_nonzero_role_rank(monkeypatch):
     monkeypatch.setenv("AFD_NPU_FFN_PROFILER_ENABLE", "true")
 
     assert create_afd_npu_profiler("ffn", role_rank=1) is None
+
+
+@pytest.mark.parametrize("configured_ranks", ["1,3", "all"])
+def test_create_npu_profiler_supports_configured_role_ranks(
+    monkeypatch,
+    configured_ranks,
+):
+    profiler_module = _FakeTorchNPUProfiler()
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        SimpleNamespace(profiler=profiler_module),
+    )
+    monkeypatch.setenv("AFD_NPU_FFN_PROFILER_ENABLE", "true")
+    monkeypatch.setenv("AFD_NPU_FFN_PROFILER_RANKS", configured_ranks)
+
+    profiler = create_afd_npu_profiler("ffn", role_rank=1)
+
+    assert profiler is profiler_module.created_profiler
+    assert profiler.started is True
+
+
+@pytest.mark.parametrize("configured_ranks", ["", "1,bad", "-1"])
+def test_npu_profiler_rejects_invalid_role_ranks(monkeypatch, configured_ranks):
+    monkeypatch.setenv("AFD_NPU_FFN_PROFILER_RANKS", configured_ranks)
+
+    with pytest.raises(ValueError, match="AFD_NPU_FFN_PROFILER_RANKS"):
+        afd_npu_profiler_config("ffn")
 
 
 def test_step_npu_profiler_ignores_disabled_profiler():

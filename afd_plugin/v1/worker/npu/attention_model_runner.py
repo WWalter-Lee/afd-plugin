@@ -273,7 +273,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             ]
             | None
         ) = None
-        self._afd_logged_metadata_stage_counts: set[int] = set()
+        self._afd_logged_metadata_stage_counts: set[tuple[int, bool, bool]] = set()
         self.prof = create_afd_npu_profiler("attention", role_rank=rank)
 
     @staticmethod
@@ -1706,8 +1706,9 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             "_afd_logged_metadata_stage_counts",
             set(),
         )
+        log_signature = (stage_count, is_graph_capturing, is_warmup)
         debug_key = None
-        if stage_count not in logged_stage_counts:
+        if log_signature not in logged_stage_counts:
             debug_key = _dp_metadata_debug_key(dp_metadata_list)
             logger.warning(
                 "AFD NPU Attention send_dp_metadata decision; world_rank=%d "
@@ -1718,7 +1719,10 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 is_graph_capturing,
                 is_warmup,
             )
-            logged_stage_counts.add(stage_count)
+            # Capture, warmup and live requests can use the same number of
+            # stages. Keep one marker for each context so deployment tooling
+            # can prove that U2 reached real online execution.
+            logged_stage_counts.add(log_signature)
             self._afd_logged_metadata_stage_counts = logged_stage_counts
         if logger.isEnabledFor(logging.DEBUG):
             debug_key = debug_key or _dp_metadata_debug_key(dp_metadata_list)

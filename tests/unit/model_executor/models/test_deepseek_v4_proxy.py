@@ -165,6 +165,30 @@ def test_loopback_layer_matches_local_reference(
     assert connector.sent[0][1].metadata.seq_lens == [num_tokens]
 
 
+def test_decoder_layer_forwards_layer_identity_to_remote_receive(monkeypatch):
+    calls = []
+    proxy = adapter.AFDDeepseekV4RemoteMoEProxy(layer_idx=7)
+    layer = object.__new__(adapter.AFDDeepseekV4DecoderLayer)
+    nn.Module.__init__(layer)
+    layer.layer_idx = 7
+    layer.mlp = proxy
+    transfer = SimpleNamespace()
+    output = torch.ones((1, 8))
+
+    def receive_remote_ffn(_self, value, *, layer_idx=None):
+        calls.append((value, layer_idx))
+        return output
+
+    monkeypatch.setattr(
+        adapter.AFDDeepseekV4RemoteMoEProxy,
+        "receive_remote_ffn",
+        receive_remote_ffn,
+    )
+
+    assert layer.receive_remote_ffn(transfer) is output
+    assert calls == [(transfer, 7)]
+
+
 def test_mtp_remote_moe_does_not_require_or_send_input_ids(monkeypatch):
     hidden_states = torch.ones((3, 4, 8), dtype=torch.bfloat16)
     ffn_layer = _ffn_layer(layer_idx=0, quantized=False)

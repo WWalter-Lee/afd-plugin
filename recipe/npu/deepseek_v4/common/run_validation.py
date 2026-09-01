@@ -329,34 +329,56 @@ def _profile_output_gate(profile_dir: Path) -> dict[str, Any]:
     roles: dict[str, Any] = {}
     for role in ("attention", "ffn"):
         trace_dirs = sorted((profile_dir / role).glob("*_ascend_pt"))
+        traces: list[dict[str, Any]] = []
         required_sizes: dict[str, int] = {}
         cann_raw_file_count = 0
-        if len(trace_dirs) == 1:
-            trace_dir = trace_dirs[0]
-            for relative_path in (
-                Path("profiler_info_0.json"),
-                Path("FRAMEWORK/torch.op_range"),
-            ):
-                path = trace_dir / relative_path
-                required_sizes[str(relative_path)] = (
-                    path.stat().st_size if path.is_file() else 0
-                )
-            cann_raw_file_count = sum(
+        for trace_dir in trace_dirs:
+            profiler_info_files = sorted(trace_dir.glob("profiler_info_*.json"))
+            trace_required_sizes = {
+                "profiler_info_*.json": (
+                    profiler_info_files[0].stat().st_size
+                    if len(profiler_info_files) == 1
+                    else 0
+                ),
+                "FRAMEWORK/torch.op_range": (
+                    (trace_dir / "FRAMEWORK/torch.op_range").stat().st_size
+                    if (trace_dir / "FRAMEWORK/torch.op_range").is_file()
+                    else 0
+                ),
+            }
+            trace_raw_file_count = sum(
                 1
                 for prof_dir in trace_dir.glob("PROF_*")
                 if prof_dir.is_dir()
                 for path in prof_dir.rglob("*")
                 if path.is_file() and path.stat().st_size > 0
             )
-        role_passed = bool(
-            len(trace_dirs) == 1
-            and required_sizes
-            and all(size > 0 for size in required_sizes.values())
-            and cann_raw_file_count > 0
-        )
+            trace_passed = bool(
+                len(profiler_info_files) == 1
+                and all(size > 0 for size in trace_required_sizes.values())
+                and trace_raw_file_count > 0
+            )
+            traces.append(
+                {
+                    "passed": trace_passed,
+                    "trace_dir": str(trace_dir),
+                    "profiler_info_files": [str(path) for path in profiler_info_files],
+                    "required_sizes": trace_required_sizes,
+                    "cann_raw_file_count": trace_raw_file_count,
+                }
+            )
+            required_sizes.update(
+                {
+                    f"{trace_dir.name}/{path}": size
+                    for path, size in trace_required_sizes.items()
+                }
+            )
+            cann_raw_file_count += trace_raw_file_count
+        role_passed = bool(traces) and all(trace["passed"] for trace in traces)
         roles[role] = {
             "passed": role_passed,
             "trace_dirs": [str(path) for path in trace_dirs],
+            "traces": traces,
             "required_sizes": required_sizes,
             "cann_raw_file_count": cann_raw_file_count,
         }
@@ -461,6 +483,24 @@ def _runtime_manifest(
         "DSV4_VLLM_ASCEND_ROOT",
         "/mnt/workspace/code/vllm-ascend-rfc-vllm-cann",
     )
+    cann_root = os.environ.get(
+        "DSV4_CANN_ROOT",
+        "/mnt/workspace/code/.ascend/cann-9.0.1/cann-9.0.1",
+    )
+    cann_version = os.environ.get("DSV4_CANN_VERSION")
+    if not cann_version:
+        cann_version = Path(cann_root).name.removeprefix("cann-")
+    profile_role_rank_selection = (
+        {
+            role: os.environ.get(
+                f"AFD_NPU_{role.upper()}_PROFILER_RANKS",
+                "0",
+            )
+            for role in ("attention", "ffn")
+        }
+        if profile
+        else {}
+    )
 
     def git_head(path: str) -> str:
         return subprocess.check_output(
@@ -484,7 +524,8 @@ def _runtime_manifest(
     manifest = {
         "python": sys.version,
         "plugins": "ascend,ascend_model,ascend_model_loader,ascend_kv_connector,afd",
-        "cann": "/mnt/workspace/code/.ascend/cann-9.0.1/cann-9.0.1",
+        "cann": str(Path(cann_root).resolve()),
+        "cann_version": cann_version,
         "venv": venv_path,
         "model": "/mnt/workspace/models/DeepSeek-V4-Flash-w8a8-mtp",
         "connector": connector,
@@ -497,6 +538,7 @@ def _runtime_manifest(
         "mtp_draft_execution": mtp_draft_execution if enable_mtp else None,
         "profile": profile,
         "profile_role_ranks": [0] if profile else [],
+        "profile_role_rank_selection": profile_role_rank_selection,
         "torch_profiler_with_stack": False,
         "commits": {
             "afd_plugin": git_head(str(REPO_ROOT)),

@@ -16,7 +16,10 @@ from vllm_ascend.models import deepseek_v4 as native
 from vllm_ascend.models import deepseek_v4_mtp as native_mtp
 
 from afd_plugin.config import parse_afd_config
-from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
+from afd_plugin.model_executor.models.deepseek_v2 import (
+    AFDRemoteFFNTransfer,
+    RemoteFFNProxy,
+)
 
 _ATTENTION_ROLE = frozenset(("attention",))
 _FFN_ROLE = frozenset(("ffn",))
@@ -78,16 +81,21 @@ class AFDDeepseekV4RemoteMoEProxy(RemoteFFNProxy):
     """Parameter-free DSV4 MoE stage executed by the remote FFN role."""
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.phase == "mtp":
-            return self._send_and_receive(hidden_states)
-        input_ids = None
-        if self.layer_idx == 0:
+        return self._send_and_receive(hidden_states)
+
+    def dispatch_remote_ffn(
+        self,
+        hidden_states: torch.Tensor,
+        **send_kwargs: torch.Tensor,
+    ) -> AFDRemoteFFNTransfer:
+        if self.phase == "decoder" and self.layer_idx == 0:
             input_ids = getattr(get_forward_context(), "input_ids", None)
             if input_ids is None:
                 raise RuntimeError(
                     "DSV4 layer 0 requires input_ids in the forward context"
                 )
-        return self._send_and_receive(hidden_states, input_ids=input_ids)
+            send_kwargs["input_ids"] = input_ids
+        return super().dispatch_remote_ffn(hidden_states, **send_kwargs)
 
 
 class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
@@ -246,6 +254,28 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
         tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     ]:
         """Run through the remote MoE receive, deferring FFN HC post."""
+        hidden_states, continuation = self.forward_attention_to_remote_ffn_input(
+            positions,
+            hidden_states,
+            residual,
+            llama_4_scaling,
+        )
+        if not isinstance(self.mlp, AFDDeepseekV4RemoteMoEProxy):
+            return self.mlp(hidden_states), continuation
+        transfer = self.dispatch_remote_ffn(hidden_states)
+        return self.receive_remote_ffn(transfer), continuation
+
+    def forward_attention_to_remote_ffn_input(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        llama_4_scaling: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
+        """Compute the Attention-side input consumed by the remote MoE."""
         # ### PATCH START: reject accidental FFN full-model execution.
         if self.afd_role != "attention":
             raise RuntimeError("DSV4 FFN layers are connector-driven")
@@ -273,8 +303,23 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
             self.hc_ffn_base,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
         return hidden_states, (residual, post, comb)
+
+    def dispatch_remote_ffn(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> AFDRemoteFFNTransfer:
+        if not isinstance(self.mlp, AFDDeepseekV4RemoteMoEProxy):
+            raise RuntimeError("DSV4 Attention layer requires its remote MoE proxy")
+        return self.mlp.dispatch_remote_ffn(hidden_states)
+
+    def receive_remote_ffn(
+        self,
+        transfer: AFDRemoteFFNTransfer,
+    ) -> torch.Tensor:
+        if not isinstance(self.mlp, AFDDeepseekV4RemoteMoEProxy):
+            raise RuntimeError("DSV4 Attention layer requires its remote MoE proxy")
+        return self.mlp.receive_remote_ffn(transfer, layer_idx=self.layer_idx)
 
     def complete_remote_ffn(
         self,
@@ -569,72 +614,35 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
                         hidden_states = item.intermediate_tensors["hidden_states"]
                     hidden_ubatches.append(hidden_states)
 
-            llama_4_scaling = None
-            for layer_offset, layer in enumerate(
-                islice(self.layers, self.start_layer, self.end_layer)
-            ):
-                for stage_idx, (item, forward_context) in enumerate(
-                    zip(ubatch_metadata, stage_contexts, strict=True)
-                ):
-                    with override_forward_context(forward_context):
-                        if layer_offset > 0:
-                            wait_for_receive(
-                                stage_idx=stage_idx,
-                                tensor=hidden_ubatches[stage_idx],
-                            )
-                            pending_layer = pending_layers[stage_idx]
-                            continuation = pending_continuations[stage_idx]
-                            if pending_layer is None or continuation is None:
-                                raise RuntimeError(
-                                    "DSV4 layer-major stage has no pending layer: "
-                                    f"stage={stage_idx}"
-                                )
-                            hidden_ubatches[stage_idx] = (
-                                pending_layer.complete_remote_ffn(
-                                    hidden_ubatches[stage_idx],
-                                    continuation,
-                                )
-                            )
-                            if (
-                                pending_layer.layer_idx + 1
-                                in self.aux_hidden_state_layers
-                            ):
-                                aux_hidden_ubatches[stage_idx].append(
-                                    hidden_ubatches[stage_idx].mean(dim=1)
-                                )
-                        hidden_states, continuation = (
-                            layer.forward_attention_to_remote_ffn(
-                                item.positions,
-                                hidden_ubatches[stage_idx],
-                                None,
-                                llama_4_scaling,
-                            )
-                        )
-                        hidden_ubatches[stage_idx] = hidden_states
-                        pending_layers[stage_idx] = layer
-                        pending_continuations[stage_idx] = continuation
-
-            for stage_idx, forward_context in enumerate(stage_contexts):
-                with override_forward_context(forward_context):
-                    wait_for_receive(
-                        stage_idx=stage_idx,
-                        tensor=hidden_ubatches[stage_idx],
-                    )
-                    pending_layer = pending_layers[stage_idx]
-                    continuation = pending_continuations[stage_idx]
-                    if pending_layer is None or continuation is None:
-                        raise RuntimeError(
-                            "DSV4 layer-major stage has no final pending layer: "
-                            f"stage={stage_idx}"
-                        )
-                    hidden_ubatches[stage_idx] = pending_layer.complete_remote_ffn(
-                        hidden_ubatches[stage_idx],
-                        continuation,
-                    )
-                    if pending_layer.layer_idx + 1 in self.aux_hidden_state_layers:
-                        aux_hidden_ubatches[stage_idx].append(
-                            hidden_ubatches[stage_idx].mean(dim=1)
-                        )
+            graph_pipeline_active = getattr(
+                connector,
+                "attention_graph_compute_pipeline_active",
+                None,
+            )
+            with override_forward_context(stage_contexts[0]):
+                use_graph_compute = bool(
+                    callable(graph_pipeline_active) and graph_pipeline_active()
+                )
+            if use_graph_compute:
+                self._forward_ubatches_graph_compute_pipeline(
+                    ubatch_metadata=ubatch_metadata,
+                    stage_contexts=stage_contexts,
+                    connector=connector,
+                    hidden_ubatches=hidden_ubatches,
+                    pending_layers=pending_layers,
+                    pending_continuations=pending_continuations,
+                    aux_hidden_ubatches=aux_hidden_ubatches,
+                )
+            else:
+                self._forward_ubatches_eager_pipeline(
+                    ubatch_metadata=ubatch_metadata,
+                    stage_contexts=stage_contexts,
+                    wait_for_receive=wait_for_receive,
+                    hidden_ubatches=hidden_ubatches,
+                    pending_layers=pending_layers,
+                    pending_continuations=pending_continuations,
+                    aux_hidden_ubatches=aux_hidden_ubatches,
+                )
         except BaseException:
             if callable(reset_pipeline):
                 reset_pipeline()
@@ -673,6 +681,249 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
                     else hidden_states
                 )
         return outputs
+
+    def _forward_ubatches_eager_pipeline(
+        self,
+        *,
+        ubatch_metadata: list[Any],
+        stage_contexts: list[Any],
+        wait_for_receive: Any,
+        hidden_ubatches: list[torch.Tensor],
+        pending_layers: list[AFDDeepseekV4DecoderLayer | None],
+        pending_continuations: list[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ],
+        aux_hidden_ubatches: list[list[torch.Tensor]],
+    ) -> None:
+        llama_4_scaling = None
+        for layer_offset, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer)
+        ):
+            for stage_idx, (item, forward_context) in enumerate(
+                zip(ubatch_metadata, stage_contexts, strict=True)
+            ):
+                with override_forward_context(forward_context):
+                    if layer_offset > 0:
+                        wait_for_receive(
+                            stage_idx=stage_idx,
+                            tensor=hidden_ubatches[stage_idx],
+                        )
+                        self._complete_pending_stage(
+                            stage_idx,
+                            hidden_ubatches,
+                            pending_layers,
+                            pending_continuations,
+                            aux_hidden_ubatches,
+                        )
+                    hidden_states, continuation = layer.forward_attention_to_remote_ffn(
+                        item.positions,
+                        hidden_ubatches[stage_idx],
+                        None,
+                        llama_4_scaling,
+                    )
+                    hidden_ubatches[stage_idx] = hidden_states
+                    pending_layers[stage_idx] = layer
+                    pending_continuations[stage_idx] = continuation
+
+        for stage_idx, forward_context in enumerate(stage_contexts):
+            with override_forward_context(forward_context):
+                wait_for_receive(
+                    stage_idx=stage_idx,
+                    tensor=hidden_ubatches[stage_idx],
+                )
+                self._complete_pending_stage(
+                    stage_idx,
+                    hidden_ubatches,
+                    pending_layers,
+                    pending_continuations,
+                    aux_hidden_ubatches,
+                    final=True,
+                )
+
+    def _forward_ubatches_graph_compute_pipeline(
+        self,
+        *,
+        ubatch_metadata: list[Any],
+        stage_contexts: list[Any],
+        connector: Any,
+        hidden_ubatches: list[torch.Tensor],
+        pending_layers: list[AFDDeepseekV4DecoderLayer | None],
+        pending_continuations: list[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ],
+        aux_hidden_ubatches: list[list[torch.Tensor]],
+    ) -> None:
+        compute_scope = getattr(connector, "attention_graph_compute", None)
+        wait_for_compute = getattr(
+            connector,
+            "wait_for_attention_graph_compute",
+            None,
+        )
+        join_compute = getattr(
+            connector,
+            "join_attention_graph_compute",
+            None,
+        )
+        hybrid_dag_active = getattr(
+            connector,
+            "attention_graph_hybrid_dag_active",
+            None,
+        )
+        wait_for_receive = getattr(
+            connector,
+            "wait_for_attention_stage_receive",
+            None,
+        )
+        if not all(
+            callable(method)
+            for method in (
+                compute_scope,
+                wait_for_compute,
+                join_compute,
+                wait_for_receive,
+                hybrid_dag_active,
+            )
+        ):
+            raise RuntimeError("DSV4 Graph U2 requires the HCCL compute pipeline")
+
+        layers = list(islice(self.layers, self.start_layer, self.end_layer))
+        llama_4_scaling = None
+        with override_forward_context(stage_contexts[0]):
+            use_hybrid_dag = hybrid_dag_active()
+
+        def enqueue_attention_compute(
+            layer_offset: int,
+            layer: AFDDeepseekV4DecoderLayer,
+            stage_idx: int,
+        ) -> None:
+            item = ubatch_metadata[stage_idx]
+            forward_context = stage_contexts[stage_idx]
+            with (
+                override_forward_context(forward_context),
+                compute_scope(
+                    layer_idx=layer.layer_idx,
+                    stage_idx=stage_idx,
+                    tensors=(hidden_ubatches[stage_idx], item.positions),
+                    wait_for_receive_layer_idx=(
+                        layers[layer_offset - 1].layer_idx
+                        if use_hybrid_dag and layer_offset > 0
+                        else None
+                    ),
+                ),
+            ):
+                if layer_offset > 0:
+                    wait_for_receive(
+                        stage_idx=stage_idx,
+                        tensor=hidden_ubatches[stage_idx],
+                    )
+                    self._complete_pending_stage(
+                        stage_idx,
+                        hidden_ubatches,
+                        pending_layers,
+                        pending_continuations,
+                        aux_hidden_ubatches,
+                    )
+                hidden_states, continuation = (
+                    layer.forward_attention_to_remote_ffn_input(
+                        item.positions,
+                        hidden_ubatches[stage_idx],
+                        None,
+                        llama_4_scaling,
+                    )
+                )
+                hidden_ubatches[stage_idx] = hidden_states
+                pending_continuations[stage_idx] = continuation
+
+        # Host-side Graph construction remains layer-major. With the hybrid DAG,
+        # each side-stream stage waits only for its own prior-layer F2A receive,
+        # so S0 compute can execute while the parent stream finishes S1 exchange.
+        first_layer = layers[0]
+        for stage_idx in range(len(stage_contexts)):
+            enqueue_attention_compute(0, first_layer, stage_idx)
+
+        final_event_layer = int(self.config.num_hidden_layers)
+        for layer_offset, layer in enumerate(layers):
+            for stage_idx, forward_context in enumerate(stage_contexts):
+                with override_forward_context(forward_context):
+                    wait_for_compute(
+                        layer_idx=layer.layer_idx,
+                        stage_idx=stage_idx,
+                        tensors=(hidden_ubatches[stage_idx],),
+                    )
+                    transfer = layer.dispatch_remote_ffn(hidden_ubatches[stage_idx])
+                    hidden_ubatches[stage_idx] = layer.receive_remote_ffn(transfer)
+                    pending_layers[stage_idx] = layer
+
+            next_layer_offset = layer_offset + 1
+            if next_layer_offset < len(layers):
+                for stage_idx in range(len(stage_contexts)):
+                    enqueue_attention_compute(
+                        next_layer_offset,
+                        layers[next_layer_offset],
+                        stage_idx,
+                    )
+            else:
+                for stage_idx, forward_context in enumerate(stage_contexts):
+                    with (
+                        override_forward_context(forward_context),
+                        compute_scope(
+                            layer_idx=final_event_layer,
+                            stage_idx=stage_idx,
+                            tensors=(hidden_ubatches[stage_idx],),
+                            wait_for_receive_layer_idx=(
+                                layer.layer_idx if use_hybrid_dag else None
+                            ),
+                        ),
+                    ):
+                        wait_for_receive(
+                            stage_idx=stage_idx,
+                            tensor=hidden_ubatches[stage_idx],
+                        )
+                        self._complete_pending_stage(
+                            stage_idx,
+                            hidden_ubatches,
+                            pending_layers,
+                            pending_continuations,
+                            aux_hidden_ubatches,
+                            final=True,
+                        )
+
+        for stage_idx, forward_context in enumerate(stage_contexts):
+            with override_forward_context(forward_context):
+                join_compute(
+                    layer_idx=final_event_layer,
+                    stage_idx=stage_idx,
+                    tensors=(hidden_ubatches[stage_idx],),
+                )
+
+    def _complete_pending_stage(
+        self,
+        stage_idx: int,
+        hidden_ubatches: list[torch.Tensor],
+        pending_layers: list[AFDDeepseekV4DecoderLayer | None],
+        pending_continuations: list[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ],
+        aux_hidden_ubatches: list[list[torch.Tensor]],
+        *,
+        final: bool = False,
+    ) -> None:
+        pending_layer = pending_layers[stage_idx]
+        continuation = pending_continuations[stage_idx]
+        if pending_layer is None or continuation is None:
+            qualifier = "final " if final else ""
+            raise RuntimeError(
+                f"DSV4 layer-major stage has no {qualifier}pending layer: "
+                f"stage={stage_idx}"
+            )
+        hidden_ubatches[stage_idx] = pending_layer.complete_remote_ffn(
+            hidden_ubatches[stage_idx],
+            continuation,
+        )
+        if pending_layer.layer_idx + 1 in self.aux_hidden_state_layers:
+            aux_hidden_ubatches[stage_idx].append(
+                hidden_ubatches[stage_idx].mean(dim=1)
+            )
 
     def compute_ffn_output(
         self,

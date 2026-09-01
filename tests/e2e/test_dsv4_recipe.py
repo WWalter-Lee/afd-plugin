@@ -636,6 +636,32 @@ def test_dsv4_performance_defaults_to_validated_sync_scheduler(monkeypatch, tmp_
 
     assert args.async_scheduling == "off"
     assert args.tensor_parallel_size == 1
+    assert args.graph_u2_compute_overlap == "on"
+    assert args.graph_u2_hybrid_dag == "on"
+
+
+def test_dsv4_performance_records_graph_u2_overlap_mode(monkeypatch):
+    runner = _load_performance_runner()
+    args = SimpleNamespace(
+        max_model_len=4096,
+        max_num_batched_tokens=1024,
+        max_num_seqs=8,
+        gpu_memory_utilization=0.9,
+        attention_hccl_base_port=51000,
+        ffn_hccl_base_port=52000,
+        async_scheduling="off",
+        tensor_parallel_size=1,
+        graph_u2_compute_overlap="off",
+        graph_u2_hybrid_dag="off",
+        enable_mtp=False,
+        mtp_num_speculative_tokens=1,
+        profile=False,
+    )
+
+    runner._set_service_environment(args)
+
+    assert runner.os.environ["AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP"] == "0"
+    assert runner.os.environ["AFD_HCCL_GRAPH_U2_HYBRID_DAG"] == "0"
 
 
 def test_dsv4_performance_tp2_uses_dp4_topology_and_environment(monkeypatch):
@@ -739,6 +765,8 @@ def test_dsv4_performance_mtp_manifest_preserves_structured_topology(monkeypatch
         attention_hccl_base_port=51000,
         ffn_hccl_base_port=52000,
         async_scheduling="off",
+        graph_u2_compute_overlap="on",
+        graph_u2_hybrid_dag="off",
         input_len=1024,
         output_len=128,
         concurrencies=[32],
@@ -772,6 +800,8 @@ def test_dsv4_performance_mtp_manifest_preserves_structured_topology(monkeypatch
     graph_u2_manifest = runner._runtime_manifest(args)
     assert graph_u2_manifest["stage"] == "A3-P7M4-P1"
     assert graph_u2_manifest["mtp_phase_u_batches"] == 1
+    assert graph_u2_manifest["service"]["graph_u2_compute_overlap"] == "on"
+    assert graph_u2_manifest["service"]["graph_u2_hybrid_dag"] == "off"
 
 
 def test_dsv4_performance_detects_exited_service():
@@ -936,6 +966,9 @@ def test_dsv4_performance_npu_snapshot_parser_uses_bus_rows():
 
 def test_dsv4_runtime_manifest_records_graph_u1(monkeypatch):
     runner = _load_runner()
+    monkeypatch.setenv("DSV4_CANN_ROOT", "/opt/cann-9.0.0")
+    monkeypatch.setenv("DSV4_CANN_VERSION", "9.0.0")
+    monkeypatch.setenv("AFD_NPU_FFN_PROFILER_RANKS", "all")
 
     def check_output(command, **kwargs):
         if "status" in command:
@@ -960,7 +993,13 @@ def test_dsv4_runtime_manifest_records_graph_u1(monkeypatch):
     assert manifest["u_batches"] == 1
     assert manifest["profile"] is True
     assert manifest["profile_role_ranks"] == [0]
+    assert manifest["profile_role_rank_selection"] == {
+        "attention": "0",
+        "ffn": "all",
+    }
     assert manifest["torch_profiler_with_stack"] is False
+    assert manifest["cann"] == "/opt/cann-9.0.0"
+    assert manifest["cann_version"] == "9.0.0"
     assert manifest["afd_plugin_worktree"]["tracked_dirty"] is True
     assert manifest["afd_plugin_worktree"]["tracked_status"] == [" M tracked.py"]
     assert len(manifest["afd_plugin_worktree"]["tracked_diff_sha256"]) == 64
@@ -1182,7 +1221,7 @@ def test_dsv4_ubatch_gate_requires_two_stage_runtime_evidence(
     assert result["passed"] is expected
 
 
-def test_dsv4_profile_gate_requires_one_nonempty_dp0_trace_per_role(tmp_path):
+def test_dsv4_profile_gate_requires_every_rank_trace_to_be_nonempty(tmp_path):
     runner = _load_runner()
     for role in ("attention", "ffn"):
         trace_dir = tmp_path / role / f"{role}_dp0_ascend_pt"
@@ -1198,12 +1237,26 @@ def test_dsv4_profile_gate_requires_one_nonempty_dp0_trace_per_role(tmp_path):
     assert result["passed"] is True
     assert result["roles"]["attention"]["cann_raw_file_count"] == 1
 
-    (tmp_path / "attention/extra_ascend_pt").mkdir()
+    extra_trace = tmp_path / "attention/attention_dp1_ascend_pt"
+    extra_trace.mkdir()
 
     result = runner._profile_output_gate(tmp_path)
 
     assert result["passed"] is False
     assert result["roles"]["attention"]["passed"] is False
+
+    (extra_trace / "FRAMEWORK").mkdir()
+    (extra_trace / "profiler_info_1.json").write_text("{}\n", encoding="utf-8")
+    (extra_trace / "FRAMEWORK/torch.op_range").write_bytes(b"torch-ops")
+    raw_dir = extra_trace / "PROF_000001/device_1/data"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "stars.data").write_bytes(b"cann-data")
+
+    result = runner._profile_output_gate(tmp_path)
+
+    assert result["passed"] is True
+    assert result["roles"]["attention"]["cann_raw_file_count"] == 2
+    assert len(result["roles"]["attention"]["traces"]) == 2
 
 
 def test_dsv4_npu_process_parser_ignores_device_rows():

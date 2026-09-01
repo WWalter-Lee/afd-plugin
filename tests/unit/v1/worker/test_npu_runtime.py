@@ -1323,6 +1323,60 @@ def test_npu_attention_runner_logs_each_metadata_stage_count_once(monkeypatch):
     assert key_calls == [[0], [0, 1]]
 
 
+def test_npu_attention_runner_logs_live_stage_after_graph_warmup(monkeypatch):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    runner = _new_attention_runner()
+    runner.vllm_config = _vllm_config(
+        role="attention",
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+        ubatch_size=4,
+    )
+    runner.connector = _RecordingConnector()
+    runner._afd_unpadded_tokens_across_dp = None
+    runner._afd_logged_metadata_stage_counts = set()
+    ubatch_slices = [
+        SimpleNamespace(
+            request_slice=slice(0, 2),
+            token_slice=slice(0, 4),
+            num_tokens=4,
+        ),
+        SimpleNamespace(
+            request_slice=slice(2, 3),
+            token_slice=slice(4, 7),
+            num_tokens=3,
+        ),
+    ]
+    warning_messages = []
+    monkeypatch.setattr(
+        attention_model_runner.logger,
+        "warning",
+        lambda message, *args: warning_messages.append(message % args),
+    )
+    monkeypatch.setattr(
+        attention_model_runner.logger,
+        "isEnabledFor",
+        lambda _level: False,
+    )
+
+    runner._is_warmup = True
+    runner._afd_is_graph_capturing = True
+    runner._send_dp_metadata(None, ubatch_slices)
+    runner._is_warmup = False
+    runner._afd_is_graph_capturing = False
+    runner._send_dp_metadata(None, ubatch_slices)
+    runner._send_dp_metadata(None, ubatch_slices)
+
+    assert len(warning_messages) == 2
+    assert "stage_count=2" in warning_messages[0]
+    assert "is_graph_capturing=True is_warmup=True" in warning_messages[0]
+    assert "stage_count=2" in warning_messages[1]
+    assert "is_graph_capturing=False is_warmup=False" in warning_messages[1]
+
+
 def test_npu_attention_runner_sends_global_nonuniform_ubatch_dp_metadata():
     runner = _new_attention_runner()
     runner.vllm_config = _vllm_config(
@@ -1612,6 +1666,7 @@ def test_npu_attention_announces_only_executed_live_mtp_phase(monkeypatch):
             ),
         ),
     )
+
     class CallableDraftGraph:
         runtime_mode = CUDAGraphMode.FULL
         concrete_aclgraph_entries = {}
@@ -1671,6 +1726,7 @@ def test_npu_attention_synchronizes_live_full_graph_mtp(monkeypatch):
     runner.connector = SimpleNamespace(
         control_plane=SimpleNamespace(),
     )
+
     def parent_propose(self, *args):
         assert self._afd_in_mtp_proposal is True
         self._afd_mtp_phase_announced = True
@@ -2287,8 +2343,24 @@ def test_npu_ffn_runner_computes_stage_token_layout_once_per_step(monkeypatch):
     assert len(runner.connector.ffn_outputs) == 6
 
 
-def test_npu_ffn_runner_stream_pipeline_orders_each_layer_and_stage(monkeypatch):
+@pytest.mark.parametrize(
+    ("is_graph_capturing", "graph_runtime", "graph_overlap_enabled"),
+    [
+        (False, False, True),
+        (True, True, True),
+        (True, True, False),
+    ],
+    ids=["eager", "graph-capture-overlap", "graph-capture-baseline"],
+)
+def test_npu_ffn_runner_stream_pipeline_orders_each_layer_and_stage(
+    monkeypatch,
+    is_graph_capturing,
+    graph_runtime,
+    graph_overlap_enabled,
+):
     _require_npu_runtime()
+    from vllm.config import CUDAGraphMode
+
     from afd_plugin.v1.worker.npu import ffn_model_runner
 
     _patch_ffn_forward_context(monkeypatch)
@@ -2321,6 +2393,36 @@ def test_npu_ffn_runner_stream_pipeline_orders_each_layer_and_stage(monkeypatch)
     class StreamConnector(_FakeFFNConnector):
         stream_overlap_enabled = True
 
+        def recv_attn_output(self, *, ubatch_idx, **kwargs):
+            if is_graph_capturing:
+                calls.append(
+                    (
+                        "recv",
+                        kwargs["layer_idx"],
+                        ubatch_idx,
+                        ffn_model_runner.torch.npu.current_stream(),
+                    )
+                )
+            return super().recv_attn_output(ubatch_idx=ubatch_idx, **kwargs)
+
+        def send_ffn_output(self, ffn_output, context, *, ubatch_idx, **kwargs):
+            if is_graph_capturing:
+                calls.append(
+                    (
+                        "send",
+                        context.metadata.layer_idx,
+                        ubatch_idx,
+                        active_stream[0]
+                        or ffn_model_runner.torch.npu.current_stream(),
+                    )
+                )
+            return super().send_ffn_output(
+                ffn_output,
+                context,
+                ubatch_idx=ubatch_idx,
+                **kwargs,
+            )
+
         def recv_attn_output_streamed(
             self,
             *,
@@ -2350,9 +2452,10 @@ def test_npu_ffn_runner_stream_pipeline_orders_each_layer_and_stage(monkeypatch)
         ):
             with use_stream(send_stream):
                 wait_event.wait(send_stream)
-                calls.append(
-                    ("send", context.metadata.layer_idx, ubatch_idx, send_stream),
-                )
+                if not is_graph_capturing:
+                    calls.append(
+                        ("send", context.metadata.layer_idx, ubatch_idx, send_stream),
+                    )
                 self.send_ffn_output(
                     ffn_output,
                     context,
@@ -2384,6 +2487,7 @@ def test_npu_ffn_runner_stream_pipeline_orders_each_layer_and_stage(monkeypatch)
         num_ubatches=2,
     )
     runner.connector = StreamConnector(attn_size=2, ffn_size=2)
+    runner.connector.graph_u2_compute_overlap_enabled = graph_overlap_enabled
     runner.model = StreamModel()
     runner.num_layers = 2
     runner.max_num_tokens = 2
@@ -2422,24 +2526,93 @@ def test_npu_ffn_runner_stream_pipeline_orders_each_layer_and_stage(monkeypatch)
             0: _FakeDPMetadata([1]),
             1: _FakeDPMetadata([1]),
         },
+        is_graph_capturing=is_graph_capturing,
+        aclgraph_runtime_mode=CUDAGraphMode.FULL if graph_runtime else None,
     )
 
     for layer_idx in range(2):
         for stage_idx in range(2):
-            recv_marker = ("recv", layer_idx, stage_idx, recv_stream)
-            compute_marker = ("compute", layer_idx, stage_idx, compute_stream)
-            send_marker = ("send", layer_idx, stage_idx, send_stream)
+            recv_marker = (
+                "recv",
+                layer_idx,
+                stage_idx,
+                default_stream if is_graph_capturing else recv_stream,
+            )
+            expected_compute_stream = (
+                compute_stream
+                if not is_graph_capturing or graph_overlap_enabled
+                else None
+            )
+            compute_marker = (
+                "compute",
+                layer_idx,
+                stage_idx,
+                expected_compute_stream,
+            )
+            send_marker = (
+                "send",
+                layer_idx,
+                stage_idx,
+                send_stream if graph_overlap_enabled else default_stream,
+            )
             assert calls.index(recv_marker) < calls.index(compute_marker)
             assert calls.index(compute_marker) < calls.index(send_marker)
-            if layer_idx > 0:
+            if layer_idx > 0 and not is_graph_capturing:
                 previous_send_wait = (
                     f"send-{layer_idx - 1}-{stage_idx}",
                     "wait",
                     recv_stream,
                 )
                 assert calls.index(previous_send_wait) < calls.index(recv_marker)
-    assert ("send-1-0", "wait", default_stream) in calls
-    assert ("send-1-1", "wait", default_stream) in calls
+            if is_graph_capturing and graph_overlap_enabled:
+                compute_wait = (
+                    f"compute-{layer_idx}-{stage_idx}",
+                    "wait",
+                    send_stream,
+                )
+                assert calls.index(compute_wait) < calls.index(send_marker)
+    if is_graph_capturing:
+        graph_schedule = [
+            call[:3] for call in calls if call[0] in {"recv", "compute", "send"}
+        ]
+        if graph_overlap_enabled:
+            assert graph_schedule == [
+                ("recv", 0, 0),
+                ("compute", 0, 0),
+                ("send", 0, 0),
+                ("recv", 0, 1),
+                ("compute", 0, 1),
+                ("send", 0, 1),
+                ("recv", 1, 0),
+                ("compute", 1, 0),
+                ("send", 1, 0),
+                ("recv", 1, 1),
+                ("compute", 1, 1),
+                ("send", 1, 1),
+            ]
+        else:
+            assert graph_schedule == [
+                (op, layer_idx, stage_idx)
+                for layer_idx in range(2)
+                for stage_idx in range(2)
+                for op in ("recv", "compute", "send")
+            ]
+        if graph_overlap_enabled:
+            for layer_idx in range(2):
+                for stage_idx in range(2):
+                    assert (
+                        f"send-{layer_idx}-{stage_idx}",
+                        "wait",
+                        default_stream,
+                    ) in calls
+                assert calls.index(
+                    ("recv", layer_idx, 1, default_stream)
+                ) < calls.index(
+                    (f"send-{layer_idx}-0", "wait", default_stream)
+                )
+    else:
+        assert ("send-1-0", "wait", default_stream) in calls
+        assert ("send-1-1", "wait", default_stream) in calls
 
 
 def test_dsv4_ffn_eager_receives_ids_and_hidden_stage_by_stage(monkeypatch):

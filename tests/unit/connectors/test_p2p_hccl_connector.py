@@ -19,6 +19,7 @@ from afd_plugin.connectors import (  # noqa: E402
 )
 from afd_plugin.connectors.npu import p2p_hccl as hccl_module  # noqa: E402
 from afd_plugin.connectors.npu.p2p_hccl import (  # noqa: E402
+    HCCLAttentionGraphStreamPlan,
     HCCLMTPHeader,
     HCCLP2PTransferState,
     P2pHcclAFDConnector,
@@ -1040,18 +1041,16 @@ def test_p2p_hccl_attention_stream_pipeline_is_inactive_for_graph_ubatching(
     assert connector.pending_attention_transfers == {}
 
 
-def test_p2p_hccl_attention_stream_pipeline_is_active_for_layer_major_graph(
-    monkeypatch,
-):
+def test_p2p_hccl_graph_uses_only_the_compute_side_stream(monkeypatch):
     connector = _connector(role="attention", num_ubatches=2)
     connector.a2f_send_stream = object()
     connector.f2a_recv_stream = object()
-    connector.attention_pipeline_events = {(1, 0): object()}
-    monkeypatch.setattr(
-        hccl_module.torch.npu,
-        "is_current_stream_capturing",
-        lambda: False,
+    connector.attention_graph_compute_stream = object()
+    connector.attention_graph_stream_plan = HCCLAttentionGraphStreamPlan(
+        compute_stream=connector.attention_graph_compute_stream,
     )
+    connector.attention_pipeline_events = {(1, 0): object()}
+    connector.attention_graph_events = {(1, 0): object()}
     monkeypatch.setattr(
         hccl_module,
         "get_forward_context",
@@ -1061,42 +1060,175 @@ def test_p2p_hccl_attention_stream_pipeline_is_active_for_layer_major_graph(
             dbo_enabled=True,
             num_ubatches=2,
         ),
-    )
-
-    assert connector._attention_stream_pipeline_active() is True
-
-
-def test_p2p_hccl_dynamic_graph_capture_disables_attention_stream_pipeline(
-    monkeypatch,
-):
-    connector = _connector(role="attention", num_ubatches=2)
-    connector.a2f_send_stream = object()
-    connector.f2a_recv_stream = object()
-    connector.attention_pipeline_events = {(1, 0): object()}
-    monkeypatch.setattr(
-        hccl_module,
-        "get_forward_context",
-        lambda: SimpleNamespace(
-            afd_graph_ubatching=True,
-            afd_layer_major_u2=True,
-            dbo_enabled=True,
-            num_ubatches=2,
-        ),
-    )
-    monkeypatch.setattr(
-        hccl_module.torch.npu,
-        "is_current_stream_capturing",
-        lambda: True,
     )
 
     assert connector._attention_stream_pipeline_active() is False
+    assert connector.attention_graph_compute_pipeline_active() is True
 
 
-def test_p2p_hccl_dynamic_graph_capture_skips_deferred_receive_wait(monkeypatch):
+def test_p2p_hccl_graph_pipeline_skips_python_state_during_compile(monkeypatch):
     connector = _connector(role="attention", num_ubatches=2)
+
+    class CompileUnsafeEvents(dict):
+        def __bool__(self):
+            raise AssertionError("Dynamo path must not inspect the event dictionary")
+
+    connector.attention_graph_stream_plan = HCCLAttentionGraphStreamPlan(
+        compute_stream=object(),
+    )
+    connector.attention_graph_events = CompileUnsafeEvents({(1, 0): object()})
+    monkeypatch.setattr(hccl_module.torch.compiler, "is_compiling", lambda: True)
+
+    assert connector.attention_graph_compute_pipeline_active() is False
+
+
+def test_p2p_hccl_graph_keeps_send_and_receive_on_parent_stream(monkeypatch):
+    connector = _connector(role="attention", num_ubatches=2)
+    calls = []
+    parent_stream = object()
+
+    class FakeEvent:
+        def __init__(self, name):
+            self.name = name
+
+        def record(self, stream):
+            calls.append((self.name, "record", stream))
+
+        def wait(self, stream):
+            calls.append((self.name, "wait", stream))
+
     connector.a2f_send_stream = object()
     connector.f2a_recv_stream = object()
     connector.attention_pipeline_events = {(1, 0): object()}
+    connector.attention_graph_stream_plan = HCCLAttentionGraphStreamPlan(
+        compute_stream=object(),
+    )
+    connector.attention_graph_events = {
+        (1, 0): hccl_module.HCCLAttentionGraphEvents(
+            ready=FakeEvent("ready"),
+            compute_done=FakeEvent("compute_done"),
+            send_done=FakeEvent("send_done"),
+            recv_done=FakeEvent("recv_done"),
+        )
+    }
+    monkeypatch.setattr(
+        hccl_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            afd_graph_ubatching=True,
+            afd_layer_major_u2=True,
+            dbo_enabled=True,
+            num_ubatches=2,
+        ),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_send_tensor",
+        lambda _tensor, *, dst, group, stream=None: calls.append(
+            ("send_tensor", dst, group, stream)
+        ),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_recv_tensor",
+        lambda _tensor, *, src, group, stream=None: calls.append(
+            ("recv_tensor", src, group, stream)
+        ),
+    )
+    monkeypatch.setattr(
+        hccl_module,
+        "maybe_apply_dbo_yield",
+        lambda *_args, **_kw: None,
+    )
+    monkeypatch.setattr(
+        hccl_module.torch.npu,
+        "current_stream",
+        lambda: parent_stream,
+    )
+    hidden = torch.ones((2, 4), dtype=torch.bfloat16)
+
+    connector.send_attn_output(
+        hidden,
+        _attention_context(layer_idx=1, stage_idx=0, num_tokens=2),
+    )
+    output = connector.recv_ffn_output(hidden, ubatch_idx=0, layer_idx=1)
+
+    assert calls == [
+        ("send_tensor", 0, connector.data_pg_list[0], None),
+        ("send_done", "record", parent_stream),
+        ("send_done", "wait", parent_stream),
+        ("recv_tensor", 0, connector.data_pg_list[0], None),
+        ("recv_done", "record", parent_stream),
+    ]
+    assert output is hidden
+    assert connector.pending_attention_transfers == {}
+    assert connector.attention_receive_dependencies == {}
+
+
+def test_attention_graph_stream_plan_decouples_logical_and_physical_streams():
+    parent_stream = object()
+    compute_stream = object()
+    send_stream = object()
+    recv_stream = object()
+
+    parent_transport = HCCLAttentionGraphStreamPlan(
+        compute_stream=compute_stream,
+    )
+    three_stream = HCCLAttentionGraphStreamPlan(
+        compute_stream=compute_stream,
+        send_stream=send_stream,
+        recv_stream=recv_stream,
+    )
+
+    assert parent_transport.resolve("compute", parent_stream) is compute_stream
+    assert parent_transport.resolve("send", parent_stream) is parent_stream
+    assert parent_transport.resolve("recv", parent_stream) is parent_stream
+    assert three_stream.resolve("send", parent_stream) is send_stream
+    assert three_stream.resolve("recv", parent_stream) is recv_stream
+
+
+def test_p2p_hccl_graph_routes_transport_through_stream_plan(monkeypatch):
+    connector = _connector(role="attention", num_ubatches=2)
+    calls = []
+    parent_stream = object()
+    send_stream = object()
+    recv_stream = object()
+    active_stream = [parent_stream]
+
+    class FakeEvent:
+        def __init__(self, name):
+            self.name = name
+
+        def record(self, stream):
+            calls.append((self.name, "record", stream))
+
+        def wait(self, stream):
+            calls.append((self.name, "wait", stream))
+
+    @contextmanager
+    def use_stream(stream):
+        previous = active_stream[0]
+        active_stream[0] = stream
+        calls.append(("enter", stream))
+        try:
+            yield
+        finally:
+            calls.append(("exit", stream))
+            active_stream[0] = previous
+
+    connector.attention_graph_stream_plan = HCCLAttentionGraphStreamPlan(
+        compute_stream=object(),
+        send_stream=send_stream,
+        recv_stream=recv_stream,
+    )
+    connector.attention_graph_events = {
+        (1, 0): hccl_module.HCCLAttentionGraphEvents(
+            ready=FakeEvent("ready"),
+            compute_done=FakeEvent("compute_done"),
+            send_done=FakeEvent("send_done"),
+            recv_done=FakeEvent("recv_done"),
+        )
+    }
     monkeypatch.setattr(
         hccl_module,
         "get_forward_context",
@@ -1109,16 +1241,259 @@ def test_p2p_hccl_dynamic_graph_capture_skips_deferred_receive_wait(monkeypatch)
     )
     monkeypatch.setattr(
         hccl_module.torch.npu,
-        "is_current_stream_capturing",
-        lambda: True,
+        "current_stream",
+        lambda: active_stream[0],
+    )
+    monkeypatch.setattr(hccl_module.torch.npu, "stream", use_stream)
+    monkeypatch.setattr(
+        connector,
+        "_send_tensor",
+        lambda _tensor, *, dst, group, stream=None: calls.append(
+            ("send_tensor", dst, group, stream)
+        ),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_recv_tensor",
+        lambda _tensor, *, src, group, stream=None: calls.append(
+            ("recv_tensor", src, group, stream)
+        ),
+    )
+    hidden = torch.ones((2, 4), dtype=torch.bfloat16)
+
+    connector.send_attn_output(
+        hidden,
+        _attention_context(layer_idx=1, stage_idx=0, num_tokens=2),
+    )
+    connector.recv_ffn_output(hidden, ubatch_idx=0, layer_idx=1)
+
+    assert calls == [
+        ("enter", send_stream),
+        ("send_tensor", 0, connector.data_pg_list[0], send_stream),
+        ("send_done", "record", send_stream),
+        ("exit", send_stream),
+        ("enter", recv_stream),
+        ("send_done", "wait", recv_stream),
+        ("recv_tensor", 0, connector.data_pg_list[0], recv_stream),
+        ("recv_done", "record", recv_stream),
+        ("exit", recv_stream),
+    ]
+
+
+def test_p2p_hccl_graph_compute_pipeline_can_be_disabled_for_comparison(
+    monkeypatch,
+):
+    monkeypatch.setenv("AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP", "0")
+    connector = _connector(role="attention", num_ubatches=2)
+    connector.a2f_send_stream = object()
+    connector.f2a_recv_stream = object()
+    connector.attention_pipeline_events = {(1, 0): object()}
+    connector.attention_graph_compute_stream = object()
+    connector.attention_graph_stream_plan = HCCLAttentionGraphStreamPlan(
+        compute_stream=connector.attention_graph_compute_stream,
+    )
+    connector.attention_graph_events = {(1, 0): object()}
+    monkeypatch.setattr(
+        hccl_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            afd_graph_ubatching=True,
+            afd_layer_major_u2=True,
+            dbo_enabled=True,
+            num_ubatches=2,
+        ),
     )
 
-    connector.wait_for_attention_stage_receive(
+    assert connector.graph_u2_compute_overlap_enabled is False
+    assert connector.attention_graph_compute_pipeline_active() is False
+
+
+def test_p2p_hccl_rejects_invalid_graph_compute_overlap_value(monkeypatch):
+    monkeypatch.setenv("AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP", "invalid")
+
+    with pytest.raises(
+        RuntimeError,
+        match="AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP must be 0 or 1",
+    ):
+        _connector(role="attention", num_ubatches=2)
+
+
+def test_p2p_hccl_graph_hybrid_dag_can_be_disabled_for_comparison(monkeypatch):
+    monkeypatch.setenv("AFD_HCCL_GRAPH_U2_HYBRID_DAG", "0")
+
+    connector = _connector(role="attention", num_ubatches=2)
+
+    assert connector.graph_u2_hybrid_dag_enabled is False
+
+
+def test_p2p_hccl_rejects_invalid_graph_hybrid_dag_value(monkeypatch):
+    monkeypatch.setenv("AFD_HCCL_GRAPH_U2_HYBRID_DAG", "invalid")
+
+    with pytest.raises(
+        RuntimeError,
+        match="AFD_HCCL_GRAPH_U2_HYBRID_DAG must be 0 or 1",
+    ):
+        _connector(role="attention", num_ubatches=2)
+
+
+def test_p2p_hccl_attention_graph_compute_orders_fork_and_join(monkeypatch):
+    connector = _connector(role="attention", num_ubatches=2)
+    calls = []
+    active_stream = [None]
+    parent_stream = object()
+    compute_stream = object()
+    tensor = torch.ones((2, 4), dtype=torch.bfloat16)
+
+    class FakeEvent:
+        def __init__(self, name):
+            self.name = name
+
+        def record(self, stream):
+            calls.append((self.name, "record", stream))
+
+        def wait(self, stream):
+            calls.append((self.name, "wait", stream))
+
+    @contextmanager
+    def use_stream(stream):
+        previous = active_stream[0]
+        active_stream[0] = stream
+        try:
+            yield
+        finally:
+            active_stream[0] = previous
+
+    connector.a2f_send_stream = object()
+    connector.f2a_recv_stream = object()
+    connector.attention_graph_compute_stream = compute_stream
+    connector.attention_graph_stream_plan = HCCLAttentionGraphStreamPlan(
+        compute_stream=compute_stream,
+    )
+    connector.attention_pipeline_events = {(1, 0): object()}
+    connector.attention_graph_events = {
+        (1, 0): hccl_module.HCCLAttentionGraphEvents(
+            ready=FakeEvent("ready"),
+            compute_done=FakeEvent("compute"),
+            send_done=FakeEvent("send"),
+            recv_done=FakeEvent("recv"),
+        )
+    }
+    monkeypatch.setattr(
+        hccl_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            afd_graph_ubatching=True,
+            afd_layer_major_u2=True,
+            dbo_enabled=True,
+            num_ubatches=2,
+        ),
+    )
+    monkeypatch.setattr(
+        hccl_module.torch.npu,
+        "current_stream",
+        lambda: parent_stream,
+    )
+    monkeypatch.setattr(hccl_module.torch.npu, "stream", use_stream)
+    monkeypatch.setattr(
+        connector,
+        "_record_stream",
+        lambda value, stream: calls.append(("tensor", value, stream)),
+    )
+
+    with connector.attention_graph_compute(
+        layer_idx=1,
         stage_idx=0,
-        tensor=torch.ones((2, 4), dtype=torch.bfloat16),
+        tensors=(tensor,),
+    ):
+        calls.append(("body", active_stream[0]))
+    connector.wait_for_attention_graph_compute(
+        layer_idx=1,
+        stage_idx=0,
+        tensors=(tensor,),
     )
 
-    assert connector.attention_receive_dependencies == {}
+    assert calls == [
+        ("ready", "record", parent_stream),
+        ("ready", "wait", compute_stream),
+        ("tensor", tensor, compute_stream),
+        ("body", compute_stream),
+        ("compute", "record", compute_stream),
+        ("compute", "wait", parent_stream),
+        ("tensor", tensor, parent_stream),
+    ]
+
+
+def test_p2p_hccl_attention_graph_compute_waits_for_own_prior_receive(
+    monkeypatch,
+):
+    connector = _connector(role="attention", num_ubatches=2)
+    calls = []
+    parent_stream = object()
+    compute_stream = object()
+
+    class FakeEvent:
+        def __init__(self, name):
+            self.name = name
+
+        def record(self, stream):
+            calls.append((self.name, "record", stream))
+
+        def wait(self, stream):
+            calls.append((self.name, "wait", stream))
+
+    @contextmanager
+    def use_stream(_stream):
+        yield
+
+    connector.a2f_send_stream = object()
+    connector.f2a_recv_stream = object()
+    connector.attention_pipeline_events = {(0, 0): object()}
+    connector.attention_graph_stream_plan = HCCLAttentionGraphStreamPlan(
+        compute_stream=compute_stream,
+    )
+    connector.attention_graph_events = {
+        (0, 0): hccl_module.HCCLAttentionGraphEvents(
+            ready=FakeEvent("previous_ready"),
+            compute_done=FakeEvent("previous_compute"),
+            send_done=FakeEvent("previous_send"),
+            recv_done=FakeEvent("previous_recv"),
+        ),
+        (1, 0): hccl_module.HCCLAttentionGraphEvents(
+            ready=FakeEvent("current_ready"),
+            compute_done=FakeEvent("current_compute"),
+            send_done=FakeEvent("current_send"),
+            recv_done=FakeEvent("current_recv"),
+        ),
+    }
+    monkeypatch.setattr(
+        hccl_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            afd_graph_ubatching=True,
+            afd_layer_major_u2=True,
+            dbo_enabled=True,
+            num_ubatches=2,
+        ),
+    )
+    monkeypatch.setattr(
+        hccl_module.torch.npu,
+        "current_stream",
+        lambda: parent_stream,
+    )
+    monkeypatch.setattr(hccl_module.torch.npu, "stream", use_stream)
+
+    with connector.attention_graph_compute(
+        layer_idx=1,
+        stage_idx=0,
+        wait_for_receive_layer_idx=0,
+    ):
+        calls.append(("body", compute_stream))
+
+    assert calls == [
+        ("previous_recv", "wait", compute_stream),
+        ("body", compute_stream),
+        ("current_compute", "record", compute_stream),
+    ]
 
 
 def test_p2p_hccl_attention_stream_pipeline_is_inactive_while_compiling(
@@ -1170,7 +1545,13 @@ def test_p2p_hccl_capture_uses_graph_send_recv(monkeypatch):
     connector = _connector(role="ffn")
     connector.is_graph_capturing = True
     graph_calls = []
+    side_stream = object()
     monkeypatch.setattr(hccl_module.torch.compiler, "is_compiling", lambda: False)
+    monkeypatch.setattr(
+        connector,
+        "_record_stream",
+        lambda tensor, stream: graph_calls.append(("record", tensor, stream)),
+    )
     monkeypatch.setattr(
         hccl_module,
         "_graph_hccl_send",
@@ -1193,11 +1574,23 @@ def test_p2p_hccl_capture_uses_graph_send_recv(monkeypatch):
     )
     tensor = torch.ones((2, 4), dtype=torch.bfloat16)
 
-    connector._send_tensor(tensor, dst=1, group=connector.data_pg_list[0])
-    connector._recv_tensor(tensor, src=1, group=connector.data_pg_list[0])
+    connector._send_tensor(
+        tensor,
+        dst=1,
+        group=connector.data_pg_list[0],
+        stream=side_stream,
+    )
+    connector._recv_tensor(
+        tensor,
+        src=1,
+        group=connector.data_pg_list[0],
+        stream=side_stream,
+    )
 
     assert graph_calls == [
+        ("record", tensor, side_stream),
         ("send", tensor, 1, connector.data_pg_list[0]),
+        ("record", tensor, side_stream),
         ("recv", tensor, 1, connector.data_pg_list[0]),
     ]
 
@@ -1677,6 +2070,99 @@ def test_p2p_hccl_control_plane_receives_from_first_subgroup_attention(monkeypat
 
     assert connector.control_plane.recv_dp_metadata_list() is expected
     assert calls == [(4, connector.p2p_pg, torch.device("cpu"))]
+
+
+@pytest.mark.parametrize(
+    ("attention_size", "ratio"),
+    [(48, 3), (64, 4)],
+)
+def test_p2p_hccl_scaleout_control_plane_has_one_sender_per_ffn(
+    monkeypatch,
+    attention_size,
+    ratio,
+):
+    payload = AFDControlPayload(
+        dp_metadata_list={},
+        is_graph_capturing=False,
+        is_warmup=False,
+    )
+    active_sender = -1
+    sent = []
+
+    def send(value, *, dst, group, device):
+        sent.append((active_sender, value, dst, group, device))
+
+    monkeypatch.setattr(hccl_module, "send_control_payload", send)
+    for role_rank in range(attention_size):
+        active_sender = role_rank
+        connector = _connector(
+            role="attention",
+            role_rank=role_rank,
+            attention=attention_size,
+            ffn=16,
+        )
+        connector.p2p_pg = object()
+        connector.control_plane.send_dp_metadata_list(payload)
+
+    assert [(source, destination) for source, _, destination, _, _ in sent] == [
+        (ffn_rank * ratio, ffn_rank) for ffn_rank in range(16)
+    ]
+    assert all(value is payload for _, value, _, _, _ in sent)
+    assert all(device == torch.device("cpu") for _, _, _, _, device in sent)
+
+
+@pytest.mark.parametrize(
+    ("attention_size", "ffn_rank", "expected_peer_world_ranks"),
+    [
+        (48, 5, (31, 32, 33)),
+        (48, 10, (46, 47, 48)),
+        (48, 15, (61, 62, 63)),
+        (64, 3, (28, 29, 30, 31)),
+        (64, 4, (32, 33, 34, 35)),
+        (64, 15, (76, 77, 78, 79)),
+    ],
+)
+def test_p2p_hccl_scaleout_token_fan_in_matches_static_peer_contract(
+    monkeypatch,
+    attention_size,
+    ffn_rank,
+    expected_peer_world_ranks,
+):
+    connector = _connector(
+        role="ffn",
+        role_rank=ffn_rank,
+        attention=attention_size,
+        ffn=16,
+        max_num_batched_tokens=256,
+    )
+    prepared = []
+    monkeypatch.setattr(
+        connector,
+        "prepare_stage_buffer",
+        lambda stage_idx, num_tokens: prepared.append((stage_idx, num_tokens)),
+    )
+    counts = torch.arange(1, attention_size + 1, dtype=torch.int32)
+    connector.control_plane.update_state_from_dp_metadata(
+        AFDControlPayload(
+            dp_metadata_list={0: AFDDPMetadata(counts)},
+            is_graph_capturing=False,
+            is_warmup=False,
+        ),
+    )
+
+    first_attention_rank = ffn_rank * connector.ratio
+    expected_seq_lens = tuple(
+        range(
+            first_attention_rank + 1,
+            first_attention_rank + connector.ratio + 1,
+        ),
+    )
+    layout = connector.stage_layouts[0]
+    assert layout.peer_ranks == expected_peer_world_ranks
+    assert layout.seq_lens == expected_seq_lens
+    assert layout.num_tokens == sum(expected_seq_lens)
+    assert layout.peer_slices[-1][2] == sum(expected_seq_lens)
+    assert prepared == [(0, sum(expected_seq_lens))]
 
 
 def test_p2p_hccl_mtp_phase_marker_uses_control_sender(monkeypatch):

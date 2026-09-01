@@ -9,6 +9,7 @@ hidden states between the Attention and FFN roles through the AFD connector.
 """
 
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from typing import Any, TypeAlias
 
 import torch
@@ -64,6 +65,16 @@ def _is_moe_layer(config: _DeepseekAdapterConfig, layer_idx: int) -> bool:
 _ATTENTION_ROLE = frozenset(("attention",))
 _FFN_ROLE = frozenset(("ffn",))
 _BOTH_ROLES = frozenset(("attention", "ffn"))
+
+
+@dataclass(frozen=True, slots=True)
+class AFDRemoteFFNTransfer:
+    """One dispatched A2F transfer awaiting its matching F2A receive."""
+
+    connector: Any
+    context: AFDTransferContext
+    stage_idx: int
+    ref_tensor: torch.Tensor
 
 
 def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
@@ -150,12 +161,21 @@ class RemoteFFNProxy(nn.Module):
         hidden_states: torch.Tensor,
         **send_kwargs: torch.Tensor,
     ) -> torch.Tensor:
+        transfer = self.dispatch_remote_ffn(hidden_states, **send_kwargs)
+        return self.receive_remote_ffn(transfer)
+
+    def dispatch_remote_ffn(
+        self,
+        hidden_states: torch.Tensor,
+        **send_kwargs: torch.Tensor,
+    ) -> AFDRemoteFFNTransfer:
+        """Send one remote FFN input without immediately posting its receive."""
         afd_metadata = get_afd_metadata_from_forward_context()
-        forward_context = get_forward_context()
         if afd_metadata is None and (
             self.phase != "mtp" or self._fallback_connector is None
         ):
             raise RuntimeError("RemoteFFNProxy requires AFD forward metadata")
+        forward_context = get_forward_context()
         if afd_metadata is None:
             connector = self._fallback_connector
             stage_idx = 0
@@ -202,12 +222,28 @@ class RemoteFFNProxy(nn.Module):
                 hidden_states,
                 role="attention",
             )
+        return AFDRemoteFFNTransfer(
+            connector=connector,
+            context=context,
+            stage_idx=stage_idx,
+            ref_tensor=hidden_states,
+        )
+
+    def receive_remote_ffn(
+        self,
+        transfer: AFDRemoteFFNTransfer,
+        *,
+        layer_idx: int | None = None,
+    ) -> torch.Tensor:
+        """Receive the F2A result for a previously dispatched transfer."""
         recv_kwargs = {}
         if self.phase != "decoder":
             recv_kwargs["phase"] = self.phase
-        return connector.recv_ffn_output(
-            ref_tensor=hidden_states,
-            ubatch_idx=stage_idx,
+        if layer_idx is not None:
+            recv_kwargs["layer_idx"] = layer_idx
+        return transfer.connector.recv_ffn_output(
+            ref_tensor=transfer.ref_tensor,
+            ubatch_idx=transfer.stage_idx,
             **recv_kwargs,
         )
 
