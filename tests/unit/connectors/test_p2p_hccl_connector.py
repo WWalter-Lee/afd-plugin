@@ -1083,6 +1083,7 @@ def test_p2p_hccl_graph_pipeline_skips_python_state_during_compile(monkeypatch):
 
 
 def test_p2p_hccl_graph_keeps_send_and_receive_on_parent_stream(monkeypatch):
+    monkeypatch.setenv("AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM", "0")
     connector = _connector(role="attention", num_ubatches=2)
     calls = []
     parent_stream = object()
@@ -1163,6 +1164,38 @@ def test_p2p_hccl_graph_keeps_send_and_receive_on_parent_stream(monkeypatch):
     assert output is hidden
     assert connector.pending_attention_transfers == {}
     assert connector.attention_receive_dependencies == {}
+
+
+@pytest.mark.parametrize(
+    ("three_stream_enabled", "expected_side_transport"),
+    [("1", True), ("0", False)],
+)
+def test_p2p_hccl_initializes_configured_attention_graph_stream_plan(
+    monkeypatch,
+    three_stream_enabled,
+    expected_side_transport,
+):
+    monkeypatch.setenv(
+        "AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM",
+        three_stream_enabled,
+    )
+    connector = _connector(role="attention", num_ubatches=2)
+    send_stream = object()
+    recv_stream = object()
+    compute_stream = object()
+    streams = iter((send_stream, recv_stream, compute_stream))
+    monkeypatch.setattr(
+        hccl_module.torch.npu, "Stream", lambda **_kwargs: next(streams)
+    )
+    monkeypatch.setattr(hccl_module.torch.npu, "Event", object)
+
+    connector._initialize_attention_stream_pipeline()
+
+    plan = connector.attention_graph_stream_plan
+    assert plan is not None
+    assert plan.compute_stream is compute_stream
+    assert plan.send_stream is (send_stream if expected_side_transport else None)
+    assert plan.recv_stream is (recv_stream if expected_side_transport else None)
 
 
 def test_attention_graph_stream_plan_decouples_logical_and_physical_streams():
@@ -1334,6 +1367,52 @@ def test_p2p_hccl_rejects_invalid_graph_hybrid_dag_value(monkeypatch):
         match="AFD_HCCL_GRAPH_U2_HYBRID_DAG must be 0 or 1",
     ):
         _connector(role="attention", num_ubatches=2)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM",
+        "AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM",
+        "AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER",
+    ],
+)
+def test_p2p_hccl_rejects_invalid_graph_physical_pipeline_values(
+    monkeypatch,
+    name,
+):
+    monkeypatch.setenv(name, "invalid")
+
+    with pytest.raises(RuntimeError, match=rf"{name} must be 0 or 1"):
+        _connector(role="attention", num_ubatches=2)
+
+
+def test_p2p_hccl_graph_physical_pipeline_defaults_are_disabled(monkeypatch):
+    for name in (
+        "AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM",
+        "AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM",
+        "AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    connector = _connector(role="attention", num_ubatches=2)
+
+    assert connector.graph_u2_attention_three_stream_enabled is False
+    assert connector.graph_u2_ffn_recv_stream_enabled is False
+    assert connector.graph_u2_ffn_cross_layer_enabled is False
+
+
+def test_p2p_hccl_ffn_cross_layer_requires_receive_stream(monkeypatch):
+    monkeypatch.setenv("AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM", "0")
+    monkeypatch.setenv("AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER", "1")
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER=1 requires "
+            "AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM=1"
+        ),
+    ):
+        _connector(role="ffn", num_ubatches=2)
 
 
 def test_p2p_hccl_attention_graph_compute_orders_fork_and_join(monkeypatch):

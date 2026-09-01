@@ -190,8 +190,9 @@ class HCCLAttentionGraphStreamPlan:
     """Map logical Attention Graph work onto physical NPU streams.
 
     A ``None`` communication stream means that operation remains on the parent
-    capture stream. V1 therefore binds only compute to a side stream; a later
-    three-stream implementation can replace the plan without changing the DAG.
+    capture stream. The plan keeps the logical DAG independent from whether
+    Graph communication uses the parent stream or dedicated send/receive
+    streams.
     """
 
     compute_stream: Any
@@ -232,6 +233,9 @@ _MTP_HEADER_MAGIC = 0x4D545031
 _MTP_HEADER_PREFIX_SIZE = 4
 _GRAPH_U2_COMPUTE_OVERLAP_ENV = "AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP"
 _GRAPH_U2_HYBRID_DAG_ENV = "AFD_HCCL_GRAPH_U2_HYBRID_DAG"
+_GRAPH_U2_ATTENTION_THREE_STREAM_ENV = "AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM"
+_GRAPH_U2_FFN_RECV_STREAM_ENV = "AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM"
+_GRAPH_U2_FFN_CROSS_LAYER_ENV = "AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER"
 
 
 def _strict_binary_env_enabled(name: str, *, default: str = "1") -> bool:
@@ -247,6 +251,27 @@ def _graph_u2_compute_overlap_enabled() -> bool:
 
 def _graph_u2_hybrid_dag_enabled() -> bool:
     return _strict_binary_env_enabled(_GRAPH_U2_HYBRID_DAG_ENV)
+
+
+def _graph_u2_attention_three_stream_enabled() -> bool:
+    return _strict_binary_env_enabled(
+        _GRAPH_U2_ATTENTION_THREE_STREAM_ENV,
+        default="0",
+    )
+
+
+def _graph_u2_ffn_recv_stream_enabled() -> bool:
+    return _strict_binary_env_enabled(
+        _GRAPH_U2_FFN_RECV_STREAM_ENV,
+        default="0",
+    )
+
+
+def _graph_u2_ffn_cross_layer_enabled() -> bool:
+    return _strict_binary_env_enabled(
+        _GRAPH_U2_FFN_CROSS_LAYER_ENV,
+        default="0",
+    )
 
 
 class P2pHcclAFDConnector(AFDConnectorBase):
@@ -321,6 +346,19 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         self.stream_overlap_enabled = self.num_stages > 1
         self.graph_u2_compute_overlap_enabled = _graph_u2_compute_overlap_enabled()
         self.graph_u2_hybrid_dag_enabled = _graph_u2_hybrid_dag_enabled()
+        self.graph_u2_attention_three_stream_enabled = (
+            _graph_u2_attention_three_stream_enabled()
+        )
+        self.graph_u2_ffn_recv_stream_enabled = _graph_u2_ffn_recv_stream_enabled()
+        self.graph_u2_ffn_cross_layer_enabled = _graph_u2_ffn_cross_layer_enabled()
+        if (
+            self.graph_u2_ffn_cross_layer_enabled
+            and not self.graph_u2_ffn_recv_stream_enabled
+        ):
+            raise RuntimeError(
+                f"{_GRAPH_U2_FFN_CROSS_LAYER_ENV}=1 requires "
+                f"{_GRAPH_U2_FFN_RECV_STREAM_ENV}=1"
+            )
 
         self.data_pg_list: list[ProcessGroup] = []
         self.ids_pg_list: list[ProcessGroup] = []
@@ -485,8 +523,8 @@ class P2pHcclAFDConnector(AFDConnectorBase):
             # a vLLM model forward context and must retain the synchronous path.
             return False
         graph_ubatching = bool(getattr(forward_context, "afd_graph_ubatching", False))
-        # Graph U2 uses a dedicated receive path below. Keep this eager path
-        # disabled so A2F sends do not move off the parent capture stream.
+        # Graph U2 uses a dedicated path below. Keep this eager pipeline
+        # disabled so the Graph stream plan owns all physical stream mapping.
         if graph_ubatching:
             return False
         return bool(
@@ -510,6 +548,16 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         self.attention_graph_compute_stream = torch.npu.Stream(device=device)
         self.attention_graph_stream_plan = HCCLAttentionGraphStreamPlan(
             compute_stream=self.attention_graph_compute_stream,
+            send_stream=(
+                self.a2f_send_stream
+                if self.graph_u2_attention_three_stream_enabled
+                else None
+            ),
+            recv_stream=(
+                self.f2a_recv_stream
+                if self.graph_u2_attention_three_stream_enabled
+                else None
+            ),
         )
         num_layers = int(self.vllm_config.model_config.hf_config.num_hidden_layers)
         self.attention_pipeline_events = {
@@ -900,8 +948,8 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         tensor: torch.Tensor,
     ) -> None:
         """Make the current compute stream consume one deferred F2A receive."""
-        # Graph U2 keeps F2A receives on the parent stream, so it has no
-        # connector-owned receive event to join here.
+        # Graph U2 owns its receive dependency in attention_graph_events, so
+        # it never consumes eager attention_receive_dependencies here.
         if not self._attention_stream_pipeline_active():
             return
         dependency = self.attention_receive_dependencies.pop(stage_idx, None)

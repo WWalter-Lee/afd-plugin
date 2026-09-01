@@ -449,6 +449,21 @@ def _runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
                     "graph_u2_hybrid_dag",
                     "on",
                 ),
+                "graph_u2_attention_three_stream": getattr(
+                    args,
+                    "graph_u2_attention_three_stream",
+                    "off",
+                ),
+                "graph_u2_ffn_recv_stream": getattr(
+                    args,
+                    "graph_u2_ffn_recv_stream",
+                    "off",
+                ),
+                "graph_u2_ffn_cross_layer": getattr(
+                    args,
+                    "graph_u2_ffn_cross_layer",
+                    "off",
+                ),
             },
             "workload": {
                 "input_len": args.input_len,
@@ -500,6 +515,17 @@ def _set_service_environment(args: argparse.Namespace) -> None:
             ),
             "AFD_HCCL_GRAPH_U2_HYBRID_DAG": (
                 "1" if getattr(args, "graph_u2_hybrid_dag", "on") == "on" else "0"
+            ),
+            "AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM": (
+                "1"
+                if getattr(args, "graph_u2_attention_three_stream", "off") == "on"
+                else "0"
+            ),
+            "AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM": (
+                "1" if getattr(args, "graph_u2_ffn_recv_stream", "off") == "on" else "0"
+            ),
+            "AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER": (
+                "1" if getattr(args, "graph_u2_ffn_cross_layer", "off") == "on" else "0"
             ),
         }
     )
@@ -561,6 +587,13 @@ def _validate_execution_args(args: argparse.Namespace) -> None:
             tensor_parallel_size,
         ),
     )
+    if (
+        getattr(args, "graph_u2_ffn_cross_layer", "off") == "on"
+        and getattr(args, "graph_u2_ffn_recv_stream", "off") != "on"
+    ):
+        raise ValueError(
+            "Graph/U2 FFN cross-layer overlap requires the FFN receive stream"
+        )
 
 
 def _run(args: argparse.Namespace) -> dict[str, Any]:
@@ -804,6 +837,32 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Release each next-layer Attention stage from its own prior-layer "
             "F2A receive. This has no effect when Graph/U2 overlap is off."
+        ),
+    )
+    parser.add_argument(
+        "--graph-u2-attention-three-stream",
+        choices=("on", "off"),
+        default="off",
+        help=(
+            "Experimentally map Attention Graph compute/send/recv to three "
+            "physical streams. Disabled by default after CANN 9.0.0 profiling."
+        ),
+    )
+    parser.add_argument(
+        "--graph-u2-ffn-recv-stream",
+        choices=("on", "off"),
+        default="off",
+        help=(
+            "Experimentally run FFN Graph A2F receives on the dedicated receive stream."
+        ),
+    )
+    parser.add_argument(
+        "--graph-u2-ffn-cross-layer",
+        choices=("on", "off"),
+        default="off",
+        help=(
+            "Release next-layer FFN receives per stage instead of joining both "
+            "stage sends at every layer."
         ),
     )
     parser.add_argument(

@@ -638,6 +638,9 @@ def test_dsv4_performance_defaults_to_validated_sync_scheduler(monkeypatch, tmp_
     assert args.tensor_parallel_size == 1
     assert args.graph_u2_compute_overlap == "on"
     assert args.graph_u2_hybrid_dag == "on"
+    assert args.graph_u2_attention_three_stream == "off"
+    assert args.graph_u2_ffn_recv_stream == "off"
+    assert args.graph_u2_ffn_cross_layer == "off"
 
 
 def test_dsv4_performance_records_graph_u2_overlap_mode(monkeypatch):
@@ -653,6 +656,9 @@ def test_dsv4_performance_records_graph_u2_overlap_mode(monkeypatch):
         tensor_parallel_size=1,
         graph_u2_compute_overlap="off",
         graph_u2_hybrid_dag="off",
+        graph_u2_attention_three_stream="off",
+        graph_u2_ffn_recv_stream="off",
+        graph_u2_ffn_cross_layer="off",
         enable_mtp=False,
         mtp_num_speculative_tokens=1,
         profile=False,
@@ -662,6 +668,26 @@ def test_dsv4_performance_records_graph_u2_overlap_mode(monkeypatch):
 
     assert runner.os.environ["AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP"] == "0"
     assert runner.os.environ["AFD_HCCL_GRAPH_U2_HYBRID_DAG"] == "0"
+    assert runner.os.environ["AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM"] == "0"
+    assert runner.os.environ["AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM"] == "0"
+    assert runner.os.environ["AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER"] == "0"
+
+
+def test_dsv4_performance_requires_ffn_recv_stream_for_cross_layer():
+    runner = _load_performance_runner()
+    args = SimpleNamespace(
+        execution_mode="full-decode-only",
+        u_batches=2,
+        tensor_parallel_size=1,
+        enable_mtp=False,
+        mtp_num_speculative_tokens=1,
+        max_num_batched_tokens=1024,
+        graph_u2_ffn_recv_stream="off",
+        graph_u2_ffn_cross_layer="on",
+    )
+
+    with pytest.raises(ValueError, match="requires the FFN receive stream"):
+        runner._validate_execution_args(args)
 
 
 def test_dsv4_performance_tp2_uses_dp4_topology_and_environment(monkeypatch):
@@ -767,6 +793,9 @@ def test_dsv4_performance_mtp_manifest_preserves_structured_topology(monkeypatch
         async_scheduling="off",
         graph_u2_compute_overlap="on",
         graph_u2_hybrid_dag="off",
+        graph_u2_attention_three_stream="on",
+        graph_u2_ffn_recv_stream="on",
+        graph_u2_ffn_cross_layer="on",
         input_len=1024,
         output_len=128,
         concurrencies=[32],
@@ -802,6 +831,9 @@ def test_dsv4_performance_mtp_manifest_preserves_structured_topology(monkeypatch
     assert graph_u2_manifest["mtp_phase_u_batches"] == 1
     assert graph_u2_manifest["service"]["graph_u2_compute_overlap"] == "on"
     assert graph_u2_manifest["service"]["graph_u2_hybrid_dag"] == "off"
+    assert graph_u2_manifest["service"]["graph_u2_attention_three_stream"] == "on"
+    assert graph_u2_manifest["service"]["graph_u2_ffn_recv_stream"] == "on"
+    assert graph_u2_manifest["service"]["graph_u2_ffn_cross_layer"] == "on"
 
 
 def test_dsv4_performance_detects_exited_service():

@@ -33,8 +33,7 @@ def _token_counts(
 ) -> list[int]:
     dp_size = attention_size // tensor_parallel_size
     dp_counts = [
-        2 + ((step_idx + stage_idx + dp_rank) % 4)
-        for dp_rank in range(dp_size)
+        2 + ((step_idx + stage_idx + dp_rank) % 4) for dp_rank in range(dp_size)
     ]
     return [
         dp_counts[attention_rank // tensor_parallel_size]
@@ -67,9 +66,7 @@ def _mtp_token_counts(
     tensor_parallel_size: int = 1,
 ) -> list[int]:
     dp_size = attention_size // tensor_parallel_size
-    dp_counts = [
-        1 + ((2 * step_idx + dp_rank) % 3) for dp_rank in range(dp_size)
-    ]
+    dp_counts = [1 + ((2 * step_idx + dp_rank) % 3) for dp_rank in range(dp_size)]
     return [
         dp_counts[attention_rank // tensor_parallel_size]
         for attention_rank in range(attention_size)
@@ -180,45 +177,71 @@ def _validate_graph_transport(
     graph = torch.npu.NPUGraph()
     connector.is_graph_capturing = True
     graph_compute_stream = torch.npu.Stream() if multistream else None
+    graph_send_stream = torch.npu.Stream() if multistream else None
+    graph_recv_stream = torch.npu.Stream() if multistream else None
+    graph_ready_events = (
+        {stage_idx: torch.npu.Event() for stage_idx in counts_by_stage}
+        if multistream
+        else None
+    )
     graph_compute_events = (
+        {stage_idx: torch.npu.Event() for stage_idx in counts_by_stage}
+        if multistream
+        else None
+    )
+    graph_send_events = (
         {stage_idx: torch.npu.Event() for stage_idx in counts_by_stage}
         if multistream
         else None
     )
     graph_recv_events = (
         {stage_idx: torch.npu.Event() for stage_idx in counts_by_stage}
-        if multistream and role == "ffn"
+        if multistream
         else None
     )
     with torch.npu.graph(graph, pool=torch.npu.graph_pool_handle()):
         if role == "attention" and multistream:
             assert graph_compute_stream is not None
+            assert graph_send_stream is not None
+            assert graph_recv_stream is not None
+            assert graph_ready_events is not None
             assert graph_compute_events is not None
+            assert graph_send_events is not None
+            assert graph_recv_events is not None
             prepared_hidden = {}
             capture_stream = torch.npu.current_stream()
-            capture_ready = torch.npu.Event()
-            capture_ready.record(capture_stream)
             for stage_idx, hidden in static_hidden.items():
+                ready_event = graph_ready_events[stage_idx]
+                ready_event.record(capture_stream)
                 with torch.npu.stream(graph_compute_stream):
-                    capture_ready.wait(graph_compute_stream)
+                    ready_event.wait(graph_compute_stream)
                     hidden.record_stream(graph_compute_stream)
                     prepared_hidden[stage_idx] = hidden + 0
                     graph_compute_events[stage_idx].record(graph_compute_stream)
             for stage_idx, hidden in prepared_hidden.items():
-                graph_compute_events[stage_idx].wait(capture_stream)
-                context = AFDTransferContext(
-                    metadata=AFDTransferMetadata.create_attention_metadata(
-                        layer_idx=1,
-                        stage_idx=stage_idx,
-                        seq_len=int(hidden.shape[0]),
-                    ),
-                )
-                connector.send_attn_output(hidden, context)
+                with torch.npu.stream(graph_send_stream):
+                    graph_compute_events[stage_idx].wait(graph_send_stream)
+                    hidden.record_stream(graph_send_stream)
+                    context = AFDTransferContext(
+                        metadata=AFDTransferMetadata.create_attention_metadata(
+                            layer_idx=1,
+                            stage_idx=stage_idx,
+                            seq_len=int(hidden.shape[0]),
+                        ),
+                    )
+                    connector.send_attn_output(hidden, context)
+                    graph_send_events[stage_idx].record(graph_send_stream)
             for stage_idx in prepared_hidden:
-                returned_buffers[stage_idx] = connector.recv_ffn_output(
-                    returned_buffers[stage_idx],
-                    ubatch_idx=stage_idx,
-                )
+                with torch.npu.stream(graph_recv_stream):
+                    graph_send_events[stage_idx].wait(graph_recv_stream)
+                    returned_buffers[stage_idx].record_stream(graph_recv_stream)
+                    returned_buffers[stage_idx] = connector.recv_ffn_output(
+                        returned_buffers[stage_idx],
+                        ubatch_idx=stage_idx,
+                    )
+                    graph_recv_events[stage_idx].record(graph_recv_stream)
+            for recv_event in graph_recv_events.values():
+                recv_event.wait(capture_stream)
         elif role == "attention":
             for stage_idx, hidden in static_hidden.items():
                 context = AFDTransferContext(
@@ -235,31 +258,43 @@ def _validate_graph_transport(
                 )
         elif multistream:
             assert graph_compute_stream is not None
+            assert graph_send_stream is not None
+            assert graph_recv_stream is not None
+            assert graph_ready_events is not None
             assert graph_compute_events is not None
+            assert graph_send_events is not None
             assert graph_recv_events is not None
             ffn_outputs = {}
             ffn_contexts = {}
             capture_stream = torch.npu.current_stream()
             for stage_idx in counts_by_stage:
-                payload = connector.recv_attn_output(
-                    ubatch_idx=stage_idx,
-                    layer_idx=1,
-                )
-                recv_done = graph_recv_events[stage_idx]
-                recv_done.record(capture_stream)
+                graph_ready_events[stage_idx].record(capture_stream)
+                with torch.npu.stream(graph_recv_stream):
+                    graph_ready_events[stage_idx].wait(graph_recv_stream)
+                    payload = connector.recv_attn_output(
+                        ubatch_idx=stage_idx,
+                        layer_idx=1,
+                    )
+                    payload.hidden_states.record_stream(graph_recv_stream)
+                    graph_recv_events[stage_idx].record(graph_recv_stream)
                 with torch.npu.stream(graph_compute_stream):
-                    recv_done.wait(graph_compute_stream)
+                    graph_recv_events[stage_idx].wait(graph_compute_stream)
                     payload.hidden_states.record_stream(graph_compute_stream)
                     ffn_outputs[stage_idx] = payload.hidden_states + 1
                     ffn_contexts[stage_idx] = payload.context
                     graph_compute_events[stage_idx].record(graph_compute_stream)
             for stage_idx, ffn_output in ffn_outputs.items():
-                graph_compute_events[stage_idx].wait(capture_stream)
-                connector.send_ffn_output(
-                    ffn_output,
-                    ffn_contexts[stage_idx],
-                    ubatch_idx=stage_idx,
-                )
+                with torch.npu.stream(graph_send_stream):
+                    graph_compute_events[stage_idx].wait(graph_send_stream)
+                    ffn_output.record_stream(graph_send_stream)
+                    connector.send_ffn_output(
+                        ffn_output,
+                        ffn_contexts[stage_idx],
+                        ubatch_idx=stage_idx,
+                    )
+                    graph_send_events[stage_idx].record(graph_send_stream)
+            for send_event in graph_send_events.values():
+                send_event.wait(capture_stream)
         else:
             for stage_idx in counts_by_stage:
                 payload = connector.recv_attn_output(
@@ -285,6 +320,9 @@ def _validate_graph_transport(
                     "tokens": int(hidden.shape[0]),
                     "captured": True,
                     "multistream": multistream,
+                    "physical_streams": (
+                        ["recv", "compute", "send"] if multistream else ["parent"]
+                    ),
                 }
             )
     else:
@@ -318,6 +356,9 @@ def _validate_graph_transport(
                     "input_ids_external": True,
                     "fan_in_out": True,
                     "multistream": multistream,
+                    "physical_streams": (
+                        ["recv", "compute", "send"] if multistream else ["parent"]
+                    ),
                 }
             )
 
@@ -332,9 +373,11 @@ def _validate_graph_transport(
                 )
             )
     dist.barrier(group=connector.p2p_pg)
-    graph.replay()
-    torch.npu.synchronize()
-    dist.barrier(group=connector.p2p_pg)
+    replay_count = 100 if multistream else 1
+    for _ in range(replay_count):
+        graph.replay()
+        torch.npu.synchronize()
+        dist.barrier(group=connector.p2p_pg)
 
     if role == "attention":
         for stage_idx, hidden in static_hidden.items():
@@ -347,6 +390,7 @@ def _validate_graph_transport(
                 {
                     "phase": "graph_replay",
                     "stage": stage_idx,
+                    "replays": replay_count,
                     "tokens": int(hidden.shape[0]),
                     "updated_input": True,
                     "roundtrip": True,
@@ -357,6 +401,7 @@ def _validate_graph_transport(
             {
                 "phase": "graph_replay",
                 "stages": stages,
+                "replays": replay_count,
                 "fan_in_out": True,
             }
         )
@@ -513,8 +558,7 @@ def _validate_mtp_graph_transport(
             {
                 "phase": "mtp_graph_capture",
                 "peer_tokens": attention_peer_counts[
-                    role_rank * connector.ratio :
-                    (role_rank + 1) * connector.ratio
+                    role_rank * connector.ratio : (role_rank + 1) * connector.ratio
                 ],
                 "header_fan_in": True,
                 "captured": True,
@@ -530,9 +574,7 @@ def _validate_mtp_graph_transport(
         assert static_hidden is not None
         assert returned_buffer is not None
         if not torch.equal(returned_buffer.cpu(), (static_hidden + 2).cpu()):
-            raise AssertionError(
-                f"MTP graph replay mismatch for attention={role_rank}"
-            )
+            raise AssertionError(f"MTP graph replay mismatch for attention={role_rank}")
         checks.append(
             {
                 "phase": "mtp_graph_replay",

@@ -2344,19 +2344,35 @@ def test_npu_ffn_runner_computes_stage_token_layout_once_per_step(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("is_graph_capturing", "graph_runtime", "graph_overlap_enabled"),
+    (
+        "is_graph_capturing",
+        "graph_runtime",
+        "graph_overlap_enabled",
+        "graph_recv_enabled",
+        "graph_cross_layer_enabled",
+    ),
     [
-        (False, False, True),
-        (True, True, True),
-        (True, True, False),
+        (False, False, True, True, True),
+        (True, True, True, True, True),
+        (True, True, True, True, False),
+        (True, True, True, False, False),
+        (True, True, False, True, True),
     ],
-    ids=["eager", "graph-capture-overlap", "graph-capture-baseline"],
+    ids=[
+        "eager",
+        "graph-full-pipeline",
+        "graph-recv-layer-barrier",
+        "graph-parent-recv-layer-barrier",
+        "graph-capture-baseline",
+    ],
 )
 def test_npu_ffn_runner_stream_pipeline_orders_each_layer_and_stage(
     monkeypatch,
     is_graph_capturing,
     graph_runtime,
     graph_overlap_enabled,
+    graph_recv_enabled,
+    graph_cross_layer_enabled,
 ):
     _require_npu_runtime()
     from vllm.config import CUDAGraphMode
@@ -2394,7 +2410,7 @@ def test_npu_ffn_runner_stream_pipeline_orders_each_layer_and_stage(
         stream_overlap_enabled = True
 
         def recv_attn_output(self, *, ubatch_idx, **kwargs):
-            if is_graph_capturing:
+            if is_graph_capturing and active_stream[0] is not recv_stream:
                 calls.append(
                     (
                         "recv",
@@ -2412,8 +2428,7 @@ def test_npu_ffn_runner_stream_pipeline_orders_each_layer_and_stage(
                         "send",
                         context.metadata.layer_idx,
                         ubatch_idx,
-                        active_stream[0]
-                        or ffn_model_runner.torch.npu.current_stream(),
+                        active_stream[0] or ffn_model_runner.torch.npu.current_stream(),
                     )
                 )
             return super().send_ffn_output(
@@ -2488,6 +2503,8 @@ def test_npu_ffn_runner_stream_pipeline_orders_each_layer_and_stage(
     )
     runner.connector = StreamConnector(attn_size=2, ffn_size=2)
     runner.connector.graph_u2_compute_overlap_enabled = graph_overlap_enabled
+    runner.connector.graph_u2_ffn_recv_stream_enabled = graph_recv_enabled
+    runner.connector.graph_u2_ffn_cross_layer_enabled = graph_cross_layer_enabled
     runner.model = StreamModel()
     runner.num_layers = 2
     runner.max_num_tokens = 2
@@ -2495,6 +2512,7 @@ def test_npu_ffn_runner_stream_pipeline_orders_each_layer_and_stage(
     runner.ffn_recv_stream = recv_stream
     runner.ffn_compute_stream = compute_stream
     runner.ffn_send_stream = send_stream
+    runner.ffn_graph_recv_ready_event = FakeEvent("graph-recv-ready")
     event_keys = [
         (layer_idx, stage_idx) for layer_idx in range(2) for stage_idx in range(2)
     ]
@@ -2536,7 +2554,12 @@ def test_npu_ffn_runner_stream_pipeline_orders_each_layer_and_stage(
                 "recv",
                 layer_idx,
                 stage_idx,
-                default_stream if is_graph_capturing else recv_stream,
+                (
+                    recv_stream
+                    if not is_graph_capturing
+                    or (graph_overlap_enabled and graph_recv_enabled)
+                    else default_stream
+                ),
             )
             expected_compute_stream = (
                 compute_stream
@@ -2557,13 +2580,24 @@ def test_npu_ffn_runner_stream_pipeline_orders_each_layer_and_stage(
             )
             assert calls.index(recv_marker) < calls.index(compute_marker)
             assert calls.index(compute_marker) < calls.index(send_marker)
-            if layer_idx > 0 and not is_graph_capturing:
+            if layer_idx > 0 and (
+                not is_graph_capturing or (graph_overlap_enabled and graph_recv_enabled)
+            ):
                 previous_send_wait = (
                     f"send-{layer_idx - 1}-{stage_idx}",
                     "wait",
                     recv_stream,
                 )
                 assert calls.index(previous_send_wait) < calls.index(recv_marker)
+            if (
+                layer_idx == 0
+                and is_graph_capturing
+                and graph_overlap_enabled
+                and graph_recv_enabled
+            ):
+                assert calls.index(
+                    ("graph-recv-ready", "wait", recv_stream)
+                ) < calls.index(recv_marker)
             if is_graph_capturing and graph_overlap_enabled:
                 compute_wait = (
                     f"compute-{layer_idx}-{stage_idx}",
@@ -2598,18 +2632,30 @@ def test_npu_ffn_runner_stream_pipeline_orders_each_layer_and_stage(
                 for op in ("recv", "compute", "send")
             ]
         if graph_overlap_enabled:
-            for layer_idx in range(2):
+            cross_layer_active = graph_recv_enabled and graph_cross_layer_enabled
+            joined_layers = (1,) if cross_layer_active else (0, 1)
+            for layer_idx in joined_layers:
                 for stage_idx in range(2):
                     assert (
                         f"send-{layer_idx}-{stage_idx}",
                         "wait",
                         default_stream,
                     ) in calls
-                assert calls.index(
-                    ("recv", layer_idx, 1, default_stream)
-                ) < calls.index(
-                    (f"send-{layer_idx}-0", "wait", default_stream)
-                )
+            if cross_layer_active:
+                for stage_idx in range(2):
+                    assert (
+                        f"send-0-{stage_idx}",
+                        "wait",
+                        default_stream,
+                    ) not in calls
+            else:
+                for layer_idx in range(2):
+                    recv_stream_for_layer = (
+                        recv_stream if graph_recv_enabled else default_stream
+                    )
+                    assert calls.index(
+                        ("recv", layer_idx, 1, recv_stream_for_layer)
+                    ) < calls.index((f"send-{layer_idx}-0", "wait", default_stream))
     else:
         assert ("send-1-0", "wait", default_stream) in calls
         assert ("send-1-1", "wait", default_stream) in calls

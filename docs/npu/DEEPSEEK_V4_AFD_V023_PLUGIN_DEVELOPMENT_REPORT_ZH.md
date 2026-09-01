@@ -289,6 +289,125 @@ Attention 正常 shutdown 后 CANN 9.0.0 TBE 队列线程产生 `EOFError`，使
 /mnt/workspace/validation/dsv4_afd_v023_cann900_hccl_graph_u2_hybrid_on_c32_profile_20260831_codex1
 ```
 
+### 2.8 2026-09-01 逻辑 DAG 与三项物理流水验证
+
+混合 DAG 基线先以 `891e794`（`feat(npu): optimize Graph U2 hybrid pipeline`）独立
+提交，随后在同一基线上实现三个不改变 wire protocol 的实验开关：
+
+| 开关 | 物理映射或依赖变化 | 默认值 |
+|---|---|---|
+| `AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM` | Attention Graph 的 compute/send/recv 分别映射到独立工作流 | `0` |
+| `AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM` | FFN Graph 的 A2F receive 从 parent 移到既有 recv stream | `0` |
+| `AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER` | `send(L,S)` 只解锁同 stage 的 `recv(L+1,S)`，取消逐层双 stage send join | `0` |
+
+对应 recipe 参数为 `--graph-u2-attention-three-stream`、
+`--graph-u2-ffn-recv-stream` 和 `--graph-u2-ffn-cross-layer`。FFN cross-layer 依赖独立
+recv stream；非法的 `cross-layer=on, recv-stream=off` 会 fail-fast。三项都默认关闭不是
+功能未完成，而是本节 CANN 9.0.0 性能门禁的结论。
+
+Attention 逻辑 DAG 没有因物理流实验而改变。三流开启时，每个 stage 的依赖为：
+
+```text
+parent:  record ready ........................................ join final compute
+compute:       wait ready/recv(L-1,S) -> A compute(L,S) -> compute_done
+send:                                      wait -> A2F send -> send_done
+recv:                                                        wait -> F2A recv -> recv_done
+```
+
+FFN 两项开启时，recv/compute/send 分别运行在既有独立流上。layer 0 由 parent 的 ready
+event 接入 capture tree；后续 layer 只等待同 stage 上一层 send，避免复用 receive buffer：
+
+```text
+recv:    parent-ready -> A2F recv(L,S) -> recv_done
+compute:                    wait -> FFN compute(L,S) -> compute_done
+send:                                               wait -> F2A send(L,S) -> send_done
+recv L+1:                                                     wait same-stage send -> ...
+parent:                                                       join final-layer sends
+```
+
+这里“跨 layer”不是 FFN 主动产生输入，而是把下一层阻塞式 receive 提前排入 Graph；它仍
+必须等待 Attention 真正发送数据。逻辑 DAG 持有 event 依赖，物理 stream plan 只决定节点
+落在哪条流，因此可以在同一源码中恢复 V1 parent 通信映射做公平对照。
+
+#### 2.8.1 功能与生命周期门禁
+
+最小 A1F1 HCCL Graph component 同时启用两侧独立 recv/compute/send 流，连续 replay
+100 次通过；两侧 summary 均记录三条物理工作流、正确 roundtrip 和 capture closure。初版
+曾因 FFN recv stream 缺少 parent fork 卡在 pending HCCL capture；修复为 capture 开始时
+由 parent 记录 `ffn_graph_recv_ready_event`，layer 0 recv 等待该 event 后，3 次和 100 次
+回放都通过。
+
+A8F8/TP1 实模 smoke 使用 CANN 9.0.0、`FULL_DECODE_ONLY`、Graph/U2、三项全开，完成
+Graph capture/replay、warmup 和 8/8 正式请求；`observed_two_stages=true`，fatal log、
+双侧 shutdown、NPU monitor 和 cleanup gate 全部通过。组件与实模证据目录：
+
+```text
+/mnt/workspace/validation/dsv4_afd_v023_cann900_graph_u2_full_multistream_component_r100_20260901_codex1
+/mnt/workspace/validation/dsv4_afd_v023_cann900_graph_u2_full_pipeline_smoke_c8_20260901_codex1
+```
+
+#### 2.8.2 C32 消融与默认策略
+
+正式对照固定同一代码、CANN 9.0.0、A8F8/TP1、Graph/U2、MTP off、async scheduling
+off、input 1024、output 128、每轮 128 请求。V1 对照保持混合 DAG 与 side compute 开启，
+只关闭本节三个新开关。
+
+| 配置 | throughput，token/s | 均值 | CV | 相对 V1 | 口径 |
+|---|---|---:|---:|---:|---|
+| V1：Attention parent 通信，FFN parent recv/逐层 join | 151.352 / 144.606 / 150.502 | 148.820 | 2.016% | 基线 | 三轮 |
+| 三项全开 | 127.649 / 138.108 / 138.731 | 134.829 | 3.770% | -9.401% | 三轮 |
+| Attention 三流 only | 118.003 | 118.003 | - | -20.707% | 单轮筛选 |
+| FFN recv only，逐层 join | 136.082 | 136.082 | - | -8.559% | 单轮筛选 |
+| FFN recv + cross-layer | 136.438 / 130.110 / 131.586 | 132.711 | 2.037% | -10.824% | 三轮 |
+
+FFN recv + cross-layer 的先行单轮曾得到 `152.447 token/s`（相对基线 `+2.437%`），但
+正式三轮没有复现，不能选择性报告该单轮为收益。上述 1152/1152 个三轮正式请求全部
+成功，所有组的 U2、fatal log、shutdown 和 cleanup gate 均通过。结论是三项能力功能
+闭环，但当前 CANN/HCCL 栈下增加通信流会引入资源争用和调度成本；最终默认保持三项
+关闭，只允许显式实验开启，不能用“流水数量更多”替代端到端吞吐门禁。
+
+正式三轮和筛选证据目录：
+
+```text
+/mnt/workspace/validation/dsv4_afd_v023_cann900_graph_u2_streams_off_c32_r3_20260901_codex1
+/mnt/workspace/validation/dsv4_afd_v023_cann900_graph_u2_all_streams_on_c32_r3_20260901_codex1
+/mnt/workspace/validation/dsv4_afd_v023_cann900_graph_u2_attention_three_stream_only_c32_r1_20260901_codex1
+/mnt/workspace/validation/dsv4_afd_v023_cann900_graph_u2_ffn_recv_only_c32_r1_20260901_codex1
+/mnt/workspace/validation/dsv4_afd_v023_cann900_graph_u2_ffn_recv_cross_layer_c32_r3_20260901_codex1
+```
+
+#### 2.8.3 双侧 profile
+
+三项全开 profile 使用 CANN 9.0.0，Attention/FFN DP0 各采
+`skip_first=64, wait=2, warmup=1, active=20, repeat=1`，`with_stack=false`。128/128
+请求成功，双侧 raw/profile/log/cleanup gate 通过，并由同一 CANN 9.0.0 的
+`torch_npu.profiler.analyse` 串行生成非空 `step_trace_time.csv`、`kernel_details.csv`、
+`communication.json`、`trace_view.json` 和数据库。
+
+Attention DP0 的 20 个 step 均值与 2.7.1 节 V1 hybrid-on profile 对比如下：
+
+| Attention DP0 指标，20-step 均值 | V1 | 三项全开 | 变化 |
+|---|---:|---:|---:|
+| Computing | 38.836 ms | 39.075 ms | +0.616% |
+| Communication(Not Overlapped) | 11.758 ms | 4.140 ms | -64.788% |
+| Communication | 41.900 ms | 33.138 ms | -20.912% |
+| Overlapped / Communication | 71.939% | 87.507% | +15.568 pp |
+| Stage | 37.491 ms | 35.580 ms | -5.098% |
+| Bubble | 47.002 ms | 32.090 ms | -31.725% |
+
+因此新 stream 确实增加了 Attention 设备端重叠，回退不能归因于“流水没有执行”。但
+FFN active step 边界仍与 Attention 错位：20 行中只有 step 67-73 有非零 compute，
+step 74-86 主要是跨请求 receive/Preparing，不能把 FFN 20-row aggregate 与 Attention
+相加。结合端到端三轮，当前可辩护的结论是局部 Attention 时间线改善被 FFN/全局 HCCL
+资源争用和额外 stream/event 调度抵消；若继续优化，必须先修正双侧同窗口 step 标记，
+再针对 FFN receive wait 和 HCCL AICPU 队列做归因，不能直接默认全开。
+
+profile 证据目录：
+
+```text
+/mnt/workspace/validation/dsv4_afd_v023_cann900_graph_u2_all_streams_on_c32_profile_20260901_codex1
+```
+
 ## 3. 工程底座：vLLM 0.23 和 plugin 兼容边界
 
 ### 3.1 问题背景
@@ -1636,11 +1755,11 @@ non-overlap communication 降低 `50.118%`。该结果可以证明调度机制�
   双 stage、生命周期和 NPU 清理 smoke。
 - [x] 混合 DAG 完成同源码 `--graph-u2-hybrid-dag on/off` C32 三轮对照和 Attention/FFN
   DP0 双侧 profile；两组 CV 通过，Attention 时间线验证目标 overlap。
-- [ ] 混合 DAG 继续完成最小 Graph component、A1F1 连续 capture/replay 和 A8F8 完整 F0。
-- [ ] 在最小 HCCL Graph component 中验证独立 send stream + compute event；连续
-  capture/replay 100 次无 pending work 后再接入 connector。
-- [ ] 若 side-stream HCCL 仍不能稳定 capture，将 U2 拆为两个 compute Graph segment，
-  HCCL 留在 Graph 外调度。
+- [x] 混合 DAG 三项物理流水完成最小 Graph component 100 次 replay、A8F8 实模 smoke、
+  同源码 C32 消融和双侧 CANN 9.0.0 profile；功能通过但正式吞吐回退，三项默认关闭。
+- [ ] 混合 DAG 继续完成 A1F1 实模连续 capture/replay 和 A8F8 完整 F0。
+- [ ] 修正 A/F 双侧同窗口 step 标记，定位 FFN receive wait 与 HCCL AICPU 队列争用后，
+  再决定是否继续 side-stream HCCL 或把 HCCL 留在 Graph 外调度。
 - [ ] MTP on/off 三轮公平对照。
 - [ ] 同预算 native Graph 对照和 `tokens/s/NPU`。
 - [ ] A/F 双侧同窗口 profile，报告 compute、non-overlap communication、Free、Bubble 和等待分布。
@@ -1687,6 +1806,7 @@ non-overlap communication 降低 `50.118%`。该结果可以证明调度机制�
 | `436eed65` | TP2 |
 | `e7c6da77` | Mooncake PD 首个实现 |
 | `49bb4a1d` | HCCL P2P recipe 隔离 |
+| `891e794` | Graph/U2 混合 DAG 与逻辑/物理 stream 解耦基线 |
 
 ### 13.2 冻结 tag
 

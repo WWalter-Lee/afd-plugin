@@ -97,6 +97,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self.ffn_recv_events: dict[tuple[int, int], Any] = {}
         self.ffn_compute_events: dict[tuple[int, int], Any] = {}
         self.ffn_send_events: dict[tuple[int, int], Any] = {}
+        self.ffn_graph_recv_ready_event = None
         if self.ffn_stream_overlap_enabled:
             self._initialize_ffn_stream_pipeline(device)
         self.use_aclgraph = _use_npu_aclgraph(vllm_config, self)
@@ -124,6 +125,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self.ffn_recv_events = {key: torch.npu.Event() for key in event_keys}
         self.ffn_compute_events = {key: torch.npu.Event() for key in event_keys}
         self.ffn_send_events = {key: torch.npu.Event() for key in event_keys}
+        self.ffn_graph_recv_ready_event = torch.npu.Event()
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
@@ -405,8 +407,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             fallback=int(self.max_num_tokens),
         )
         capture_sizes = tuple(
-            int(size)
-            for size in getattr(self, "cudagraph_batch_sizes", ())
+            int(size) for size in getattr(self, "cudagraph_batch_sizes", ())
         )
         if capture_sizes:
             # Attention dispatches each DP rank to the smallest captured batch
@@ -539,13 +540,34 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             and not graph_stream_overlap
             and aclgraph_runtime_mode in (None, CUDAGraphMode.NONE)
         )
+        graph_recv_stream_overlap = bool(
+            graph_stream_overlap
+            and getattr(
+                self.connector,
+                "graph_u2_ffn_recv_stream_enabled",
+                False,
+            )
+        )
+        graph_cross_layer_overlap = bool(
+            graph_recv_stream_overlap
+            and getattr(
+                self.connector,
+                "graph_u2_ffn_cross_layer_enabled",
+                False,
+            )
+        )
         compute_stream_overlap = graph_stream_overlap or eager_stream_overlap
         if compute_stream_overlap:
             assert isinstance(self.connector, P2pHcclAFDConnector)
             assert self.ffn_compute_stream is not None
             assert self.ffn_send_stream is not None
-        if eager_stream_overlap:
+        if eager_stream_overlap or graph_recv_stream_overlap:
             assert self.ffn_recv_stream is not None
+        graph_recv_ready_event = None
+        if graph_recv_stream_overlap:
+            graph_recv_ready_event = self.ffn_graph_recv_ready_event
+            assert graph_recv_ready_event is not None
+            graph_recv_ready_event.record(torch.npu.current_stream())
         try:
             for layer_idx in layer_indices:
                 graph_pending_send_events: list[Any] = []
@@ -556,11 +578,11 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                         else None
                     )
                     recv_event = None
-                    if eager_stream_overlap:
+                    if eager_stream_overlap or graph_recv_stream_overlap:
                         previous_send_event = (
                             self.ffn_send_events[(layer_idx - 1, stage_idx)]
                             if layer_idx > 0
-                            else None
+                            else graph_recv_ready_event
                         )
                         recv_event = self.ffn_recv_events[(layer_idx, stage_idx)]
                         payload, recv_event = self.connector.recv_attn_output_streamed(
@@ -656,11 +678,11 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                                 context,
                                 stage_idx=stage_idx,
                             )
-                if graph_pending_send_events:
+                if graph_pending_send_events and not graph_cross_layer_overlap:
                     current_stream = torch.npu.current_stream()
                     for send_event in graph_pending_send_events:
                         send_event.wait(current_stream)
-            if eager_stream_overlap:
+            if eager_stream_overlap or graph_cross_layer_overlap:
                 current_stream = torch.npu.current_stream()
                 final_layer_idx = layer_indices[-1]
                 for stage_idx in stage_ids:
@@ -819,8 +841,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         existing_graph_info = getattr(self, "_acl_graphs", {}).get(graph_key)
         if not is_warmup and existing_graph_info is not None:
             logger.debug(
-                "AFD NPU FFN replaying existing graph during duplicate "
-                "capture; key=%s",
+                "AFD NPU FFN replaying existing graph during duplicate capture; key=%s",
                 graph_key,
             )
             existing_graph_info["graph"].replay()
