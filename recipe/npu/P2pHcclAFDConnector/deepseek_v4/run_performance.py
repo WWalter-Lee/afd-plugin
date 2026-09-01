@@ -452,17 +452,17 @@ def _runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
                 "graph_u2_attention_three_stream": getattr(
                     args,
                     "graph_u2_attention_three_stream",
-                    "off",
+                    "on",
                 ),
                 "graph_u2_ffn_recv_stream": getattr(
                     args,
                     "graph_u2_ffn_recv_stream",
-                    "off",
+                    "on",
                 ),
                 "graph_u2_ffn_cross_layer": getattr(
                     args,
                     "graph_u2_ffn_cross_layer",
-                    "off",
+                    "on",
                 ),
             },
             "workload": {
@@ -518,14 +518,14 @@ def _set_service_environment(args: argparse.Namespace) -> None:
             ),
             "AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM": (
                 "1"
-                if getattr(args, "graph_u2_attention_three_stream", "off") == "on"
+                if getattr(args, "graph_u2_attention_three_stream", "on") == "on"
                 else "0"
             ),
             "AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM": (
-                "1" if getattr(args, "graph_u2_ffn_recv_stream", "off") == "on" else "0"
+                "1" if getattr(args, "graph_u2_ffn_recv_stream", "on") == "on" else "0"
             ),
             "AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER": (
-                "1" if getattr(args, "graph_u2_ffn_cross_layer", "off") == "on" else "0"
+                "1" if getattr(args, "graph_u2_ffn_cross_layer", "on") == "on" else "0"
             ),
         }
     )
@@ -588,8 +588,8 @@ def _validate_execution_args(args: argparse.Namespace) -> None:
         ),
     )
     if (
-        getattr(args, "graph_u2_ffn_cross_layer", "off") == "on"
-        and getattr(args, "graph_u2_ffn_recv_stream", "off") != "on"
+        getattr(args, "graph_u2_ffn_cross_layer", "on") == "on"
+        and getattr(args, "graph_u2_ffn_recv_stream", "on") != "on"
     ):
         raise ValueError(
             "Graph/U2 FFN cross-layer overlap requires the FFN receive stream"
@@ -842,27 +842,28 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--graph-u2-attention-three-stream",
         choices=("on", "off"),
-        default="off",
+        default="on",
         help=(
             "Experimentally map Attention Graph compute/send/recv to three "
-            "physical streams. Disabled by default after CANN 9.0.0 profiling."
+            "physical streams. Enabled by default on this validation branch."
         ),
     )
     parser.add_argument(
         "--graph-u2-ffn-recv-stream",
         choices=("on", "off"),
-        default="off",
+        default="on",
         help=(
-            "Experimentally run FFN Graph A2F receives on the dedicated receive stream."
+            "Experimentally run FFN Graph A2F receives on the dedicated receive "
+            "stream. Enabled by default on this validation branch."
         ),
     )
     parser.add_argument(
         "--graph-u2-ffn-cross-layer",
         choices=("on", "off"),
-        default="off",
+        default="on",
         help=(
             "Release next-layer FFN receives per stage instead of joining both "
-            "stage sends at every layer."
+            "stage sends at every layer. Enabled by default on this validation branch."
         ),
     )
     parser.add_argument(

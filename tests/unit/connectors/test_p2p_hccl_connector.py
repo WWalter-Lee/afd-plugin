@@ -1387,7 +1387,7 @@ def test_p2p_hccl_rejects_invalid_graph_physical_pipeline_values(
         _connector(role="attention", num_ubatches=2)
 
 
-def test_p2p_hccl_graph_physical_pipeline_defaults_are_disabled(monkeypatch):
+def test_p2p_hccl_graph_physical_pipeline_defaults_are_enabled(monkeypatch):
     for name in (
         "AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM",
         "AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM",
@@ -1396,9 +1396,9 @@ def test_p2p_hccl_graph_physical_pipeline_defaults_are_disabled(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     connector = _connector(role="attention", num_ubatches=2)
 
-    assert connector.graph_u2_attention_three_stream_enabled is False
-    assert connector.graph_u2_ffn_recv_stream_enabled is False
-    assert connector.graph_u2_ffn_cross_layer_enabled is False
+    assert connector.graph_u2_attention_three_stream_enabled is True
+    assert connector.graph_u2_ffn_recv_stream_enabled is True
+    assert connector.graph_u2_ffn_cross_layer_enabled is True
 
 
 def test_p2p_hccl_ffn_cross_layer_requires_receive_stream(monkeypatch):

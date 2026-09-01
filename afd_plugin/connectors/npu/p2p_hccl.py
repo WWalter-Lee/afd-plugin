@@ -256,21 +256,21 @@ def _graph_u2_hybrid_dag_enabled() -> bool:
 def _graph_u2_attention_three_stream_enabled() -> bool:
     return _strict_binary_env_enabled(
         _GRAPH_U2_ATTENTION_THREE_STREAM_ENV,
-        default="0",
+        default="1",
     )
 
 
 def _graph_u2_ffn_recv_stream_enabled() -> bool:
     return _strict_binary_env_enabled(
         _GRAPH_U2_FFN_RECV_STREAM_ENV,
-        default="0",
+        default="1",
     )
 
 
 def _graph_u2_ffn_cross_layer_enabled() -> bool:
     return _strict_binary_env_enabled(
         _GRAPH_U2_FFN_CROSS_LAYER_ENV,
-        default="0",
+        default="1",
     )
 
 

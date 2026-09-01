@@ -638,9 +638,9 @@ def test_dsv4_performance_defaults_to_validated_sync_scheduler(monkeypatch, tmp_
     assert args.tensor_parallel_size == 1
     assert args.graph_u2_compute_overlap == "on"
     assert args.graph_u2_hybrid_dag == "on"
-    assert args.graph_u2_attention_three_stream == "off"
-    assert args.graph_u2_ffn_recv_stream == "off"
-    assert args.graph_u2_ffn_cross_layer == "off"
+    assert args.graph_u2_attention_three_stream == "on"
+    assert args.graph_u2_ffn_recv_stream == "on"
+    assert args.graph_u2_ffn_cross_layer == "on"
 
 
 def test_dsv4_performance_records_graph_u2_overlap_mode(monkeypatch):
