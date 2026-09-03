@@ -126,11 +126,27 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
 
+        self.vllm_config = vllm_config
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_idx = int(prefix.split(sep=".")[-1])
         self.norm_eps = config.rms_norm_eps
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+        routed_experts = getattr(config, "n_routed_experts", None)
+        # DSV4's native definition is MoE in every decoder layer.  It does
+        # not use DSV2's optional dense-prefix fields, so those fields must
+        # not be consulted when the model type is DSV4.
+        if getattr(config, "model_type", None) == "deepseek_v4":
+            self.is_moe_layer = routed_experts is not None
+        else:
+            moe_layer_freq = max(1, int(getattr(config, "moe_layer_freq", 1)))
+            self.is_moe_layer = (
+                routed_experts is not None
+                and self.layer_idx >= int(getattr(config, "first_k_dense_replace", 0))
+                and self.layer_idx % moe_layer_freq == 0
+            )
+        self.compute_gate_on_attention = bool(afd_config.compute_gate_on_attention)
+        self.top_k = int(getattr(config, "num_experts_per_tok", 1))
 
         if self.afd_role == "attention":
             max_position_embeddings = config.rope_parameters[
@@ -146,10 +162,50 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
             )
-            self.mlp = AFDDeepseekV4RemoteMoEProxy(
-                layer_idx=self.layer_idx,
-                phase="mtp" if is_draft_layer else "decoder",
-            )
+            if self.is_moe_layer:
+                self.mlp = AFDDeepseekV4RemoteMoEProxy(
+                    layer_idx=self.layer_idx,
+                    phase="mtp" if is_draft_layer else "decoder",
+                )
+            else:
+                self.mlp = native.DeepseekV2MLP(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=config.intermediate_size,
+                    hidden_act=config.hidden_act,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.ffn",
+                )
+            if self.compute_gate_on_attention and self.is_moe_layer:
+                # Keep the native DSV4 checkpoint namespace (mlp.gate) even
+                # though this proxy executes the gate on the Attention role.
+                self.mlp.gate = native.ReplicatedLinear(
+                    config.hidden_size,
+                    config.n_routed_experts,
+                    bias=False,
+                    quant_config=None,
+                    prefix=f"{prefix}.mlp.gate",
+                )
+                self.mlp.gate.precast_fp32_weight = True
+                self.mlp.gate.e_score_correction_bias = nn.Parameter(
+                    torch.empty(config.n_routed_experts, dtype=torch.float32),
+                )
+                num_hash_layers = int(getattr(config, "num_hash_layers", 0))
+                if self.layer_idx < num_hash_layers and not is_draft_layer:
+                    # Native DSV4 uses a token-id -> expert-id table for the
+                    # hash-routing prefix.  Keep the same parameter on the
+                    # Attention-side gate so checkpoint loading and routing
+                    # follow the native contract.
+                    self.mlp.gate.tid2eid = nn.Parameter(
+                        torch.zeros(
+                            config.vocab_size,
+                            self.top_k,
+                            dtype=torch.int32,
+                        ),
+                        requires_grad=False,
+                    )
+                    self.mlp.gate.e_score_correction_bias = None
+                else:
+                    self.mlp.gate.tid2eid = None
             self.input_layernorm = native.RMSNorm(
                 config.hidden_size,
                 eps=self.norm_eps,
@@ -311,7 +367,28 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
     ) -> AFDRemoteFFNTransfer:
         if not isinstance(self.mlp, AFDDeepseekV4RemoteMoEProxy):
             raise RuntimeError("DSV4 Attention layer requires its remote MoE proxy")
-        return self.mlp.dispatch_remote_ffn(hidden_states)
+        send_kwargs: dict[str, torch.Tensor] = {}
+        if self.compute_gate_on_attention:
+            from afd_plugin.model_executor.models.npu.deepseek_v2_attention_gate import (
+                compute_gate_topk,
+            )
+
+            topk_weights, topk_ids, _ = compute_gate_topk(
+                gate=self.mlp.gate,
+                vllm_config=self.vllm_config,
+                config=self.config,
+                top_k=self.top_k,
+                hidden_states=hidden_states,
+                input_ids=(
+                    getattr(get_forward_context(), "input_ids", None)
+                    if self.layer_idx < int(getattr(self.config, "num_hash_layers", 0))
+                    else None
+                ),
+                tid2eid=getattr(self.mlp.gate, "tid2eid", None),
+            )
+            send_kwargs["expert_ids"] = topk_ids
+            send_kwargs["expert_scales"] = topk_weights
+        return self.mlp.dispatch_remote_ffn(hidden_states, **send_kwargs)
 
     def receive_remote_ffn(
         self,
@@ -335,9 +412,31 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
         hidden_states: torch.Tensor,
         *,
         input_ids: torch.Tensor | None = None,
+        group_list: torch.Tensor | None = None,
+        dynamic_scales: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         if self.afd_role != "ffn":
             raise RuntimeError("DSV4 Attention role does not own local MoE weights")
+        if self.compute_gate_on_attention and self.is_moe_layer:
+            if group_list is None:
+                raise RuntimeError("DSV4 Window FFN requires group_list from batching")
+            from afd_plugin.model_executor.models.npu.deepseek_v2_attention_gate import (
+                compute_attention_gate_moe_ffn,
+            )
+
+            output = compute_attention_gate_moe_ffn(
+                self,
+                hidden_states=hidden_states,
+                group_list=group_list,
+                dynamic_scales=dynamic_scales,
+                expand_x_shared=kwargs.get("expand_x_shared"),
+                dynamic_scales_shared=kwargs.get("dynamic_scales_shared"),
+                topk_scales=kwargs.get("topk_scales"),
+                group_list_type=int(kwargs.get("group_list_type", 1)),
+                shared_expert_local_start=kwargs.get("shared_expert_local_start"),
+            )
+            return output
         return self.mlp(hidden_states, input_ids=input_ids)
 
 

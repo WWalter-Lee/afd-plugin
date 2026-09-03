@@ -45,7 +45,7 @@ def fail_if_unsupported_npu_afd_features(
         )
         return
 
-    if afd_config.compute_gate_on_attention:
+    if afd_config.compute_gate_on_attention and afd_config.connector != "WindowAFDConnector":
         raise RuntimeError(
             "AFD NPU runtime does not support compute_gate_on_attention=true yet",
         )
@@ -149,7 +149,8 @@ def _fail_if_unsupported_deepseek_v4_features(
     }
     if afd_config.connector not in supported_connectors:
         raise RuntimeError(
-            "DeepSeek-V4 AFD supports only CAMP2pAFDConnector or P2pHcclAFDConnector"
+            "DeepSeek-V4 AFD supports only CAMP2pAFDConnector, "
+            "P2pHcclAFDConnector, or WindowAFDConnector"
         )
     if (
         afd_config.connector == "CAMP2pAFDConnector"
@@ -199,8 +200,10 @@ def _fail_if_unsupported_deepseek_v4_features(
         )
     if parallel_config.use_sequence_parallel_moe:
         raise RuntimeError("DeepSeek-V4 AFD does not support sequence-parallel MoE")
-    if afd_config.compute_gate_on_attention:
-        raise RuntimeError("DeepSeek-V4 AFD requires FFN-side gate computation")
+    if afd_config.compute_gate_on_attention and afd_config.connector != "WindowAFDConnector":
+        raise RuntimeError(
+            "DeepSeek-V4 Attention-side gate requires WindowAFDConnector",
+        )
     speculative_config = vllm_config.speculative_config
     if speculative_config is not None:
         if afd_config.connector != "P2pHcclAFDConnector":

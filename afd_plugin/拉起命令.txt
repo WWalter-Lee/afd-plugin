@@ -1,0 +1,37 @@
+# FFN
+VLLM_PLUGINS=ascend,ascend_model,ascend_model_loader,ascend_kv_connector,afd \
+ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15 \
+HCCL_IF_BASE_PORT=52000 \
+python -m vllm.entrypoints.openai.api_server \
+--model /data/models/dsv4-flash-w8a8 \
+--port 8911 \
+--served-model-name dsv4-afd-ffn \
+--max-model-len 2048 \
+--max-num-batched-tokens 2048 \
+--max-num-seqs 32 \
+--data-parallel-size 8 \
+--enable-expert-parallel \
+--tokenizer-mode deepseek_v4 \
+--safetensors-load-strategy lazy \
+--block-size 128 \
+--enforce-eager \
+--additional-config '{"afd":{"role":"ffn","connector":"WindowAFDConnector","host":"127.0.0.1","port":29761,"num_attention_ranks":8,"num_ffn_ranks":8,"compute_gate_on_attention":true}}'
+
+# Attention
+VLLM_PLUGINS=ascend,ascend_model,ascend_model_loader,ascend_kv_connector,afd \
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+HCCL_IF_BASE_PORT=51000 \
+python -m vllm.entrypoints.openai.api_server \
+--model /data/models/dsv4-flash-w8a8 \
+--port 8900 \
+--served-model-name dsv4-afd \
+--max-model-len 2048 \
+--max-num-batched-tokens 2048 \
+--max-num-seqs 32 \
+--data-parallel-size 8 \
+--enable-expert-parallel \
+--tokenizer-mode deepseek_v4 \
+--safetensors-load-strategy lazy \
+--block-size 128 \
+--enforce-eager \
+--additional-config '{"afd":{"role":"attention","connector":"WindowAFDConnector","host":"127.0.0.1","port":29761,"num_attention_ranks":8,"num_ffn_ranks":8,"compute_gate_on_attention":true}}'

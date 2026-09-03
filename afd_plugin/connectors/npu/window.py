@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Window-based AFD connector initialization for Ascend NPU.
 
-Stage one owns only the communication resources.  The A2F/F2A data path is
-deliberately left disabled until the DSV4 model integration is added.
+The connector owns the communication resources and the synchronous A2F/F2A
+data path used by the initial A3 implementation.
 """
 
 from __future__ import annotations
@@ -28,22 +28,40 @@ from afd_plugin.config_utils import (
 from afd_plugin.connectors.base import AFDConnectorBase, ConnectorExtraInfo
 from afd_plugin.connectors.metadata import (
     AFDA2FTransferPayload,
+    AFDTransferMetadata,
+    AFDTransferState,
     AFDTransferContext,
 )
 from afd_plugin.distributed import (
     build_window_rank_mapping,
     init_afd_process_group,
 )
+from afd_plugin.connectors.npu import window_ops
 
 logger = init_logger(__name__)
+
+
+@dataclass(slots=True)
+class WindowAFDTransferState(AFDTransferState):
+    """Operator-produced routing metadata for one A2F exchange."""
+
+    expert_scales: torch.Tensor
+    group_list: torch.Tensor | None = None
+    dynamic_scale: torch.Tensor | None = None
+    session_ids: torch.Tensor | None = None
+    micro_batch_ids: torch.Tensor | None = None
+    token_ids: torch.Tensor | None = None
+    expert_offsets: torch.Tensor | None = None
+    actual_token_num: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class WindowAFDExtraInfo(ConnectorExtraInfo):
     """Window protocol options.
 
-    ``micro_batch_num`` and ``async_dispatch`` are retained for the later data
-    path.  Stage one requires the former to be one and does not call operators.
+    ``micro_batch_num`` and ``async_dispatch`` are retained for the common
+    connector configuration.  The initial implementation requires one
+    micro-batch and uses the synchronous Window operators.
     """
 
     micro_batch_num: int = 1
@@ -167,14 +185,14 @@ def _window_sizes(
 class WindowAFDConnector(AFDConnectorBase):
     """Create the shared M2N HCCL Window and schedule context.
 
-    The connector intentionally does not expose a connector-driven FFN loop in
-    stage one.  This lets both model runners initialize resources without
-    accidentally invoking unimplemented communication operators.
+    The connector owns both the M2N Window resources and the synchronous
+    operator data path used by the initial A3 implementation.
     """
 
     yield_after_attn_send = True
     data_path_ready = False
-    supports_connector_driven_loop = False
+    supports_connector_driven_loop = True
+    is_window_connector = True
 
     @classmethod
     def parse_extra_config(
@@ -205,6 +223,12 @@ class WindowAFDConnector(AFDConnectorBase):
         self.window_addr = 0
         self.context_holder: Any | None = None
         self.schedule_context: torch.Tensor | None = None
+        self.expert_rank_table: torch.Tensor | None = None
+        self.attn_rank_table: torch.Tensor | None = None
+        self.local_expert_num = 0
+        self.local_routed_expert_num = 0
+        self.shared_expert_local_start: int | None = None
+        self._pending_transfers: dict[tuple[int, int], AFDTransferContext] = {}
         self._initialized = False
 
         hf_config = vllm_config.model_config.hf_config
@@ -216,13 +240,21 @@ class WindowAFDConnector(AFDConnectorBase):
             default=1,
         )
         shared_expert_num = _model_int(hf_config, "n_shared_experts", default=0)
-        self.selected_expert_num = routed_topk + shared_expert_num
-        self.expert_num = _model_int(
+        self.shared_expert_num = shared_expert_num
+        self.mix_placement = bool(
+            getattr(vllm_config, "additional_config", {}).get(
+                "mix_placement",
+                False,
+            )
+        )
+        self.routed_expert_num = _model_int(
             hf_config,
             "n_routed_experts",
             "num_experts",
             default=1,
-        ) + shared_expert_num
+        )
+        self.selected_expert_num = routed_topk + shared_expert_num
+        self.expert_num = self.routed_expert_num + shared_expert_num
         scheduler_config = vllm_config.scheduler_config
         max_tokens = int(
             getattr(scheduler_config, "max_num_batched_tokens", 0)
@@ -238,6 +270,11 @@ class WindowAFDConnector(AFDConnectorBase):
     def init_afd_connector(self) -> None:
         if self._initialized:
             return
+        if not self.afd_config.compute_gate_on_attention:
+            raise ValueError(
+                "WindowAFDConnector requires compute_gate_on_attention=true "
+                "for the ref-style Attention-to-FFN route",
+            )
         if self.extra_info.micro_batch_num != 1:
             raise ValueError(
                 "WindowAFDConnector stage one supports only micro_batch_num=1, "
@@ -303,6 +340,8 @@ class WindowAFDConnector(AFDConnectorBase):
                 )
             self.context_holder = context_factory(**kwargs)
             self.schedule_context = self.context_holder.get_schedule_context_tensor()
+            self._build_rank_tables()
+            self.data_path_ready = True
             self._initialized = True
             logger.info(
                 "Window AFD initialized: role=%s role_rank=%d world_rank=%d "
@@ -331,6 +370,7 @@ class WindowAFDConnector(AFDConnectorBase):
         return attn_size if self.afd_config.role == "attention" else ffn_size
 
     def close(self) -> None:
+        self._pending_transfers.clear()
         holder = self.context_holder
         self.context_holder = None
         self.schedule_context = None
@@ -350,11 +390,242 @@ class WindowAFDConnector(AFDConnectorBase):
         self.hccl_comm_name = None
         self.window_size = 0
         self.window_addr = 0
+        self.data_path_ready = False
         self._initialized = False
 
-    def _stage_two_error(self) -> RuntimeError:
-        return RuntimeError(
-            "WindowAFDConnector data path is not enabled in stage one",
+    def _build_rank_tables(self) -> None:
+        """Build a compatibility expert map for a uniform EP=1 deployment.
+
+        The native/ref implementation builds this table from each FFN rank's
+        actual local expert map.  ``set_expert_rank_table`` can replace this
+        compatibility map once that model-owned map is available.  Keeping a
+        fallback is useful for the first uniform deployment, but it is
+        intentionally not used to claim support for EPLB or uneven placement.
+        """
+        device = self.window_tensor.device if self.window_tensor is not None else "npu"
+        table = torch.zeros(
+            (1, self.expert_num, 3), dtype=torch.int32, device=device
+        )
+        routed_num = max(0, self.expert_num - self.shared_expert_num)
+        base_experts, remainder = divmod(routed_num, self.ffn_size)
+        for expert_id in range(routed_num):
+            # Match the native linear EP placement: the first ``remainder``
+            # FFN ranks own one extra routed expert.
+            wide_rank_span = (base_experts + 1) * remainder
+            if remainder and expert_id < wide_rank_span:
+                ffn_rank = expert_id // (base_experts + 1)
+                local_id = expert_id % (base_experts + 1)
+            else:
+                tail_offset = expert_id - wide_rank_span
+                ffn_rank = remainder + tail_offset // max(base_experts, 1)
+                local_id = tail_offset % max(base_experts, 1)
+            table[0, expert_id, 0] = 1
+            table[0, expert_id, 1] = ffn_rank
+            table[0, expert_id, 2] = local_id
+        # Shared experts, when present, are represented by the final IDs and
+        # are placed on the first FFN rank for the initial EP=1 path.
+        for expert_id in range(routed_num, self.expert_num):
+            table[0, expert_id, 0] = 1
+            table[0, expert_id, 1] = 0
+            table[0, expert_id, 2] = (
+                base_experts + (1 if remainder > 0 else 0) + expert_id - routed_num
+            )
+        self.expert_rank_table = table
+        self.local_routed_expert_num = base_experts + (1 if self.role_rank < remainder else 0)
+        self.shared_expert_local_start = self.local_routed_expert_num
+        self.local_expert_num = self.local_routed_expert_num + (
+            self.shared_expert_num if self.role_rank == 0 else 0
+        )
+        self.attn_rank_table = torch.arange(
+            self.attn_size,
+            dtype=torch.int32,
+            device=device,
+        ) + self.ffn_size
+
+    def set_expert_rank_table(self, local_expert_ids: torch.Tensor | None) -> None:
+        """Inject the ref-style table generated from the real FFN placement.
+
+        ``local_expert_ids`` is a one-dimensional tensor whose index is the
+        local expert slot and whose value is the global logical expert id.
+        All A+F ranks must call this method so the fixed-size all-gather is
+        collective; Attention ranks pass ``None`` and contribute ``-1``.
+        """
+        if self.process_group is None or self.window_tensor is None:
+            raise RuntimeError("Window connector must be initialized first")
+        if local_expert_ids is not None:
+            local_expert_ids = local_expert_ids.reshape(-1).to(
+                device=self.window_tensor.device,
+                dtype=torch.int32,
+            )
+            # Separate shared experts are represented as additional local
+            # slots on the first FFN rank, exactly as in the ref deployment.
+            # They are not routed IDs and therefore are never sent in
+            # ``expert_ids`` by Attention.
+            if (
+                self.afd_config.role == "ffn"
+                and self.shared_expert_num > 0
+                and not self.mix_placement
+                and self.role_rank == 0
+            ):
+                shared_ids = torch.arange(
+                    self.routed_expert_num,
+                    self.routed_expert_num + self.shared_expert_num,
+                    dtype=torch.int32,
+                    device=self.window_tensor.device,
+                )
+                local_expert_ids = torch.cat(
+                    (local_expert_ids, shared_ids),
+                    dim=0,
+                )
+        local_count = max(
+            int(local_expert_ids.numel()) if local_expert_ids is not None else 0,
+            1,
+        )
+        count_tensor = torch.tensor(
+            [local_count], dtype=torch.int32, device=self.window_tensor.device
+        )
+        counts = torch.empty(
+            self.world_size, dtype=torch.int32, device=self.window_tensor.device
+        )
+        dist.all_gather_into_tensor(counts, count_tensor, group=self.process_group)
+        max_count = int(counts.max().item())
+        local_table = torch.full(
+            (1, max_count), -1, dtype=torch.int32, device=self.window_tensor.device
+        )
+        if local_expert_ids is not None and local_expert_ids.numel():
+            local_table[0, : local_expert_ids.numel()] = local_expert_ids
+        gathered = torch.empty(
+            (self.world_size, 1, max_count),
+            dtype=torch.int32,
+            device=self.window_tensor.device,
+        )
+        dist.all_gather_into_tensor(gathered, local_table, group=self.process_group)
+
+        table = torch.zeros(
+            (1, self.expert_num, max(3, 2 * self.ffn_size + 1)),
+            dtype=torch.int32,
+            device=self.window_tensor.device,
+        )
+        for rank_id in range(self.world_size):
+            if rank_id < self.ffn_size:
+                rank_value = rank_id
+            else:
+                # Attention ranks contribute only padding and are ignored.
+                continue
+            for local_id, global_id in enumerate(gathered[rank_id, 0].tolist()):
+                if global_id < 0 or global_id >= self.expert_num:
+                    continue
+                instance_count = int(table[0, global_id, 0].item()) + 1
+                if instance_count * 2 >= table.shape[-1]:
+                    raise RuntimeError(
+                        "expert_rank_table has more instances than its allocated width"
+                    )
+                table[0, global_id, 0] = instance_count
+                table[0, global_id, instance_count * 2 - 1] = rank_value
+                table[0, global_id, instance_count * 2] = local_id
+        self.expert_rank_table = table
+        self.local_routed_expert_num = max(
+            0,
+            local_count - (
+                self.shared_expert_num
+                if self.afd_config.role == "ffn"
+                and self.shared_expert_num > 0
+                and not self.mix_placement
+                and self.role_rank == 0
+                else 0
+            ),
+        )
+        self.shared_expert_local_start = self.local_routed_expert_num
+        self.local_expert_num = local_count
+
+    def configure_expert_rank_table_from_model(self, model: Any) -> None:
+        """Build the rank table from the model's loaded local expert map.
+
+        ``AscendFusedMoE._expert_map`` is indexed by global logical expert and
+        stores the local expert slot, with ``-1`` for experts absent on this
+        rank.  The Window operator needs the inverse relation, so the local
+        slot order is reconstructed before the collective gather.  Attention
+        ranks intentionally contribute ``None``.
+        """
+        # The initial Window implementation uses the uniform fallback map for
+        # separate shared experts.  Model-map discovery is a collective and
+        # cannot be started from load_model(), because Attention and FFN load
+        # at different points in their worker lifecycles.
+        if self.shared_expert_num > 0 and not self.mix_placement:
+            return
+        if self.process_group is None or self.window_tensor is None:
+            # FFN load_model can precede init_afd_connector.  The fallback map
+            # built during connector initialization remains valid for the
+            # uniform stage-one deployment.
+            return
+        local_expert_ids: torch.Tensor | None = None
+        has_model_map = False
+        if self.afd_config.role == "ffn":
+            for experts in getattr(model, "moe_layers", ()):
+                expert_map = getattr(experts, "_expert_map", None)
+                if expert_map is None:
+                    continue
+                has_model_map = True
+                expert_map = expert_map.reshape(-1)
+                present = torch.where(expert_map >= 0)[0]
+                if present.numel():
+                    local_slots = expert_map[present].to(torch.int64)
+                    order = torch.argsort(local_slots)
+                    local_expert_ids = present[order].to(torch.int32)
+                break
+            if has_model_map and local_expert_ids is None:
+                local_expert_ids = torch.empty(
+                    (0,), dtype=torch.int32, device=self.window_tensor.device
+                )
+            if (
+                self.shared_expert_num > 0
+                and not self.mix_placement
+                and self.role_rank == 0
+            ):
+                assert local_expert_ids is not None
+                shared_ids = torch.arange(
+                    self.routed_expert_num,
+                    self.routed_expert_num + self.shared_expert_num,
+                    dtype=torch.int32,
+                    device=local_expert_ids.device,
+                )
+                local_expert_ids = torch.cat(
+                    (local_expert_ids, shared_ids),
+                    dim=0,
+                )
+        map_flag = torch.tensor(
+            [int(has_model_map)], dtype=torch.int32, device=self.window_tensor.device
+        )
+        dist.all_reduce(map_flag, op=dist.ReduceOp.SUM, group=self.process_group)
+        if int(map_flag.item()) == 0:
+            # No rank exposes an EPLB/physical map.  Keep the uniform
+            # compatibility table created during connector initialization.
+            return
+        self.set_expert_rank_table(local_expert_ids)
+
+    def _operator_shapes(self, batch_size: int) -> tuple[list[int], list[int], list[int], list[int]]:
+        quant_mode = self.extra_info.quant_mode
+        token_size = _align_up(self.hidden_size + 4, 512) if quant_mode == 2 else self.hidden_size * 2
+        ffn_info = [self.attn_size, 1, 2 + batch_size * self.selected_expert_num]
+        ffn_data = [self.attn_size, 1, batch_size, self.selected_expert_num, token_size]
+        attn_info = [1, batch_size, self.selected_expert_num]
+        attn_data = [1, batch_size, self.selected_expert_num, token_size]
+        return ffn_info, ffn_data, attn_info, attn_data
+
+    def _token_dtype(self) -> int:
+        if self.extra_info.quant_mode == 2:
+            return 2
+        return 1 if self.vllm_config.model_config.dtype == torch.bfloat16 else 0
+
+    @staticmethod
+    def _token_dtype_for_tensor(tensor: torch.Tensor) -> int:
+        if tensor.dtype == torch.bfloat16:
+            return 1
+        if tensor.dtype == torch.float16:
+            return 0
+        raise RuntimeError(
+            "Window combine requires float16 or bfloat16 reference tensor, "
+            f"got {tensor.dtype}",
         )
 
     def send_attn_output(
@@ -363,7 +634,73 @@ class WindowAFDConnector(AFDConnectorBase):
         context: AFDTransferContext,
         **kwargs: Any,
     ) -> None:
-        raise self._stage_two_error()
+        self._require_data_path()
+        expert_ids = kwargs.get("expert_ids")
+        expert_scales = kwargs.get("expert_scales")
+        if expert_ids is None or expert_scales is None:
+            raise RuntimeError("Window A2F requires expert_ids and expert_scales")
+        batch_size = int(hidden_states.shape[0])
+        expert_ids = expert_ids.to(torch.int32).reshape(batch_size, -1)
+        expert_scales = expert_scales.to(torch.float32).reshape(batch_size, -1)
+
+        # A2F receives only routed top-k IDs.  The shared-expert slot is
+        # represented by selected_expert_num (K + shared) in the Window
+        # layout and rank table, not by appending a shared ID to expert_ids.
+        # Some gate paths historically included that extra column, so strip
+        # it at this connector boundary without changing the P2P path.
+        routed_topk = self.selected_expert_num - self.shared_expert_num
+        if expert_ids.shape[1] < routed_topk:
+            raise RuntimeError(
+                "Window A2F received fewer routed expert IDs than configured: "
+                f"got {expert_ids.shape[1]}, expected {routed_topk}",
+            )
+        if expert_scales.shape[1] < routed_topk:
+            raise RuntimeError(
+                "Window A2F received fewer routed expert scales than configured: "
+                f"got {expert_scales.shape[1]}, expected {routed_topk}",
+            )
+        if expert_ids.shape[1] != routed_topk:
+            logger.debug(
+                "Window A2F dropping %d non-routed expert ID columns",
+                expert_ids.shape[1] - routed_topk,
+            )
+        expert_ids = expert_ids[:, :routed_topk]
+        expert_scales = expert_scales[:, :routed_topk]
+        combine_scales = expert_scales
+        ffn_info, ffn_data, attn_info, _ = self._operator_shapes(batch_size)
+        x = hidden_states.reshape(1, batch_size, self.hidden_size)
+        session_id = torch.tensor([self.role_rank], dtype=torch.int32, device=x.device)
+        micro_batch_id = torch.tensor([int(kwargs.get("micro_batch_id", 0))], dtype=torch.int32, device=x.device)
+        # The Window A2F operator models one active MoE layer per invocation;
+        # the model layer index is carried by the surrounding execution order.
+        layer_id = torch.zeros((1,), dtype=torch.int32, device=x.device)
+        window_ops.attention_to_ffn(
+            x,
+            session_id,
+            micro_batch_id,
+            layer_id,
+            expert_ids.reshape(1, batch_size, -1),
+            self.expert_rank_table,
+            self.hccl_comm_name,
+            self.world_size,
+            ffn_info,
+            ffn_data,
+            attn_info,
+            self.routed_expert_num,
+            quant_mode=self.extra_info.quant_mode,
+            sync_flag=0,
+            ffn_start_rank_id=0,
+        )
+        logger.debug(
+            "Window A2F sent layer=%d stage=%d batch=%d topk=%d",
+            context.metadata.layer_idx,
+            context.metadata.stage_idx,
+            batch_size,
+            expert_ids.shape[-1],
+        )
+        self._pending_transfers[(int(context.metadata.stage_idx), int(context.metadata.layer_idx))] = context
+        state = WindowAFDTransferState(expert_scales=combine_scales)
+        context.states = state
 
     def recv_ffn_output(
         self,
@@ -371,14 +708,75 @@ class WindowAFDConnector(AFDConnectorBase):
         ubatch_idx: int = 0,
         **kwargs: Any,
     ) -> torch.Tensor:
-        raise self._stage_two_error()
+        self._require_data_path()
+        key = (int(ubatch_idx), int(kwargs.get("layer_idx", 0)))
+        context = self._pending_transfers.pop(key, None)
+        if context is None or not isinstance(context.states, WindowAFDTransferState):
+            raise RuntimeError(f"Window F2A has no pending transfer for {key}")
+        _, _, attn_info, _ = self._operator_shapes(int(ref_tensor.shape[0]))
+        output, _ = window_ops.attention_worker_combine(
+            self.schedule_context,
+            context.states.expert_scales,
+            torch.tensor([key[1]], dtype=torch.int32, device=ref_tensor.device),
+            self.hidden_size,
+            # ``token_dtype=2`` is only the INT8 payload mode of
+            # ``ffn_worker_batching``.  ``attention_worker_combine`` accepts
+            # only the output dtype modes: 0=FP16 and 1=BF16.  Use the same
+            # dtype as the Attention continuation/residual, as P2P does.
+            token_dtype=self._token_dtype_for_tensor(ref_tensor),
+            need_schedule=1,
+        )
+        return output.reshape_as(ref_tensor)
 
     def recv_attn_output(
         self,
         ubatch_idx: int = 0,
         **kwargs: Any,
     ) -> AFDA2FTransferPayload:
-        raise self._stage_two_error()
+        self._require_data_path()
+        batch_size = self.micro_batch_size
+        _, _, _, _ = self._operator_shapes(batch_size)
+        # The operator expects the logical dimensions [A, BS, K+1, H].
+        # Its tiling validates K+1 independently (currently <= 64); the
+        # product A*BS*(K+1) is computed internally for the output rows.
+        max_out_shape = [
+            self.attn_size,
+            batch_size,
+            self.selected_expert_num,
+            self.hidden_size,
+        ]
+        outputs = window_ops.ffn_worker_batching(
+            self.schedule_context,
+            getattr(self, "local_expert_num", max(1, math.ceil(self.expert_num / self.ffn_size))),
+            max_out_shape,
+            token_dtype=self._token_dtype(),
+            need_schedule=1,
+            layer_num=0,
+        )
+        logger.debug(
+            "Window FFN batching completed layer=%d stage=%d",
+            int(kwargs.get("layer_idx", 0)),
+            ubatch_idx,
+        )
+        hidden_states, group_list, session_ids, micro_batch_ids, token_ids, expert_offsets, dynamic_scale, actual_token_num = outputs
+        context = AFDTransferContext(
+            metadata=AFDTransferMetadata.create_ffn_metadata(
+                layer_idx=int(kwargs.get("layer_idx", 0)),
+                stage_idx=int(ubatch_idx),
+                seq_lens=[int(hidden_states.shape[0])],
+            ),
+            states=WindowAFDTransferState(
+                expert_scales=torch.empty((0,), dtype=torch.float32, device=hidden_states.device),
+                group_list=group_list,
+                dynamic_scale=dynamic_scale,
+                session_ids=session_ids,
+                micro_batch_ids=micro_batch_ids,
+                token_ids=token_ids,
+                expert_offsets=expert_offsets,
+                actual_token_num=actual_token_num,
+            ),
+        )
+        return AFDA2FTransferPayload(hidden_states=hidden_states, context=context)
 
     def send_ffn_output(
         self,
@@ -386,7 +784,39 @@ class WindowAFDConnector(AFDConnectorBase):
         context: AFDTransferContext,
         **kwargs: Any,
     ) -> None:
-        raise self._stage_two_error()
+        self._require_data_path()
+        if not isinstance(context.states, WindowAFDTransferState):
+            raise RuntimeError("Window F2A requires batching state")
+        state = context.states
+        if any(value is None for value in (state.session_ids, state.micro_batch_ids, state.token_ids, state.expert_offsets, state.actual_token_num)):
+            raise RuntimeError("Window batching did not return complete routing metadata")
+        window_ops.ffn_to_attention(
+            getattr(ffn_output, "routed_output", ffn_output),
+            state.session_ids,
+            state.micro_batch_ids,
+            state.token_ids,
+            state.expert_offsets,
+            state.actual_token_num,
+            self.hccl_comm_name,
+            self.world_size,
+            [1, self.micro_batch_size, self.selected_expert_num],
+            [1, self.micro_batch_size, self.selected_expert_num, self.hidden_size],
+            attn_rank_table=self.attn_rank_table,
+        )
+        logger.debug(
+            "Window F2A sent stage=%d actual_tokens=%s",
+            context.metadata.stage_idx,
+            state.actual_token_num,
+        )
+
+    def _require_data_path(self) -> None:
+        if not self._initialized or not self.data_path_ready:
+            raise RuntimeError("WindowAFDConnector data path is not initialized")
+
+    def select_experts(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        from vllm_ascend.ops.fused_moe.experts_selector import select_experts
+
+        return select_experts(**kwargs)
 
 
-__all__ = ["WindowAFDConnector", "WindowAFDExtraInfo"]
+__all__ = ["WindowAFDConnector", "WindowAFDExtraInfo", "WindowAFDTransferState"]

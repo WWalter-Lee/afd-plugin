@@ -26,6 +26,20 @@ if TYPE_CHECKING:
     )
 
 
+def _get_expert_parameter(experts: torch.nn.Module, name: str):
+    """Read MoE weights across vLLM-Ascend EPLB API generations."""
+
+    getter = getattr(experts, "get_eplb_parameter", None)
+    if getter is not None:
+        return getter(name)
+    try:
+        return getattr(experts, name)
+    except AttributeError as exc:
+        raise RuntimeError(
+            f"Ascend MoE does not expose required expert parameter {name!r}"
+        ) from exc
+
+
 def compute_attention_gate_topk(
     layer: AFDDeepseekV2DecoderLayer,
     hidden_states: torch.Tensor,
@@ -48,6 +62,8 @@ def compute_gate_topk(
     config: _DeepseekAdapterConfig,
     top_k: int,
     hidden_states: torch.Tensor,
+    input_ids: torch.Tensor | None = None,
+    tid2eid: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute routing payloads for a native-path gate proxy."""
 
@@ -75,22 +91,72 @@ def compute_gate_topk(
     else:
         num_experts = config.n_routed_experts + num_redundant_experts
     routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
-    topk_weights, topk_ids = afd_connector.select_experts(
-        hidden_states=hidden_states,
-        router_logits=router_logits,
-        top_k=top_k,
-        use_grouped_topk=True,
-        renormalize=getattr(config, "norm_topk_prob", True),
-        scoring_func=getattr(config, "scoring_func", "softmax"),
-        num_expert_group=getattr(config, "n_group", 1),
-        topk_group=getattr(config, "topk_group", 1),
-        routed_scaling_factor=(routed_scaling_factor if mix_placement else 1.0),
-        e_score_correction_bias=gate.e_score_correction_bias,
-        mix_placement=mix_placement,
-        num_logical_experts=router_logits.shape[1],
-        num_shared_experts=config.n_shared_experts,
-        num_experts=num_experts,
-    )
+    renormalize = getattr(config, "norm_topk_prob", True)
+    scoring_func = getattr(config, "scoring_func", "softmax")
+    used_hash_selector = tid2eid is not None
+    if used_hash_selector:
+        # The native fused selector tries to obtain an MoE communication
+        # method from the forward context for hash routing.  An AFD Attention
+        # rank owns only the gate and remote-dispatch path, so it has no local
+        # MoE communication method.  Run the hash selector directly on the
+        # local token ids instead.
+        if input_ids is None:
+            input_ids = getattr(get_forward_context(), "input_ids", None)
+        if input_ids is None:
+            raise RuntimeError("DSV4 hash routing requires input_ids")
+        input_ids = input_ids.to(torch.int64)
+        input_ids = torch.where(input_ids == -1, 0, input_ids)
+        topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k_hash(
+            x=router_logits,
+            k=top_k,
+            bias=gate.e_score_correction_bias,
+            input_ids=input_ids,
+            tid2eid=tid2eid.to(torch.int32),
+            k_group=getattr(config, "topk_group", 1),
+            group_count=getattr(config, "n_group", 1),
+            routed_scaling_factor=(routed_scaling_factor if mix_placement else 1.0),
+            eps=1e-20,
+            group_select_mode=1,
+            renorm=0,
+            norm_type=2,
+            out_flag=False,
+        )
+        if renormalize:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+    else:
+        topk_weights, topk_ids = afd_connector.select_experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            top_k=top_k,
+            use_grouped_topk=True,
+            renormalize=renormalize,
+            scoring_func=scoring_func,
+            num_expert_group=getattr(config, "n_group", 1),
+            topk_group=getattr(config, "topk_group", 1),
+            routed_scaling_factor=(routed_scaling_factor if mix_placement else 1.0),
+            e_score_correction_bias=gate.e_score_correction_bias,
+            mix_placement=mix_placement,
+            num_logical_experts=router_logits.shape[1],
+            num_shared_experts=config.n_shared_experts,
+            num_experts=num_experts,
+            input_ids=input_ids,
+            tid2eid=None,
+        )
+    if used_hash_selector and mix_placement:
+        shared_count = int(getattr(config, "n_shared_experts", 0))
+        shared_ids = torch.arange(
+            router_logits.shape[1],
+            router_logits.shape[1] + shared_count,
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        ).repeat(topk_ids.shape[0], 1)
+        shared_weights = torch.ones(
+            (topk_weights.shape[0], shared_count),
+            dtype=topk_weights.dtype,
+            device=topk_weights.device,
+        )
+        topk_ids = torch.cat((topk_ids, shared_ids), dim=1)
+        topk_weights = torch.cat((topk_weights, shared_weights), dim=1)
     if force_balanced_topk_ids_enabled():
         topk_ids = _force_balanced_topk_ids(
             topk_ids,
@@ -110,6 +176,7 @@ def compute_attention_gate_moe_ffn(
     dynamic_scales_shared: torch.Tensor | None,
     topk_scales: torch.Tensor | None,
     group_list_type: int,
+    shared_expert_local_start: int | None = None,
 ) -> AFDF2ATransferPayload:
     """Compute FFN output for MoE layers whose gate ran on Attention ranks."""
 
@@ -125,15 +192,15 @@ def compute_attention_gate_moe_ffn(
     quant_type = experts.quant_type
     if quant_type == QuantType.NONE:
         moe_weights = MoEWeights(
-            w1=experts.get_eplb_parameter("w13_weight"),
-            w2=experts.get_eplb_parameter("w2_weight"),
+            w1=_get_expert_parameter(experts, "w13_weight"),
+            w2=_get_expert_parameter(experts, "w2_weight"),
             w1_bias=(
-                experts.get_eplb_parameter("w13_bias")
+                _get_expert_parameter(experts, "w13_bias")
                 if experts.moe_config.has_bias
                 else None
             ),
             w2_bias=(
-                experts.get_eplb_parameter("w2_bias")
+                _get_expert_parameter(experts, "w2_bias")
                 if experts.moe_config.has_bias
                 else None
             ),
@@ -141,21 +208,22 @@ def compute_attention_gate_moe_ffn(
     elif quant_type == QuantType.W8A8:
         if experts.dynamic_eplb:
             moe_weights = MoEWeights(
-                w1=experts.get_eplb_parameter("w13_weight_list"),
-                w2=experts.get_eplb_parameter("w2_weight_list"),
-                w1_scale=experts.get_eplb_parameter(
+                w1=_get_expert_parameter(experts, "w13_weight_list"),
+                w2=_get_expert_parameter(experts, "w2_weight_list"),
+                w1_scale=_get_expert_parameter(
+                    experts,
                     "w13_weight_scale_fp32_list",
                 ),
-                w2_scale=experts.get_eplb_parameter("w2_weight_scale_list"),
+                w2_scale=_get_expert_parameter(experts, "w2_weight_scale_list"),
             )
         else:
             moe_weights = MoEWeights(
-                w1=[experts.get_eplb_parameter("w13_weight")],
-                w2=[experts.get_eplb_parameter("w2_weight")],
+                w1=[_get_expert_parameter(experts, "w13_weight")],
+                w2=[_get_expert_parameter(experts, "w2_weight")],
                 w1_scale=[
-                    experts.get_eplb_parameter("w13_weight_scale_fp32"),
+                    _get_expert_parameter(experts, "w13_weight_scale_fp32"),
                 ],
-                w2_scale=[experts.get_eplb_parameter("w2_weight_scale")],
+                w2_scale=[_get_expert_parameter(experts, "w2_weight_scale")],
             )
     else:
         raise RuntimeError(
@@ -168,7 +236,7 @@ def compute_attention_gate_moe_ffn(
     )
 
     shared_output = None
-    if experts._shared_experts is not None:
+    if experts._shared_experts is not None and expand_x_shared is not None:
         shared_input = expand_x_shared
         shared_scales = dynamic_scales_shared
         if shared_input.dtype == torch.int8 and quant_type == QuantType.W8A8:
@@ -186,26 +254,84 @@ def compute_attention_gate_moe_ffn(
             )
             shared_output = experts._shared_experts(shared_input)
 
-    routed_output, _ = unified_apply_mlp(
-        mlp_compute_input=MoEMlpComputeInput(
-            hidden_states=hidden_states,
-            group_list=group_list,
-            group_list_type=int(group_list_type),
-            dynamic_scale=dynamic_scales,
-            topk_scales=topk_scales,
-            weights=moe_weights,
-            quant=MoEQuantParams(quant_type=quant_type),
-            fusion=use_gmmswigluquant_fusion,
-            activation=experts.activation,
-            need_trans=False,
-            dynamic_eplb=experts.dynamic_eplb,
-        ),
-    )
+    # Window batching includes a slot for each separate shared expert in the
+    # local expert stream.  The routed GMM weights do not own that slot.  In
+    # the ref deployment shared experts are placed on the first FFN rank and
+    # are therefore computed from the tail of batching's expert-sorted input.
+    window_shared_output = None
+    route_hidden_states = hidden_states
+    route_group_list = group_list
+    if (
+        shared_expert_local_start is not None
+        and experts._shared_experts is not None
+        and int(shared_expert_local_start) >= 0
+        and group_list.dim() == 2
+        and group_list.shape[-1] == 2
+    ):
+        shared_start = int(shared_expert_local_start)
+        if shared_start < group_list.shape[0]:
+            group_counts = group_list[:, 1].to(torch.int64)
+            route_count = int(group_counts[:shared_start].sum().item())
+            shared_count = int(group_counts[shared_start:].sum().item())
+            if route_count + shared_count > hidden_states.shape[0]:
+                raise RuntimeError(
+                    "Window batching group_list exceeds hidden_states rows: "
+                    f"route={route_count} shared={shared_count} "
+                    f"rows={hidden_states.shape[0]}"
+                )
+            route_hidden_states = hidden_states[:route_count]
+            route_group_list = group_list[:shared_start]
+            if shared_count:
+                shared_input = hidden_states[route_count : route_count + shared_count]
+                shared_scale = (
+                    dynamic_scales[route_count : route_count + shared_count]
+                    if dynamic_scales is not None
+                    else None
+                )
+                if shared_input.dtype == torch.int8 and quant_type == QuantType.W8A8:
+                    window_shared_output = _compute_w8a8_shared_experts_from_int8(
+                        experts._shared_experts,
+                        shared_input,
+                        shared_scale,
+                        output_dtype=torch.bfloat16,
+                    )
+                else:
+                    shared_input = _dequantize_int8_activation(
+                        shared_input,
+                        shared_scale,
+                        output_dtype=hidden_states.dtype,
+                    )
+                    window_shared_output = experts._shared_experts(shared_input)
+
+    if route_hidden_states.numel():
+        routed_output, _ = unified_apply_mlp(
+            mlp_compute_input=MoEMlpComputeInput(
+                hidden_states=route_hidden_states,
+                group_list=route_group_list,
+                group_list_type=int(group_list_type),
+                dynamic_scale=(
+                    dynamic_scales[: route_hidden_states.shape[0]]
+                    if dynamic_scales is not None
+                    else None
+                ),
+                topk_scales=topk_scales,
+                weights=moe_weights,
+                quant=MoEQuantParams(quant_type=quant_type),
+                fusion=use_gmmswigluquant_fusion,
+                activation=experts.activation,
+                need_trans=False,
+                dynamic_eplb=experts.dynamic_eplb,
+            ),
+        )
+    else:
+        routed_output = hidden_states.new_empty((0, hidden_states.shape[-1]))
 
     if hidden_states.dtype != torch.float16:
         routed_output *= layer.mlp.routed_scaling_factor
-    elif shared_output is not None:
-        shared_output *= 1.0 / layer.mlp.routed_scaling_factor
+    if window_shared_output is not None:
+        if hidden_states.dtype == torch.float16:
+            window_shared_output *= 1.0 / layer.mlp.routed_scaling_factor
+        routed_output = torch.cat((routed_output, window_shared_output), dim=0)
 
     return AFDF2ATransferPayload(
         routed_output=routed_output,

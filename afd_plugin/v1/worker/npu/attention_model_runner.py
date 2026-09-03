@@ -1766,6 +1766,13 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
 
     def load_model(self) -> None:
         super().load_model()
+        configure_rank_table = getattr(
+            self.connector,
+            "configure_expert_rank_table_from_model",
+            None,
+        )
+        if callable(configure_rank_table):
+            configure_rank_table(self.model)
         if self.speculative_config is not None:
             if self.speculative_config.method != "mtp" or self.drafter is None:
                 raise RuntimeError("DSV4 AFD supports only an initialized MTP drafter")
