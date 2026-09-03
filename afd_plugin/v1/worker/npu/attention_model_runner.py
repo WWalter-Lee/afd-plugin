@@ -1102,6 +1102,13 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         still produce a single-stage key below the ubatch threshold.
         """
 
+        if not getattr(self.connector, "data_path_ready", True):
+            logger.info(
+                "Skipping AFD warmup/capture while connector data path is disabled: %s",
+                type(self.connector).__name__,
+            )
+            return
+
         # ### PATCH START: AFD dual graph capture
         if profiler is None:
             profiler = nullcontext()

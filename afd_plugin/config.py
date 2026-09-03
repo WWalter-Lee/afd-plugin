@@ -25,6 +25,7 @@ SUPPORTED_AFD_CONNECTORS: Final[tuple[str, ...]] = (
     "P2pHcclAFDConnector",
     "CAMP2pAFDConnector",
     AFD_ASYNC_CONNECTOR,
+    "WindowAFDConnector",
 )
 
 _ALIASES: Final[dict[str, str]] = {

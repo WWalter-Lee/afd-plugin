@@ -84,7 +84,14 @@ class AFDNPUFFNWorker(NPUWorker):
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         self.model_runner.initialize_kv_cache(kv_cache_config)
         self.model_runner.initialize_afd_connector()
-        self.start_ffn_server_loop()
+        if getattr(self.model_runner.connector, "supports_connector_driven_loop", True):
+            self.start_ffn_server_loop()
+        else:
+            logger.info(
+                "AFD connector %s initialized without FFN data loop; "
+                "data path is not enabled in this stage",
+                type(self.model_runner.connector).__name__,
+            )
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         return CompilationTimes(language_model=0.0, encoder=0.0)
@@ -99,15 +106,41 @@ class AFDNPUFFNWorker(NPUWorker):
         )
 
     def start_ffn_server_loop(self) -> None:
+        connector = self.model_runner.connector
+        # AFD FFN EngineCore returns early from its KV/scheduler
+        # initialization, so initialize_from_config() is not reached on this
+        # path.  The collective RPC is the first common point after all FFN
+        # workers have been created; initialize the connector here before
+        # deciding whether this connector also owns a data loop.
+        if not connector.is_initialized:
+            logger.info(
+                "Initializing AFD connector from FFN loop startup: %s",
+                type(connector).__name__,
+            )
+            self.model_runner.initialize_afd_connector()
+
+        # EngineCore starts the FFN loop through collective RPC after worker
+        # initialization.  Window connectors currently own only communication
+        # resource initialization and intentionally do not provide the
+        # connector-driven receive loop (for example, recv_ffn_work_item).
+        # Keep this guard here as well as in initialize_from_config(), because
+        # the RPC path bypasses that earlier decision.
+        if not getattr(
+            connector,
+            "supports_connector_driven_loop",
+            True,
+        ):
+            logger.info(
+                "AFD connector %s does not provide a connector-driven FFN loop",
+                type(connector).__name__,
+            )
+            return
+
         if self._ffn_thread is not None and self._ffn_thread.is_alive():
             self.raise_ffn_loop_error_if_any()
             return
 
         self.raise_ffn_loop_error_if_any()
-        connector = self.model_runner.connector
-        if not connector.is_initialized:
-            self.model_runner.initialize_afd_connector()
-
         self._ffn_shutdown_event = threading.Event()
         self._ffn_loop_error = None
 

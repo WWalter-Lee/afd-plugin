@@ -215,6 +215,22 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 "execute_connector_driven_step requires a connector-driven "
                 "AFD connector",
             )
+        if not getattr(self.connector, "supports_connector_driven_loop", False):
+            raise RuntimeError(
+                f"{type(self.connector).__name__} does not support a "
+                "connector-driven FFN loop",
+            )
+        recv_work_item = getattr(self.connector, "recv_ffn_work_item", None)
+        send_work_item_output = getattr(
+            self.connector,
+            "send_ffn_work_item_output",
+            None,
+        )
+        if recv_work_item is None or send_work_item_output is None:
+            raise RuntimeError(
+                f"{type(self.connector).__name__} is missing the "
+                "connector-driven FFN work-item interface",
+            )
         step_afd_npu_profiler(self.prof)
         self._ffn_forward_connector_driven()
         return None

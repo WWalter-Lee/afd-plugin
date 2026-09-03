@@ -4,7 +4,9 @@
 
 from afd_plugin.distributed.topology import (
     AFDRankMapping,
+    AFDWindowRankMapping,
     build_rank_mapping,
+    build_window_rank_mapping,
     resolve_role_rank,
     topology_from_config,
     validate_p2p_topology,
@@ -23,8 +25,10 @@ def __getattr__(name: str):
 
 __all__ = [
     "AFDRankMapping",
+    "AFDWindowRankMapping",
     "DefaultProcessGroupSwitcher",
     "build_rank_mapping",
+    "build_window_rank_mapping",
     "init_afd_process_group",
     "resolve_role_rank",
     "topology_from_config",

@@ -145,6 +145,7 @@ def _fail_if_unsupported_deepseek_v4_features(
     supported_connectors = {
         "CAMP2pAFDConnector",
         "P2pHcclAFDConnector",
+        "WindowAFDConnector",
     }
     if afd_config.connector not in supported_connectors:
         raise RuntimeError(

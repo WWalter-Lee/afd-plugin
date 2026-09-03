@@ -44,10 +44,74 @@ class AFDRankMapping:
         return self.world_rank < self.ffn_size or self.is_attention_top_min_size_rank
 
 
+@dataclass(frozen=True, slots=True)
+class AFDWindowRankMapping:
+    """M2N rank mapping used by the Window connector.
+
+    Window communication has one global HCCL rank space containing every FFN
+    rank followed by every Attention rank.  It has no P2P subgroup or ratio
+    requirement.
+    """
+
+    role: str
+    role_rank: int
+    world_rank: int
+    attention_size: int
+    ffn_size: int
+    peer_ranks: tuple[int, ...]
+
+    @property
+    def world_size(self) -> int:
+        return self.attention_size + self.ffn_size
+
+
 def topology_from_config(config: AFDConfig) -> tuple[int, int]:
     """Return ``(attention_size, ffn_size)`` for an AFD config."""
 
     return config.num_attention_ranks, config.num_ffn_ranks
+
+
+def build_window_rank_mapping(
+    config: AFDConfig,
+    role_rank: int,
+) -> AFDWindowRankMapping:
+    """Build FFN-first global ranks and opposite-role Window peers."""
+
+    attention_size, ffn_size = topology_from_config(config)
+    if attention_size <= 0 or ffn_size <= 0:
+        raise ValueError(
+            "Window AFD requires positive num_attention_ranks and "
+            f"num_ffn_ranks, got {attention_size} and {ffn_size}",
+        )
+    if role_rank < 0:
+        raise ValueError(f"AFD role rank must be non-negative, got {role_rank}")
+
+    if config.role == "ffn":
+        if role_rank >= ffn_size:
+            raise ValueError(
+                f"FFN role rank {role_rank} is outside configured size {ffn_size}",
+            )
+        world_rank = role_rank
+        peer_ranks = tuple(range(ffn_size, ffn_size + attention_size))
+    elif config.role == "attention":
+        if role_rank >= attention_size:
+            raise ValueError(
+                "Attention role rank "
+                f"{role_rank} is outside configured size {attention_size}",
+            )
+        world_rank = ffn_size + role_rank
+        peer_ranks = tuple(range(ffn_size))
+    else:
+        raise ValueError(f"unknown AFD role {config.role!r}")
+
+    return AFDWindowRankMapping(
+        role=config.role,
+        role_rank=role_rank,
+        world_rank=world_rank,
+        attention_size=attention_size,
+        ffn_size=ffn_size,
+        peer_ranks=peer_ranks,
+    )
 
 
 def validate_p2p_topology(config: AFDConfig) -> None:
