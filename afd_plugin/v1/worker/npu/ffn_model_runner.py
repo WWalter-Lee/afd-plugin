@@ -311,11 +311,26 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     ),
                     input_ids=payload.input_ids,
                 )
-                print(
-                    f"[FFN][after_compute] rank={self.connector.world_rank} "
-                    f"layer={layer_idx} shape={tuple(rank_output.shape)}",
-                    flush=True,
-                )
+                if isinstance(rank_output, AFDF2ATransferPayload):
+                    routed_shape = tuple(rank_output.routed_output.shape)
+                    shared_shape = (
+                        tuple(rank_output.shared_output.shape)
+                        if rank_output.shared_output is not None
+                        else None
+                    )
+                    print(
+                        f"[FFN][after_compute] rank={self.connector.world_rank} "
+                        f"layer={layer_idx} "
+                        f"routed_shape={routed_shape} "
+                        f"shared_shape={shared_shape}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[FFN][after_compute] rank={self.connector.world_rank} "
+                        f"layer={layer_idx} shape={tuple(rank_output.shape)}",
+                        flush=True,
+                    )
             print(
                 f"[FFN][before_f2a] rank={self.connector.world_rank} "
                 f"layer={layer_idx}",

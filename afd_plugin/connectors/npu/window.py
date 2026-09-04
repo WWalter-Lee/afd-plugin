@@ -771,26 +771,12 @@ class WindowAFDConnector(AFDConnectorBase):
             self.hidden_size,
         ]
         print(
-            f"[Window][before_scheduler] rank={self.world_rank} "
-            f"sync_group_size={self.attn_size}",
-            flush=True,
-        )
-        window_ops.ffn_worker_scheduler(
-            self.schedule_context,
-            sync_group_size=self.attn_size,
-        )
-        torch.npu.synchronize()
-        print(
-            f"[Window][scheduler_done] rank={self.world_rank}",
-            flush=True,
-        )
-        print(
             "[Window][before_batching] "
             f"rank={self.world_rank} "
             f"max_out_shape={max_out_shape} "
             f"expert_num={self.local_expert_num} "
             f"token_dtype={self._token_dtype()} "
-            f"need_schedule=0",
+            f"need_schedule=1",
             flush=True,
         )
         outputs = window_ops.ffn_worker_batching(
@@ -798,7 +784,7 @@ class WindowAFDConnector(AFDConnectorBase):
             getattr(self, "local_expert_num", max(1, math.ceil(self.expert_num / self.ffn_size))),
             max_out_shape,
             token_dtype=self._token_dtype(),
-            need_schedule=0,
+            need_schedule=1,
             layer_num=0,
         )
         print(
