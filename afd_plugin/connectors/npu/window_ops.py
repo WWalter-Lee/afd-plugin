@@ -75,6 +75,19 @@ def ffn_worker_batching(
     )
 
 
+def ffn_worker_scheduler(
+    schedule_context: torch.Tensor,
+    *,
+    sync_group_size: int,
+) -> None:
+    import torch_npu
+
+    torch_npu.ffn_worker_scheduler_(
+        schedule_context,
+        sync_group_size=sync_group_size,
+    )
+
+
 def ffn_to_attention(
     x: torch.Tensor,
     session_ids: torch.Tensor,
@@ -133,4 +146,5 @@ __all__ = [
     "attention_worker_combine",
     "ffn_to_attention",
     "ffn_worker_batching",
+    "ffn_worker_scheduler",
 ]

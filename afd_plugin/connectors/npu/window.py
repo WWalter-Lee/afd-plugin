@@ -674,6 +674,22 @@ class WindowAFDConnector(AFDConnectorBase):
         # The Window A2F operator models one active MoE layer per invocation;
         # the model layer index is carried by the surrounding execution order.
         layer_id = torch.zeros((1,), dtype=torch.int32, device=x.device)
+        debug_expert_ids = expert_ids.reshape(-1, expert_ids.shape[-1])
+        print(
+            "[A2F][before] "
+            f"rank={self.world_rank} "
+            f"session={session_id.tolist()} "
+            f"micro_batch={micro_batch_id.tolist()} "
+            f"layer={layer_id.tolist()} "
+            f"x_shape={tuple(x.shape)} "
+            f"expert_ids_shape={tuple(expert_ids.shape)} "
+            f"expert_ids_first_row={debug_expert_ids[0].tolist()} "
+            f"moe_expert_num={self.routed_expert_num} "
+            f"ffn_info={ffn_info} "
+            f"ffn_data={ffn_data} "
+            f"attn_info={attn_info}",
+            flush=True,
+        )
         window_ops.attention_to_ffn(
             x,
             session_id,
@@ -690,6 +706,15 @@ class WindowAFDConnector(AFDConnectorBase):
             quant_mode=self.extra_info.quant_mode,
             sync_flag=0,
             ffn_start_rank_id=0,
+        )
+        print(
+            f"[A2F][returned] rank={self.world_rank}",
+            flush=True,
+        )
+        torch.npu.synchronize()
+        print(
+            f"[A2F][sync_done] rank={self.world_rank}",
+            flush=True,
         )
         logger.debug(
             "Window A2F sent layer=%d stage=%d batch=%d topk=%d",
@@ -745,13 +770,55 @@ class WindowAFDConnector(AFDConnectorBase):
             self.selected_expert_num,
             self.hidden_size,
         ]
+        print(
+            f"[Window][before_scheduler] rank={self.world_rank} "
+            f"sync_group_size={self.attn_size}",
+            flush=True,
+        )
+        window_ops.ffn_worker_scheduler(
+            self.schedule_context,
+            sync_group_size=self.attn_size,
+        )
+        torch.npu.synchronize()
+        print(
+            f"[Window][scheduler_done] rank={self.world_rank}",
+            flush=True,
+        )
+        print(
+            "[Window][before_batching] "
+            f"rank={self.world_rank} "
+            f"max_out_shape={max_out_shape} "
+            f"expert_num={self.local_expert_num} "
+            f"token_dtype={self._token_dtype()} "
+            f"need_schedule=0",
+            flush=True,
+        )
         outputs = window_ops.ffn_worker_batching(
             self.schedule_context,
             getattr(self, "local_expert_num", max(1, math.ceil(self.expert_num / self.ffn_size))),
             max_out_shape,
             token_dtype=self._token_dtype(),
-            need_schedule=1,
+            need_schedule=0,
             layer_num=0,
+        )
+        print(
+            f"[Window][batching_returned] rank={self.world_rank} "
+            f"hidden_states_shape={tuple(outputs[0].shape)} "
+            f"actual_token_num_shape={tuple(outputs[-1].shape)}",
+            flush=True,
+        )
+        torch.npu.synchronize()
+        actual_token_num = outputs[-1].detach().cpu().reshape(-1).tolist()
+        group_list = outputs[1].detach().cpu()
+        nonzero_group_list = group_list[group_list[:, 1] > 0].tolist()
+        actual_num = int(actual_token_num[0]) if actual_token_num else 0
+        print(
+            f"[Window][batching_sync_done] rank={self.world_rank} "
+            f"actual_token_num={actual_token_num} "
+            f"nonzero_group_list={nonzero_group_list[:32]} "
+            f"session_ids_head={outputs[2][:min(actual_num, 16)].detach().cpu().tolist()} "
+            f"token_ids_head={outputs[4][:min(actual_num, 16)].detach().cpu().tolist()}",
+            flush=True,
         )
         logger.debug(
             "Window FFN batching completed layer=%d stage=%d",

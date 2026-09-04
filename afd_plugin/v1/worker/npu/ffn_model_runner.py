@@ -286,6 +286,13 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 # object; the transfer metadata has no connector reference.
                 forward_context.additional_kwargs["afd_metadata"] = afd_metadata
                 _set_moe_layer_index(forward_context, int(layer_idx))
+                print(
+                    f"[FFN][before_compute] rank={self.connector.world_rank} "
+                    f"layer={layer_idx} "
+                    f"hidden_states_shape={tuple(hidden_states.shape)} "
+                    f"actual_token_num={states.actual_token_num.detach().cpu().tolist() if states.actual_token_num is not None else None}",
+                    flush=True,
+                )
                 rank_output = self.model.compute_ffn_output(
                     hidden_states=hidden_states,
                     layer_idx=int(layer_idx),
@@ -304,10 +311,25 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     ),
                     input_ids=payload.input_ids,
                 )
+                print(
+                    f"[FFN][after_compute] rank={self.connector.world_rank} "
+                    f"layer={layer_idx} shape={tuple(rank_output.shape)}",
+                    flush=True,
+                )
+            print(
+                f"[FFN][before_f2a] rank={self.connector.world_rank} "
+                f"layer={layer_idx}",
+                flush=True,
+            )
             self.connector.send_ffn_output(
                 rank_output,
                 payload.context,
                 ubatch_idx=0,
+            )
+            print(
+                f"[FFN][after_f2a] rank={self.connector.world_rank} "
+                f"layer={layer_idx}",
+                flush=True,
             )
 
     def execute_model(
