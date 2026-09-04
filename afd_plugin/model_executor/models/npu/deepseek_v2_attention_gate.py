@@ -67,7 +67,25 @@ def compute_gate_topk(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute routing payloads for a native-path gate proxy."""
 
-    router_logits, _ = gate(hidden_states)
+    # Native DSV4 computes router logits through DeviceOperator, which
+    # performs the gate matmul in fp32.  Calling ReplicatedLinear directly
+    # can return bf16 logits while e_score_correction_bias remains fp32;
+    # the fused top-k operator requires these dtypes to match.
+    if getattr(config, "model_type", None) == "deepseek_v4":
+        from vllm_ascend.device.device_op import DeviceOperator
+
+        router_logits = DeviceOperator.compute_gate_logits(
+            hidden_states,
+            gate.weight,
+        )
+    else:
+        router_logits, _ = gate(hidden_states)
+    routing_bias = getattr(gate, "e_score_correction_bias", None)
+    if routing_bias is not None and routing_bias.dtype != router_logits.dtype:
+        # The fused selectors require x and bias to have identical dtypes.
+        # Native DSV4 normally produces fp32 logits; retain a defensive cast
+        # for runtimes whose DeviceOperator returns another supported dtype.
+        routing_bias = routing_bias.to(router_logits.dtype)
     afd_metadata = get_afd_metadata_from_forward_context()
     if afd_metadata is None:
         raise RuntimeError(
@@ -109,7 +127,7 @@ def compute_gate_topk(
         topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k_hash(
             x=router_logits,
             k=top_k,
-            bias=gate.e_score_correction_bias,
+            bias=routing_bias,
             input_ids=input_ids,
             tid2eid=tid2eid.to(torch.int32),
             k_group=getattr(config, "topk_group", 1),
@@ -134,7 +152,7 @@ def compute_gate_topk(
             num_expert_group=getattr(config, "n_group", 1),
             topk_group=getattr(config, "topk_group", 1),
             routed_scaling_factor=(routed_scaling_factor if mix_placement else 1.0),
-            e_score_correction_bias=gate.e_score_correction_bias,
+            e_score_correction_bias=routing_bias,
             mix_placement=mix_placement,
             num_logical_experts=router_logits.shape[1],
             num_shared_experts=config.n_shared_experts,
