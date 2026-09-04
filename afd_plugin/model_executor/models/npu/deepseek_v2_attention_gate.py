@@ -346,7 +346,17 @@ def compute_attention_gate_moe_ffn(
             ),
         )
     else:
-        routed_output = hidden_states.new_empty((0, hidden_states.shape[-1]))
+        # FFNWorkerBatching emits INT8 payloads for dynamic quantization, but
+        # FFNToAttention accepts only FP16/BF16.  Empty FFN ranks do not enter
+        # the MLP path, so explicitly create the zero-row output in the same
+        # BF16 dtype produced by the ref dynamic-quantized FFN path.
+        empty_output_dtype = (
+            torch.bfloat16 if hidden_states.dtype == torch.int8 else hidden_states.dtype
+        )
+        routed_output = hidden_states.new_empty(
+            (0, hidden_states.shape[-1]),
+            dtype=empty_output_dtype,
+        )
 
     if hidden_states.dtype != torch.float16:
         routed_output *= layer.mlp.routed_scaling_factor
