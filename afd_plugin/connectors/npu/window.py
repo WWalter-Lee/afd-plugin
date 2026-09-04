@@ -341,6 +341,20 @@ class WindowAFDConnector(AFDConnectorBase):
             self.context_holder = context_factory(**kwargs)
             self.schedule_context = self.context_holder.get_schedule_context_tensor()
             self._build_rank_tables()
+            print(
+                "[Window][init] "
+                f"role={self.afd_config.role} "
+                f"world_rank={self.world_rank} "
+                f"attn_size={self.attn_size} "
+                f"ffn_size={self.ffn_size} "
+                f"micro_batch_num={self.extra_info.micro_batch_num} "
+                f"micro_batch_size={self.micro_batch_size} "
+                f"selected_expert_num={self.selected_expert_num} "
+                f"expert_num={self.expert_num} "
+                f"local_expert_num={self.local_expert_num} "
+                f"window_size={self.window_size}",
+                flush=True,
+            )
             self.data_path_ready = True
             self._initialized = True
             logger.info(
@@ -642,6 +656,24 @@ class WindowAFDConnector(AFDConnectorBase):
         batch_size = int(hidden_states.shape[0])
         expert_ids = expert_ids.to(torch.int32).reshape(batch_size, -1)
         expert_scales = expert_scales.to(torch.float32).reshape(batch_size, -1)
+        ids_cpu = expert_ids.detach().cpu()
+        duplicate_rows = [
+            row_idx
+            for row_idx, row in enumerate(ids_cpu.tolist())
+            if len(set(row)) != len(row)
+        ]
+        print(
+            "[A2F][check] "
+            f"rank={self.world_rank} "
+            f"batch_size={batch_size} "
+            f"configured_batch_size={self.micro_batch_size} "
+            f"expert_ids_shape={tuple(expert_ids.shape)} "
+            f"expert_ids_min={int(ids_cpu.min().item()) if ids_cpu.numel() else None} "
+            f"expert_ids_max={int(ids_cpu.max().item()) if ids_cpu.numel() else None} "
+            f"duplicate_rows_head={duplicate_rows[:8]} "
+            f"first_rows={ids_cpu[:4].tolist()}",
+            flush=True,
+        )
 
         # A2F receives only routed top-k IDs.  The shared-expert slot is
         # represented by selected_expert_num (K + shared) in the Window
@@ -798,6 +830,17 @@ class WindowAFDConnector(AFDConnectorBase):
         group_list = outputs[1].detach().cpu()
         nonzero_group_list = group_list[group_list[:, 1] > 0].tolist()
         actual_num = int(actual_token_num[0]) if actual_token_num else 0
+        group_sum = int(group_list[:, 1].sum().item())
+        print(
+            "[Window][batching_check] "
+            f"rank={self.world_rank} "
+            f"actual_token_num={actual_token_num} "
+            f"group_sum={group_sum} "
+            f"group_list_shape={tuple(group_list.shape)} "
+            f"hidden_rows={outputs[0].shape[0]} "
+            f"nonzero_group_list_head={nonzero_group_list[:32]}",
+            flush=True,
+        )
         print(
             f"[Window][batching_sync_done] rank={self.world_rank} "
             f"actual_token_num={actual_token_num} "
