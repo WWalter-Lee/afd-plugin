@@ -626,6 +626,34 @@ class WindowAFDConnector(AFDConnectorBase):
         attn_data = [1, batch_size, self.selected_expert_num, token_size]
         return ffn_info, ffn_data, attn_info, attn_data
 
+    @staticmethod
+    def _sanitize_group_list(
+        group_list: torch.Tensor,
+        actual_num: int,
+    ) -> torch.Tensor:
+        """Drop stale group-list rows beyond the valid token prefix.
+
+        The batching operator returns a fixed-size ``[expert_num, 2]``
+        tensor.  Some A3 paths leave non-zero values in unused rows, while
+        ``actual_token_num`` identifies the valid token prefix.  Keep only
+        rows whose cumulative token count belongs to that prefix and zero
+        the remainder before passing the metadata to FFN computation.
+        """
+        if group_list.dim() != 2 or group_list.shape[-1] != 2:
+            raise RuntimeError(
+                "Window batching returned group_list with unexpected shape "
+                f"{tuple(group_list.shape)}"
+            )
+        if actual_num < 0:
+            raise RuntimeError(
+                f"Window batching returned negative actual_token_num={actual_num}"
+            )
+        counts = group_list[:, 1].to(torch.int64)
+        positive_counts = counts.clamp_min(0)
+        cumulative = torch.cumsum(positive_counts, dim=0)
+        valid_rows = (counts > 0) & (cumulative <= actual_num)
+        return group_list.masked_fill(~valid_rows.unsqueeze(1), 0)
+
     def _token_dtype(self) -> int:
         if self.extra_info.quant_mode == 2:
             return 2
@@ -827,16 +855,20 @@ class WindowAFDConnector(AFDConnectorBase):
         )
         torch.npu.synchronize()
         actual_token_num = outputs[-1].detach().cpu().reshape(-1).tolist()
-        group_list = outputs[1].detach().cpu()
-        nonzero_group_list = group_list[group_list[:, 1] > 0].tolist()
         actual_num = int(actual_token_num[0]) if actual_token_num else 0
+        raw_group_list = outputs[1]
+        group_list = self._sanitize_group_list(raw_group_list, actual_num)
+        group_list_cpu = group_list.detach().cpu()
+        nonzero_group_list = group_list_cpu[group_list_cpu[:, 1] > 0].tolist()
+        raw_group_sum = int(raw_group_list[:, 1].clamp_min(0).sum().item())
         group_sum = int(group_list[:, 1].sum().item())
         print(
             "[Window][batching_check] "
             f"rank={self.world_rank} "
             f"actual_token_num={actual_token_num} "
+            f"raw_group_sum={raw_group_sum} "
             f"group_sum={group_sum} "
-            f"group_list_shape={tuple(group_list.shape)} "
+            f"group_list_shape={tuple(raw_group_list.shape)} "
             f"hidden_rows={outputs[0].shape[0]} "
             f"nonzero_group_list_head={nonzero_group_list[:32]}",
             flush=True,
@@ -854,7 +886,7 @@ class WindowAFDConnector(AFDConnectorBase):
             int(kwargs.get("layer_idx", 0)),
             ubatch_idx,
         )
-        hidden_states, group_list, session_ids, micro_batch_ids, token_ids, expert_offsets, dynamic_scale, actual_token_num = outputs
+        hidden_states, _, session_ids, micro_batch_ids, token_ids, expert_offsets, dynamic_scale, actual_token_num = outputs
         context = AFDTransferContext(
             metadata=AFDTransferMetadata.create_ffn_metadata(
                 layer_idx=int(kwargs.get("layer_idx", 0)),

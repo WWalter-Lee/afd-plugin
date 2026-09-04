@@ -287,10 +287,15 @@ def compute_attention_gate_moe_ffn(
         and group_list.shape[-1] == 2
     ):
         shared_start = int(shared_expert_local_start)
-        if shared_start < group_list.shape[0]:
+        if shared_start >= 0:
+            group_ids = group_list[:, 0].to(torch.int64)
             group_counts = group_list[:, 1].to(torch.int64)
-            route_count = int(group_counts[:shared_start].sum().item())
-            shared_count = int(group_counts[shared_start:].sum().item())
+            route_rows = (group_counts > 0) & (group_ids < shared_start)
+            shared_rows = (group_counts > 0) & (group_ids >= shared_start)
+            route_group_list = group_list[route_rows]
+            shared_group_list = group_list[shared_rows]
+            route_count = int(group_counts[route_rows].sum().item())
+            shared_count = int(group_counts[shared_rows].sum().item())
             if route_count + shared_count > hidden_states.shape[0]:
                 raise RuntimeError(
                     "Window batching group_list exceeds hidden_states rows: "
@@ -298,7 +303,6 @@ def compute_attention_gate_moe_ffn(
                     f"rows={hidden_states.shape[0]}"
                 )
             route_hidden_states = hidden_states[:route_count]
-            route_group_list = group_list[:shared_start]
             if shared_count:
                 shared_input = hidden_states[route_count : route_count + shared_count]
                 shared_scale = (
