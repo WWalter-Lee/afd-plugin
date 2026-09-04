@@ -843,13 +843,61 @@ class WindowAFDConnector(AFDConnectorBase):
         state = context.states
         if any(value is None for value in (state.session_ids, state.micro_batch_ids, state.token_ids, state.expert_offsets, state.actual_token_num)):
             raise RuntimeError("Window batching did not return complete routing metadata")
-        window_ops.ffn_to_attention(
-            getattr(ffn_output, "routed_output", ffn_output),
+
+        # FFNWorkerBatching returns tensors allocated for the configured
+        # maximum capacity.  FFNToAttention, however, requires x and every
+        # per-token metadata tensor to have the current effective length Y,
+        # which is reported by actual_token_num.  Keep the Window shapes
+        # unchanged; trim only the payload sent by this invocation.
+        actual_token_num = state.actual_token_num.reshape(-1)
+        if actual_token_num.numel() != 1:
+            raise RuntimeError(
+                "Window batching returned actual_token_num with unexpected "
+                f"shape {tuple(state.actual_token_num.shape)}"
+            )
+        actual_num = int(actual_token_num.item())
+        if actual_num < 0:
+            raise RuntimeError(f"Window batching returned negative actual_token_num={actual_num}")
+
+        routed_output = getattr(ffn_output, "routed_output", ffn_output)
+        if routed_output.dim() != 2 or routed_output.shape[0] < actual_num:
+            raise RuntimeError(
+                "Window F2A output capacity is smaller than actual token count: "
+                f"output_shape={tuple(routed_output.shape)} actual_num={actual_num}"
+            )
+
+        metadata = (
             state.session_ids,
             state.micro_batch_ids,
             state.token_ids,
             state.expert_offsets,
-            state.actual_token_num,
+        )
+        if any(value.dim() != 1 or value.shape[0] < actual_num for value in metadata):
+            raise RuntimeError(
+                "Window F2A metadata capacity is smaller than actual token count: "
+                f"actual_num={actual_num} metadata_shapes="
+                f"{[tuple(value.shape) for value in metadata]}"
+            )
+
+        routed_output = routed_output.narrow(0, 0, actual_num)
+        session_ids = state.session_ids.narrow(0, 0, actual_num)
+        micro_batch_ids = state.micro_batch_ids.narrow(0, 0, actual_num)
+        token_ids = state.token_ids.narrow(0, 0, actual_num)
+        expert_offsets = state.expert_offsets.narrow(0, 0, actual_num)
+        print(
+            f"[Window][before_f2a] rank={self.world_rank} "
+            f"actual_num={actual_num} "
+            f"x_shape={tuple(routed_output.shape)} "
+            f"metadata_shapes={[tuple(value.shape) for value in (session_ids, micro_batch_ids, token_ids, expert_offsets)]}",
+            flush=True,
+        )
+        window_ops.ffn_to_attention(
+            routed_output,
+            session_ids,
+            micro_batch_ids,
+            token_ids,
+            expert_offsets,
+            actual_token_num,
             self.hccl_comm_name,
             self.world_size,
             [1, self.micro_batch_size, self.selected_expert_num],
