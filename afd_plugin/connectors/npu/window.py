@@ -626,14 +626,38 @@ class WindowAFDConnector(AFDConnectorBase):
                 f"got={tuple(group_list.shape)} "
                 f"expected={(self.local_expert_num, 2)}",
             )
-        group_counts = group_list[:, 1]
-        if bool(torch.any(group_counts < 0).item()):
-            raise RuntimeError("Window batching returned a negative expert token count")
-        group_sum = int(group_counts.sum().item())
+        # On A3 the batching kernel writes the compact valid rows followed by
+        # one [0, 0] sentinel, but does not clear the rest of the fixed-size
+        # group_list output.  Locate the valid prefix using actual_token_num
+        # and clear the stale suffix before grouped matmul consumes it.
+        if actual_num == 0:
+            group_list = torch.zeros_like(group_list)
+        else:
+            group_counts = group_list[:, 1]
+            cumulative_counts = torch.cumsum(group_counts, dim=0)
+            prefix_ends = torch.nonzero(
+                cumulative_counts == actual_num,
+                as_tuple=False,
+            ).flatten()
+            if prefix_ends.numel() == 0:
+                raise RuntimeError(
+                    "Window batching group_list has no valid prefix matching "
+                    f"actual_token_num={actual_num}",
+                )
+            valid_row_num = int(prefix_ends[0].item()) + 1
+            if bool(torch.any(group_counts[:valid_row_num] <= 0).item()):
+                raise RuntimeError(
+                    "Window batching valid group_list prefix contains a "
+                    "non-positive expert token count",
+                )
+            group_list = group_list.clone()
+            group_list[valid_row_num:] = 0
+
+        group_sum = int(group_list[:, 1].sum().item())
         if group_sum != actual_num:
             raise RuntimeError(
-                "Window batching group_list does not match actual_token_num: "
-                f"group_sum={group_sum} actual={actual_num}",
+                "Window batching normalized group_list does not match "
+                f"actual_token_num: group_sum={group_sum} actual={actual_num}",
             )
         logger.debug(
             "Window FFN batching completed layer=%d stage=%d",
