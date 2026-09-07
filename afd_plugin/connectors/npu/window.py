@@ -626,12 +626,17 @@ class WindowAFDConnector(AFDConnectorBase):
                 f"got={tuple(group_list.shape)} "
                 f"expected={(self.local_expert_num, 2)}",
             )
-        # On A3 the batching kernel writes the compact valid rows followed by
-        # one [0, 0] sentinel, but does not clear the rest of the fixed-size
-        # group_list output.  Locate the valid prefix using actual_token_num
-        # and clear the stale suffix before grouped matmul consumes it.
+        # On A3 the batching kernel writes a compact type-2 group list followed
+        # by one [0, 0] sentinel, but does not clear the rest of the fixed-size
+        # output.  Locate the valid prefix using actual_token_num, then convert
+        # it to the dense cumulative type-0 form consumed by the native P2P
+        # W8A8 MoE MLP path.  This also discards the stale fixed-buffer suffix.
         if actual_num == 0:
-            group_list = torch.zeros_like(group_list)
+            group_list = torch.zeros(
+                (self.local_expert_num,),
+                dtype=group_list.dtype,
+                device=group_list.device,
+            )
         else:
             group_counts = group_list[:, 1]
             cumulative_counts = torch.cumsum(group_counts, dim=0)
@@ -650,13 +655,40 @@ class WindowAFDConnector(AFDConnectorBase):
                     "Window batching valid group_list prefix contains a "
                     "non-positive expert token count",
                 )
-            group_list = group_list.clone()
-            group_list[valid_row_num:] = 0
+            valid_expert_ids = group_list[:valid_row_num, 0]
+            if bool(
+                torch.any(
+                    (valid_expert_ids < 0)
+                    | (valid_expert_ids >= self.local_expert_num)
+                ).item()
+            ):
+                raise RuntimeError(
+                    "Window batching valid group_list prefix contains an "
+                    "out-of-range local expert ID",
+                )
+            if valid_row_num > 1 and bool(
+                torch.any(valid_expert_ids[1:] <= valid_expert_ids[:-1]).item()
+            ):
+                raise RuntimeError(
+                    "Window batching valid group_list expert IDs are not "
+                    "strictly increasing",
+                )
+            expert_counts = torch.zeros(
+                (self.local_expert_num,),
+                dtype=group_list.dtype,
+                device=group_list.device,
+            )
+            expert_counts.scatter_(
+                0,
+                valid_expert_ids.to(torch.long),
+                group_counts[:valid_row_num],
+            )
+            group_list = torch.cumsum(expert_counts, dim=0)
 
-        group_sum = int(group_list[:, 1].sum().item())
+        group_sum = int(group_list[-1].item()) if group_list.numel() else 0
         if group_sum != actual_num:
             raise RuntimeError(
-                "Window batching normalized group_list does not match "
+                "Window batching cumulative group_list does not match "
                 f"actual_token_num: group_sum={group_sum} actual={actual_num}",
             )
         logger.debug(
@@ -685,11 +717,10 @@ class WindowAFDConnector(AFDConnectorBase):
                 actual_token_num=actual_token_num,
             ),
         )
-        # Keep the static batching capacity Y.  group_list and
+        # Keep the static batching capacity Y.  The cumulative group_list and
         # actual_token_num describe the valid prefix consumed by grouped
-        # matmul and F2A, matching the ref implementation and the operator
-        # contract.  In particular, dynamic_scale must retain the same Y as
-        # hidden_states for token-wise dynamic dequantization.
+        # matmul and F2A.  In particular, dynamic_scale must retain the same Y
+        # as hidden_states for token-wise dynamic dequantization.
         return AFDA2FTransferPayload(
             hidden_states=hidden_states,
             context=context,

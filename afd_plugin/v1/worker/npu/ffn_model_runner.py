@@ -261,12 +261,10 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     layer_idx=int(layer_idx),
                     group_list=states.group_list,
                     dynamic_scales=states.dynamic_scale,
-                    group_list_type=(
-                        2
-                        if states.group_list is not None
-                        and states.group_list.dim() == 2
-                        else 1
-                    ),
+                    # Window normalizes batching's compact type-2 output to
+                    # the cumulative type-0 form used by the native P2P/MC2
+                    # W8A8 MLP path.
+                    group_list_type=0,
                     input_ids=payload.input_ids,
                 )
             self.connector.send_ffn_output(
