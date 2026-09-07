@@ -26,6 +26,20 @@ if TYPE_CHECKING:
     )
 
 
+def _get_expert_parameter(experts: torch.nn.Module, name: str):
+    """Read MoE weights across vLLM-Ascend EPLB API generations."""
+
+    getter = getattr(experts, "get_eplb_parameter", None)
+    if getter is not None:
+        return getter(name)
+    try:
+        return getattr(experts, name)
+    except AttributeError as exc:
+        raise RuntimeError(
+            f"Ascend MoE does not expose required expert parameter {name!r}"
+        ) from exc
+
+
 def compute_attention_gate_topk(
     layer: AFDDeepseekV2DecoderLayer,
     hidden_states: torch.Tensor,
@@ -197,15 +211,15 @@ def compute_attention_gate_moe_ffn(
     quant_type = experts.quant_type
     if quant_type == QuantType.NONE:
         moe_weights = MoEWeights(
-            w1=experts.get_eplb_parameter("w13_weight"),
-            w2=experts.get_eplb_parameter("w2_weight"),
+            w1=_get_expert_parameter(experts, "w13_weight"),
+            w2=_get_expert_parameter(experts, "w2_weight"),
             w1_bias=(
-                experts.get_eplb_parameter("w13_bias")
+                _get_expert_parameter(experts, "w13_bias")
                 if experts.moe_config.has_bias
                 else None
             ),
             w2_bias=(
-                experts.get_eplb_parameter("w2_bias")
+                _get_expert_parameter(experts, "w2_bias")
                 if experts.moe_config.has_bias
                 else None
             ),
@@ -213,21 +227,22 @@ def compute_attention_gate_moe_ffn(
     elif quant_type == QuantType.W8A8:
         if experts.dynamic_eplb:
             moe_weights = MoEWeights(
-                w1=experts.get_eplb_parameter("w13_weight_list"),
-                w2=experts.get_eplb_parameter("w2_weight_list"),
-                w1_scale=experts.get_eplb_parameter(
+                w1=_get_expert_parameter(experts, "w13_weight_list"),
+                w2=_get_expert_parameter(experts, "w2_weight_list"),
+                w1_scale=_get_expert_parameter(
+                    experts,
                     "w13_weight_scale_fp32_list",
                 ),
-                w2_scale=experts.get_eplb_parameter("w2_weight_scale_list"),
+                w2_scale=_get_expert_parameter(experts, "w2_weight_scale_list"),
             )
         else:
             moe_weights = MoEWeights(
-                w1=[experts.get_eplb_parameter("w13_weight")],
-                w2=[experts.get_eplb_parameter("w2_weight")],
+                w1=[_get_expert_parameter(experts, "w13_weight")],
+                w2=[_get_expert_parameter(experts, "w2_weight")],
                 w1_scale=[
-                    experts.get_eplb_parameter("w13_weight_scale_fp32"),
+                    _get_expert_parameter(experts, "w13_weight_scale_fp32"),
                 ],
-                w2_scale=[experts.get_eplb_parameter("w2_weight_scale")],
+                w2_scale=[_get_expert_parameter(experts, "w2_weight_scale")],
             )
     else:
         raise RuntimeError(
