@@ -16,6 +16,12 @@ from vllm_ascend.models import deepseek_v4 as native
 from vllm_ascend.models import deepseek_v4_mtp as native_mtp
 
 from afd_plugin.config import parse_afd_config
+from afd_plugin.connectors import AFDF2ATransferPayload
+from afd_plugin.distributed.topology import (
+    AFDWindowExpertLayout,
+    build_window_expert_layout,
+    resolve_role_rank,
+)
 from afd_plugin.model_executor.models.deepseek_v2 import (
     AFDRemoteFFNTransfer,
     RemoteFFNProxy,
@@ -26,7 +32,11 @@ _FFN_ROLE = frozenset(("ffn",))
 _NO_ROLE = frozenset()
 
 
-def _checkpoint_weight_roles(name: str) -> frozenset[str]:
+def _checkpoint_weight_roles(
+    name: str,
+    *,
+    compute_gate_on_attention: bool,
+) -> frozenset[str]:
     """Return the DSV4 AFD role that owns one raw checkpoint key."""
     normalized = name.removeprefix("model.")
     if normalized.startswith("mtp."):
@@ -34,7 +44,11 @@ def _checkpoint_weight_roles(name: str) -> frozenset[str]:
 
     parts = normalized.split(".")
     if len(parts) >= 3 and parts[0] == "layers" and parts[1].isdigit():
-        return _FFN_ROLE if parts[2] == "ffn" else _ATTENTION_ROLE
+        if parts[2] not in {"ffn", "mlp"}:
+            return _ATTENTION_ROLE
+        if compute_gate_on_attention and len(parts) >= 4 and parts[3] == "gate":
+            return _ATTENTION_ROLE
+        return _FFN_ROLE
     return _ATTENTION_ROLE
 
 
@@ -70,11 +84,162 @@ def _iter_role_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
     *,
     role: str,
+    compute_gate_on_attention: bool,
+    window_ffn_kind: str | None,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Consume a checkpoint iterator once and retain the active role's keys."""
     for name, loaded_weight in weights:
-        if role in _checkpoint_weight_roles(name):
-            yield name, loaded_weight
+        if role not in _checkpoint_weight_roles(
+            name,
+            compute_gate_on_attention=compute_gate_on_attention,
+        ):
+            continue
+        if role == "ffn" and window_ffn_kind is not None:
+            normalized = name.removeprefix("model.")
+            is_shared = any(
+                marker in f".{normalized}"
+                for marker in (".ffn.shared_experts.", ".mlp.shared_experts.")
+            )
+            if window_ffn_kind == "shared" and not is_shared:
+                continue
+            if window_ffn_kind == "routed" and is_shared:
+                continue
+        yield name, loaded_weight
+
+
+def _window_expert_layout(
+    vllm_config: VllmConfig,
+    role_rank: int,
+) -> AFDWindowExpertLayout:
+    afd_config = parse_afd_config(vllm_config, validate=False)
+    if vllm_config.parallel_config.enable_eplb:
+        raise ValueError("DSV4 Window AFD does not support EPLB")
+    if bool(getattr(native.get_ascend_config(), "mix_placement", False)):
+        raise ValueError(
+            "DSV4 Window AFD with a dedicated shared-expert rank requires "
+            "mix_placement=false"
+        )
+    shared_experts = int(vllm_config.model_config.hf_config.n_shared_experts)
+    if shared_experts != 1:
+        raise ValueError(
+            "DSV4 Window AFD requires exactly one dedicated shared-expert rank"
+        )
+    return build_window_expert_layout(
+        routed_expert_num=int(vllm_config.model_config.hf_config.n_routed_experts),
+        ffn_size=afd_config.num_ffn_ranks,
+        ffn_rank=role_rank,
+    )
+
+
+class AFDDeepseekV4RoutedMoE(native.DeepseekV4MoE):
+    """Routed-only DSV4 MoE backed by rank-local expert weights."""
+
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        config: native.DeepseekV2Config,
+        quant_config: Any,
+        prefix: str,
+        expert_layout: AFDWindowExpertLayout,
+    ) -> None:
+        nn.Module.__init__(self)
+        if expert_layout.is_shared:
+            raise ValueError("routed DSV4 MoE requires a routed expert layout")
+        parallel_config = vllm_config.parallel_config
+        self.tp_size = native.get_tensor_model_parallel_world_size()
+        self.tp_rank = native.get_tensor_model_parallel_rank()
+        self.layer_idx = int(prefix.split(sep=".")[-2])
+        self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.5)
+        self.swiglu_limit = getattr(config, "swiglu_limit", None)
+        # Window operators own cross-rank dispatch/combine.  Keep this FusedMoE
+        # local so its EP group cannot accidentally include the shared-only FFN
+        # rank from the surrounding vLLM data-parallel group.
+        self.ep_rank = 0
+        self.ep_size = 1
+        self.n_routed_experts = int(config.n_routed_experts)
+        self.n_shared_experts = 0
+        self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        self.enable_eplb = False
+        self.n_redundant_experts = 0
+        self.n_logical_experts = self.n_routed_experts
+        self.n_physical_experts = self.n_routed_experts
+        self.n_local_physical_experts = expert_layout.local_expert_count
+        self.physical_expert_start = expert_layout.local_expert_start
+        self.physical_expert_end = (
+            self.physical_expert_start + expert_layout.local_expert_count
+        )
+        self.gate = None
+        self.shared_experts = None
+        self.hash = False
+        self.experts = native.FusedMoE(
+            shared_experts=None,
+            gate=None,
+            num_experts=expert_layout.local_expert_count,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            renormalize=config.norm_topk_prob,
+            quant_config=quant_config,
+            tp_size=1,
+            dp_size=1,
+            use_grouped_topk=True,
+            num_expert_group=getattr(config, "n_group", 1),
+            topk_group=getattr(config, "topk_group", 1),
+            prefix=f"{prefix}.experts",
+            scoring_func=getattr(config, "scoring_func", "softmax"),
+            routed_scaling_factor=self.routed_scaling_factor,
+            swiglu_limit=self.swiglu_limit,
+            e_score_correction_bias=None,
+            enable_eplb=False,
+            num_redundant_experts=0,
+            is_sequence_parallel=self.is_sequence_parallel,
+            n_shared_experts=0,
+        )
+        # The checkpoint uses global routed expert IDs while this local-only
+        # FusedMoE allocates only this rank's expert slots.  Install the
+        # deterministic Window global-to-local map before weight loading.
+        expert_map = torch.full(
+            (self.n_routed_experts,),
+            -1,
+            dtype=torch.int32,
+        )
+        start = expert_layout.local_expert_start
+        count = expert_layout.local_expert_count
+        expert_map[start : start + count] = torch.arange(count, dtype=torch.int32)
+        self.experts.expert_map_manager._expert_map = expert_map
+        self.experts.expert_map_manager._local_num_experts = (
+            expert_layout.local_expert_count
+        )
+        self.experts._expert_map = expert_map
+
+
+class AFDDeepseekV4SharedMoE(nn.Module):
+    """Shared-only DSV4 FFN placed on the first Window FFN rank."""
+
+    def __init__(
+        self,
+        *,
+        config: native.DeepseekV2Config,
+        parallel_config: Any,
+        quant_config: Any,
+        prefix: str,
+    ) -> None:
+        super().__init__()
+        self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.5)
+        self.shared_experts = native.DeepseekV2MLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
+            hidden_act=config.hidden_act,
+            swiglu_limit=getattr(config, "swiglu_limit", None),
+            quant_config=quant_config,
+            is_sequence_parallel=parallel_config.use_sequence_parallel_moe,
+            reduce_results=False,
+            prefix=f"{prefix}.shared_experts",
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.shared_experts(hidden_states)
 
 
 class AFDDeepseekV4RemoteMoEProxy(RemoteFFNProxy):
@@ -126,11 +291,18 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
 
+        self.vllm_config = vllm_config
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_idx = int(prefix.split(sep=".")[-1])
         self.norm_eps = config.rms_norm_eps
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+        # The pinned vllm_cann DSV4 implementation constructs DeepseekV4MoE
+        # unconditionally in every decoder layer.
+        self.is_moe_layer = True
+        self.compute_gate_on_attention = bool(afd_config.compute_gate_on_attention)
+        self.is_window_afd = afd_config.connector == "WindowAFDConnector"
+        self.top_k = int(getattr(config, "num_experts_per_tok", 1))
 
         if self.afd_role == "attention":
             max_position_embeddings = config.rope_parameters[
@@ -150,6 +322,37 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
                 layer_idx=self.layer_idx,
                 phase="mtp" if is_draft_layer else "decoder",
             )
+            if self.compute_gate_on_attention and self.is_moe_layer:
+                # Keep the native DSV4 checkpoint namespace (mlp.gate) even
+                # though this proxy executes the gate on the Attention role.
+                self.mlp.gate = native.ReplicatedLinear(
+                    config.hidden_size,
+                    config.n_routed_experts,
+                    bias=False,
+                    quant_config=None,
+                    prefix=f"{prefix}.mlp.gate",
+                )
+                self.mlp.gate.precast_fp32_weight = True
+                self.mlp.gate.e_score_correction_bias = nn.Parameter(
+                    torch.empty(config.n_routed_experts, dtype=torch.float32),
+                )
+                num_hash_layers = int(getattr(config, "num_hash_layers", 0))
+                if self.layer_idx < num_hash_layers and not is_draft_layer:
+                    # Native DSV4 uses a token-id -> expert-id table for the
+                    # hash-routing prefix.  Keep the same parameter on the
+                    # Attention-side gate so checkpoint loading and routing
+                    # follow the native contract.
+                    self.mlp.gate.tid2eid = nn.Parameter(
+                        torch.zeros(
+                            config.vocab_size,
+                            self.top_k,
+                            dtype=torch.int32,
+                        ),
+                        requires_grad=False,
+                    )
+                    self.mlp.gate.e_score_correction_bias = None
+                else:
+                    self.mlp.gate.tid2eid = None
             self.input_layernorm = native.RMSNorm(
                 config.hidden_size,
                 eps=self.norm_eps,
@@ -175,13 +378,32 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
             self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         else:
             self.self_attn = native.PPMissingLayer()
-            self.mlp = native.DeepseekV4MoE(
-                config=config,
-                parallel_config=parallel_config,
-                quant_config=quant_config,
-                prefix=f"{prefix}.mlp",
-                is_draft_layer=is_draft_layer,
-            )
+            if self.is_window_afd:
+                role_rank = resolve_role_rank(vllm_config, afd_config)
+                expert_layout = _window_expert_layout(vllm_config, role_rank)
+                if expert_layout.is_shared:
+                    self.mlp = AFDDeepseekV4SharedMoE(
+                        config=config,
+                        parallel_config=parallel_config,
+                        quant_config=quant_config,
+                        prefix=f"{prefix}.mlp",
+                    )
+                else:
+                    self.mlp = AFDDeepseekV4RoutedMoE(
+                        vllm_config=vllm_config,
+                        config=config,
+                        quant_config=quant_config,
+                        prefix=f"{prefix}.mlp",
+                        expert_layout=expert_layout,
+                    )
+            else:
+                self.mlp = native.DeepseekV4MoE(
+                    config=config,
+                    parallel_config=parallel_config,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.mlp",
+                    is_draft_layer=is_draft_layer,
+                )
         # ### PATCH END
 
     def hc_pre(
@@ -311,7 +533,28 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
     ) -> AFDRemoteFFNTransfer:
         if not isinstance(self.mlp, AFDDeepseekV4RemoteMoEProxy):
             raise RuntimeError("DSV4 Attention layer requires its remote MoE proxy")
-        return self.mlp.dispatch_remote_ffn(hidden_states)
+        send_kwargs: dict[str, torch.Tensor] = {}
+        if self.compute_gate_on_attention:
+            from afd_plugin.model_executor.models.npu.deepseek_v2_attention_gate import (
+                compute_gate_topk,
+            )
+
+            topk_weights, topk_ids, _ = compute_gate_topk(
+                gate=self.mlp.gate,
+                vllm_config=self.vllm_config,
+                config=self.config,
+                top_k=self.top_k,
+                hidden_states=hidden_states,
+                input_ids=(
+                    getattr(get_forward_context(), "input_ids", None)
+                    if self.layer_idx < int(getattr(self.config, "num_hash_layers", 0))
+                    else None
+                ),
+                tid2eid=getattr(self.mlp.gate, "tid2eid", None),
+            )
+            send_kwargs["expert_ids"] = topk_ids
+            send_kwargs["expert_scales"] = topk_weights
+        return self.mlp.dispatch_remote_ffn(hidden_states, **send_kwargs)
 
     def receive_remote_ffn(
         self,
@@ -335,9 +578,28 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
         hidden_states: torch.Tensor,
         *,
         input_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        group_list: torch.Tensor | None = None,
+        dynamic_scales: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor | AFDF2ATransferPayload:
         if self.afd_role != "ffn":
             raise RuntimeError("DSV4 Attention role does not own local MoE weights")
+        if self.compute_gate_on_attention and self.is_moe_layer:
+            if group_list is None:
+                raise RuntimeError("DSV4 Window FFN requires group_list from batching")
+            from afd_plugin.model_executor.models.npu.deepseek_v2_attention_gate import (
+                compute_attention_gate_moe_ffn,
+            )
+
+            output = compute_attention_gate_moe_ffn(
+                self,
+                hidden_states=hidden_states,
+                group_list=group_list,
+                dynamic_scales=dynamic_scales,
+                topk_scales=kwargs.get("topk_scales"),
+                group_list_type=int(kwargs.get("group_list_type", 1)),
+            )
+            return output
         return self.mlp(hidden_states, input_ids=input_ids)
 
 
@@ -930,7 +1192,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         hidden_states: torch.Tensor,
         layer_idx: int,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | AFDF2ATransferPayload:
         return self.layers[layer_idx].compute_ffn_output(hidden_states, **kwargs)
 
 
@@ -949,6 +1211,7 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
         nn.Module.__init__(self)
         self.afd_config = parse_afd_config(vllm_config, validate=False)
         self.afd_role = self.afd_config.role
+        self.vllm_config = vllm_config
         # ### PATCH END
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
@@ -995,7 +1258,7 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
         hidden_states: torch.Tensor,
         layer_idx: int,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | AFDF2ATransferPayload:
         return self.model.compute_ffn_output(hidden_states, layer_idx, **kwargs)
 
     def forward_ubatches_layer_major(
@@ -1010,7 +1273,21 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return super().load_weights(_iter_role_weights(weights, role=self.afd_role))
+        window_ffn_kind = None
+        if self.afd_role == "ffn" and self.afd_config.connector == "WindowAFDConnector":
+            role_rank = resolve_role_rank(self.vllm_config, self.afd_config)
+            window_ffn_kind = _window_expert_layout(
+                self.vllm_config,
+                role_rank,
+            ).kind
+        return super().load_weights(
+            _iter_role_weights(
+                weights,
+                role=self.afd_role,
+                compute_gate_on_attention=self.afd_config.compute_gate_on_attention,
+                window_ffn_kind=window_ffn_kind,
+            )
+        )
 
 
 class AFDDeepSeekMultiTokenPredictorLayer(native_mtp.DeepSeekMultiTokenPredictorLayer):
