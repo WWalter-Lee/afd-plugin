@@ -462,6 +462,8 @@ class WindowAFDConnector(AFDConnectorBase):
         if expert_ids is None or expert_scales is None:
             raise RuntimeError("Window A2F requires expert_ids and expert_scales")
         batch_size = int(hidden_states.shape[0])
+        if batch_size <= 0:
+            raise RuntimeError("Window A2F requires at least one token")
         if batch_size > self.micro_batch_size:
             raise RuntimeError(
                 "Window A2F batch exceeds the configured capacity: "
@@ -484,26 +486,35 @@ class WindowAFDConnector(AFDConnectorBase):
                 "Window A2F received an unexpected routed expert scale width: "
                 f"got {expert_scales.shape[1]}, expected {routed_topk}",
             )
-        combine_scales = expert_scales
-        ffn_info, ffn_data, attn_info, _ = self._operator_shapes()
-        x = hidden_states.new_zeros(
-            (1, self.micro_batch_size, self.hidden_size),
+        # The synchronous Window operators reuse one ScheduleContext and
+        # therefore run with the fixed capacity shape used by the ref path.
+        # Repeat valid inputs into padding slots so dynamic quantization never
+        # receives artificial all-zero rows; padded results are discarded.
+        repeat_indices = torch.arange(
+            self.micro_batch_size,
+            dtype=torch.long,
+            device=hidden_states.device,
+        ) % batch_size
+        x = hidden_states[repeat_indices].reshape(
+            1,
+            self.micro_batch_size,
+            self.hidden_size,
         )
-        x[0, :batch_size].copy_(
-            hidden_states.reshape(batch_size, self.hidden_size),
+        padded_expert_ids = expert_ids[repeat_indices].reshape(
+            1,
+            self.micro_batch_size,
+            routed_topk,
         )
-        padded_expert_ids = torch.zeros(
-            (1, self.micro_batch_size, routed_topk),
-            dtype=torch.int32,
-            device=x.device,
-        )
-        padded_expert_ids[0, :batch_size].copy_(expert_ids)
-        active_mask = torch.zeros(
+        active_mask = torch.ones(
             (1, self.micro_batch_size),
             dtype=torch.bool,
-            device=x.device,
+            device=hidden_states.device,
         )
-        active_mask[0, :batch_size] = True
+        combine_scales = expert_scales.new_zeros(
+            (self.micro_batch_size, routed_topk),
+        )
+        combine_scales[:batch_size].copy_(expert_scales)
+        ffn_info, ffn_data, attn_info, _ = self._operator_shapes()
         session_id = torch.tensor([self.role_rank], dtype=torch.int32, device=x.device)
         micro_batch_id = torch.tensor(
             [int(kwargs.get("micro_batch_id", 0))],
@@ -571,7 +582,7 @@ class WindowAFDConnector(AFDConnectorBase):
             token_dtype=self._token_dtype_for_tensor(ref_tensor),
             need_schedule=1,
         )
-        return output.reshape_as(ref_tensor)
+        return output[: ref_tensor.shape[0]].reshape_as(ref_tensor)
 
     def recv_attn_output(
         self,
