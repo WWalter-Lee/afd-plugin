@@ -1,4 +1,4 @@
-# AttentionWorkerCombine 动态 BS 复用问题
+# Window AFD 动态 BS 复用问题
 
 ## 问题与复现方法
 
@@ -6,7 +6,7 @@ DSV4 Window AFD 在线服务复用同一个 `ScheduleContext` 和固定容量的
 
 已观察到的服务现象是：服务重启后的第一个短请求正确；第二个相同短请求错误；长请求第一次就可能错误。关闭 prefix caching 后现象不变。日志进一步确认 A2F、FFN batching 和 F2A 的输入一致，而第二次请求的 combine 输出不同；错误调用结束后，仅 token 0 的 flag 被清零，其余 token 的 flag 仍为 1。
 
-[`window_dynamic_bs_combine.py`](window_dynamic_bs_combine.py) 将模型、vLLM、HCCL 和 FFN 计算全部移除，只保留：
+[`window_dynamic_bs_combine.py`](window_dynamic_bs_combine.py) 是 combine 单算子对照组。它将模型、vLLM、HCCL 和 FFN 计算全部移除，只保留：
 
 1. 创建容量为 256 的 Attention Window 和 `ScheduleContext`。
 2. 在 Window 中写入确定性的 BF16 token 数据和就绪 flag。
@@ -19,9 +19,19 @@ DSV4 Window AFD 在线服务复用同一个 `ScheduleContext` 和固定容量的
 python tools/repro/window_dynamic_bs_combine.py
 ```
 
-正常情况下每次应满足 `status=PASS`，最终输出 `RESULT: not reproduced by the combine-only test`。若第三次出现数值误差或只有第一个 token 的 flag 被清零，脚本返回非零并输出 `RESULT: dynamic-BS issue reproduced`。
+实测三次均为 `PASS`，最终输出 `RESULT: not reproduced by the combine-only test`。因此，改变 `expert_scales.shape[0]` 本身不会在单算子、本卡直接写 Window 的场景触发问题，不能把根因直接归为 `AttentionWorkerCombine` 的独立 tiling 错误。
 
-这个单卡脚本直接写 Attention Window，因此只验证 combine 算子自身对动态 BS 的复用。如果它未复现，不能否定线上问题，而是说明下一步应把 F2A 写 Window 的过程加入一个最小双卡用例。
+这个结果不否定线上已经验证的动态 BS 根因。服务修复提交同时改变了两项行为：
+
+1. A2F 从“只将真实 BS 标记为 active”改为“将固定容量 256 全部标记为 active，并重复填充有效输入”。
+2. combine scales 从真实形状 `[actual_bs, 6]` 改为固定形状 `[256, 6]`，最后只截取真实 token 输出。
+
+因此下一个有判别力的测试不能只加 F2A，而应使用两张 NPU 跑完整的 `AttentionToFfn → FfnWorkerBatching → FfnToAttention → AttentionWorkerCombine` 闭环，对比两种模式：
+
+- 动态模式：固定物理容量 256，但 `active_mask` 和 combine scales 使用 `BS=8 → 1 → 8`。
+- 固定模式：四算子始终处理 256 行，真实行以外使用重复输入填充，最终截取真实行。
+
+如果只有动态模式失败、固定模式通过，才构成可以提交给算子上游的独立复现；同时还能通过每一步的 `actual_token_num` 和 Attention Window flags 判断问题起于 A2F/batching、F2A 写回，还是 combine 消费。
 
 ## 为什么 vLLM 的 BS 会变，而 ref 不变
 

@@ -1,7 +1,8 @@
-"""Reproduce AttentionWorkerCombine reuse with changing logical batch sizes.
+"""Check AttentionWorkerCombine reuse with changing logical batch sizes.
 
 Run this script on one Ascend NPU. It intentionally reuses one fixed-capacity
 Attention Window while changing only expert_scales.shape[0]: 8 -> 1 -> 8.
+It is a combine-only control, not a reproduction of the complete AFD path.
 """
 
 from __future__ import annotations
