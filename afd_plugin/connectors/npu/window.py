@@ -571,6 +571,53 @@ class WindowAFDConnector(AFDConnectorBase):
             token_dtype=self._token_dtype_for_tensor(ref_tensor),
             need_schedule=1,
         )
+        if key[1] == 0 and ref_tensor.shape[0] > 1:
+            if self.window_tensor is None:
+                raise RuntimeError("Window tensor is not initialized")
+            if self.window_tensor.element_size() != 1:
+                raise RuntimeError(
+                    "Expected byte-addressable Window tensor, "
+                    f"got dtype={self.window_tensor.dtype}",
+                )
+            batch_size = int(ref_tensor.shape[0])
+            expert_num = self.selected_expert_num
+            token_info_bytes = (
+                self.extra_info.micro_batch_num
+                * self.micro_batch_size
+                * expert_num
+                * 4
+            )
+            token_data_offset = _align_up(token_info_bytes, 512)
+            active_flag_bytes = batch_size * expert_num * 4
+            active_data_bytes = (
+                batch_size
+                * expert_num
+                * self.hidden_size
+                * ref_tensor.element_size()
+            )
+            flags = (
+                self.window_tensor[:active_flag_bytes]
+                .cpu()
+                .view(torch.int32)
+                .reshape(batch_size, expert_num)
+            )
+            window_data = (
+                self.window_tensor[
+                    token_data_offset : token_data_offset + active_data_bytes
+                ]
+                .cpu()
+                .view(ref_tensor.dtype)
+                .reshape(batch_size, expert_num, self.hidden_size)
+            )
+            print(
+                "[WINDOW-AFTER-COMBINE]",
+                f"rank={self.role_rank}",
+                f"batch={ref_tensor.shape[0]}",
+                f"flags={flags.tolist()}",
+                f"data_rows={window_data.float().sum(dim=2).tolist()}",
+                f"out_rows={output.detach().float().sum(dim=1).cpu().tolist()}",
+                flush=True,
+            )
         return output.reshape_as(ref_tensor)
 
     def recv_attn_output(
