@@ -207,6 +207,9 @@ class WindowAFDConnector(AFDConnectorBase):
         self.local_expert_num = 0
         self._pending_transfers: dict[tuple[int, int], AFDTransferContext] = {}
         self._initialized = False
+        # This diagnostic branch prints the first two layer-0 passes only.
+        self._trace_limit = 2
+        self._trace_counts: dict[str, int] = {}
 
         hf_config = vllm_config.model_config.hf_config
         self.hidden_size = int(hf_config.hidden_size)
@@ -318,6 +321,7 @@ class WindowAFDConnector(AFDConnectorBase):
             self.context_holder = context_factory(**kwargs)
             self.schedule_context = self.context_holder.get_schedule_context_tensor()
             self._build_rank_tables()
+            self._trace_initialization()
             ffn_kind = ""
             if self.afd_config.role == "ffn":
                 ffn_kind = build_window_expert_layout(
@@ -346,6 +350,117 @@ class WindowAFDConnector(AFDConnectorBase):
             self.close()
             raise
 
+    def _trace_allowed(self, event: str, layer_idx: int, role: str) -> bool:
+        """Limit data-path traces to layer 0 and representative role ranks."""
+        if layer_idx != 0:
+            return False
+        if self.afd_config.role != role:
+            return False
+        if role == "attention" and self.role_rank != 0:
+            return False
+        if role == "ffn" and self.role_rank not in (0, 1):
+            return False
+        return self._trace_counts.get(event, 0) < self._trace_limit
+
+    def _trace(self, event: str, **fields: Any) -> None:
+        self._trace_counts[event] = self._trace_counts.get(event, 0) + 1
+        details = " ".join(f"{name}={value}" for name, value in fields.items())
+        print(
+            f"[WindowTrace][{event}] role={self.afd_config.role} "
+            f"role_rank={self.role_rank} {details}",
+            flush=True,
+        )
+
+    def _trace_initialization(self) -> None:
+        """Print the immutable Window layout and control-plane tensors once."""
+        if self.role_rank != 0:
+            return
+        schedule_info = self.context_holder.get_schedule_context_info()
+        schedule_mode = 1 if self.afd_config.role == "attention" else 0
+        self._trace(
+            "schedule-context",
+            schedule_mode=schedule_mode,
+            schedule_context_shape=tuple(self.schedule_context.shape),
+            schedule_context_dtype=self.schedule_context.dtype,
+            info=schedule_info,
+        )
+
+        m = self.extra_info.micro_batch_num
+        bs = self.micro_batch_size
+        selected = self.selected_expert_num
+        if self.afd_config.role == "attention":
+            info_bytes = _align_up(4 * m * bs * selected)
+            data_bytes = 2 * m * bs * selected * self.hidden_size
+            self._trace(
+                "window-layout",
+                total_bytes=self.window_size,
+                info_region=(
+                    f"shape=({m},{bs},{selected}) dtype=int32 bytes={info_bytes}"
+                ),
+                data_region=(
+                    f"shape=({m},{bs},{selected},{self.hidden_size}) "
+                    f"dtype={self.vllm_config.model_config.dtype} bytes={data_bytes}"
+                ),
+            )
+        else:
+            token_bytes = (
+                _align_up(self.hidden_size + 4, 512)
+                if self.extra_info.quant_mode == 2
+                else self.hidden_size * 2
+            )
+            info_bytes = _align_up(
+                4 * self.attn_size * m * (2 + bs * selected),
+            )
+            data_bytes = self.attn_size * m * bs * selected * token_bytes
+            self._trace(
+                "window-layout",
+                total_bytes=self.window_size,
+                info_region=(
+                    f"shape=({self.attn_size},{m},{2 + bs * selected}) "
+                    f"dtype=int32 bytes={info_bytes}"
+                ),
+                data_region=(
+                    f"shape=({self.attn_size},{m},{bs},{selected},{token_bytes}) "
+                    f"dtype=uint8 bytes={data_bytes}"
+                ),
+            )
+
+        if self.afd_config.role == "attention":
+            sample_ids = sorted(
+                {
+                    0,
+                    1,
+                    self.routed_expert_num - 1,
+                    self.routed_expert_num,
+                }
+            )
+            rank_counts = torch.bincount(
+                self.expert_rank_table[0, :, 1].to(torch.long),
+                minlength=self.ffn_size,
+            )
+            self._trace(
+                "rank-tables",
+                expert_rank_table_shape=tuple(self.expert_rank_table.shape),
+                columns="[copy_num,ffn_role_rank,local_expert_id]",
+                experts_per_ffn_rank=rank_counts.cpu().tolist(),
+                sample_expert_ids=sample_ids,
+                sample_rows=self.expert_rank_table[0, sample_ids].cpu().tolist(),
+                attn_rank_table=self.attn_rank_table.cpu().tolist(),
+            )
+
+    def _attention_window_flags(self) -> torch.Tensor:
+        """Return the Attention Window flag/info region as [M, BS, K]."""
+        flag_num = (
+            self.extra_info.micro_batch_num
+            * self.micro_batch_size
+            * self.selected_expert_num
+        )
+        return self.window_tensor[: flag_num * 4].view(torch.int32).reshape(
+            self.extra_info.micro_batch_num,
+            self.micro_batch_size,
+            self.selected_expert_num,
+        )
+
     def _compute_window_size(self) -> int:
         attn_size, ffn_size, _, _ = _window_sizes(
             attention_size=self.attn_size,
@@ -359,6 +474,7 @@ class WindowAFDConnector(AFDConnectorBase):
 
     def close(self) -> None:
         self._pending_transfers.clear()
+        self._trace_counts.clear()
         holder = self.context_holder
         self.context_holder = None
         self.schedule_context = None
@@ -486,6 +602,19 @@ class WindowAFDConnector(AFDConnectorBase):
                 "Window A2F received an unexpected routed expert scale width: "
                 f"got {expert_scales.shape[1]}, expected {routed_topk}",
             )
+        layer_idx = int(context.metadata.layer_idx)
+        if self._trace_allowed("gate", layer_idx, "attention"):
+            self._trace(
+                "gate",
+                layer=layer_idx,
+                hidden_shape=tuple(hidden_states.shape),
+                hidden_dtype=hidden_states.dtype,
+                hidden_row0=hidden_states[0, :4].float().cpu().tolist(),
+                expert_ids_shape=tuple(expert_ids.shape),
+                expert_ids_row0=expert_ids[0].cpu().tolist(),
+                expert_scales_shape=tuple(expert_scales.shape),
+                expert_scales_row0=expert_scales[0].float().cpu().tolist(),
+            )
         # The synchronous Window operators reuse one ScheduleContext and
         # therefore run with the fixed capacity shape used by the ref path.
         # Repeat valid inputs into padding slots so dynamic quantization never
@@ -524,6 +653,32 @@ class WindowAFDConnector(AFDConnectorBase):
         # The Window A2F operator models one active MoE layer per invocation;
         # the model layer index is carried by the surrounding execution order.
         layer_id = torch.zeros((1,), dtype=torch.int32, device=x.device)
+        if self._trace_allowed("op1-a2f", layer_idx, "attention"):
+            self._trace(
+                "op1-a2f",
+                layer=layer_idx,
+                actual_bs=batch_size,
+                fixed_bs=self.micro_batch_size,
+                x=f"{tuple(x.shape)}/{x.dtype}",
+                session_id=f"{tuple(session_id.shape)}/int32 value={session_id.item()}",
+                micro_batch_id=(
+                    f"{tuple(micro_batch_id.shape)}/int32 "
+                    f"value={micro_batch_id.item()}"
+                ),
+                layer_id=f"{tuple(layer_id.shape)}/int32 value=0",
+                expert_ids=f"{tuple(padded_expert_ids.shape)}/int32",
+                expert_rank_table=f"{tuple(self.expert_rank_table.shape)}/int32",
+                active_mask=(
+                    f"{tuple(active_mask.shape)}/bool "
+                    f"active={active_mask.sum().item()}"
+                ),
+                ffn_info=ffn_info,
+                ffn_data=ffn_data,
+                attn_info=attn_info,
+                quant_mode=self.extra_info.quant_mode,
+                sync_flag=0,
+                effect="no return tensor; writes routed tokens to FFN Window",
+            )
         torch_npu.npu_attention_to_ffn(
             x,
             session_id,
@@ -570,7 +725,8 @@ class WindowAFDConnector(AFDConnectorBase):
         context = self._pending_transfers.pop(key, None)
         if context is None or not isinstance(context.states, WindowAFDTransferState):
             raise RuntimeError(f"Window F2A has no pending transfer for {key}")
-        output, _ = torch_npu.npu_attention_worker_combine(
+        trace_combine = self._trace_allowed("op4-combine", key[1], "attention")
+        output, next_layer_id = torch_npu.npu_attention_worker_combine(
             self.schedule_context,
             context.states.expert_scales,
             torch.tensor([key[1]], dtype=torch.int32, device=ref_tensor.device),
@@ -582,7 +738,33 @@ class WindowAFDConnector(AFDConnectorBase):
             token_dtype=self._token_dtype_for_tensor(ref_tensor),
             need_schedule=1,
         )
-        return output[: ref_tensor.shape[0]].reshape_as(ref_tensor)
+        real_output = output[: ref_tensor.shape[0]].reshape_as(ref_tensor)
+        if trace_combine:
+            flags_after = self._attention_window_flags().detach().cpu()
+            self._trace(
+                "op4-combine",
+                layer=key[1],
+                schedule_context=(
+                    f"{tuple(self.schedule_context.shape)}/"
+                    f"{self.schedule_context.dtype}"
+                ),
+                scales=(
+                    f"{tuple(context.states.expert_scales.shape)}/"
+                    f"{context.states.expert_scales.dtype}"
+                ),
+                scales_row0=context.states.expert_scales[0].float().cpu().tolist(),
+                output=f"{tuple(output.shape)}/{output.dtype}",
+                returned_output=f"{tuple(real_output.shape)}/{real_output.dtype}",
+                output_row0=real_output[0, :4].float().cpu().tolist(),
+                next_layer_id=next_layer_id.reshape(-1).cpu().tolist(),
+                hidden_size=self.hidden_size,
+                token_dtype=self._token_dtype_for_tensor(ref_tensor),
+                need_schedule=1,
+                flags_shape=tuple(flags_after.shape),
+                flags_nonzero_after=int(torch.count_nonzero(flags_after).item()),
+                flags_after_first_rows=flags_after[0, :2].tolist(),
+            )
+        return real_output
 
     def recv_attn_output(
         self,
@@ -620,6 +802,10 @@ class WindowAFDConnector(AFDConnectorBase):
             dynamic_scale,
             actual_token_num,
         ) = outputs
+        layer_idx = int(kwargs.get("layer_idx", 0))
+        trace_batching = self._trace_allowed("op2-batching", layer_idx, "ffn")
+        raw_group_list_shape = tuple(group_list.shape)
+        raw_group_sample: list[list[int]] = []
         if actual_token_num.numel() != 1:
             raise RuntimeError(
                 "Window batching returned actual_token_num with unexpected "
@@ -661,6 +847,8 @@ class WindowAFDConnector(AFDConnectorBase):
                     f"actual_token_num={actual_num}",
                 )
             valid_row_num = int(prefix_ends[0].item()) + 1
+            if trace_batching:
+                raw_group_sample = group_list[: min(valid_row_num, 4)].cpu().tolist()
             if bool(torch.any(group_counts[:valid_row_num] <= 0).item()):
                 raise RuntimeError(
                     "Window batching valid group_list prefix contains a "
@@ -701,6 +889,53 @@ class WindowAFDConnector(AFDConnectorBase):
             raise RuntimeError(
                 "Window batching cumulative group_list does not match "
                 f"actual_token_num: group_sum={group_sum} actual={actual_num}",
+            )
+        if trace_batching:
+            sample_num = min(actual_num, 4)
+            expert_counts = torch.diff(
+                group_list,
+                prepend=torch.zeros(
+                    (1,),
+                    dtype=group_list.dtype,
+                    device=group_list.device,
+                ),
+            )
+            self._trace(
+                "op2-batching",
+                layer=layer_idx,
+                schedule_context=(
+                    f"{tuple(self.schedule_context.shape)}/"
+                    f"{self.schedule_context.dtype}"
+                ),
+                local_expert_num=self.local_expert_num,
+                max_out_shape=max_out_shape,
+                token_dtype=self._token_dtype(),
+                need_schedule=1,
+                layer_num=0,
+                hidden_states=f"{tuple(hidden_states.shape)}/{hidden_states.dtype}",
+                raw_group_list=(
+                    f"{raw_group_list_shape}/{group_list.dtype} "
+                    f"type2_sample={raw_group_sample}"
+                ),
+                cumulative_group_list=(
+                    f"{tuple(group_list.shape)}/{group_list.dtype}"
+                ),
+                expert_counts_nonzero=int(torch.count_nonzero(expert_counts).item()),
+                group_sum=group_sum,
+                actual_token_num=actual_num,
+                dynamic_scale=f"{tuple(dynamic_scale.shape)}/{dynamic_scale.dtype}",
+                metadata_shapes={
+                    "session": tuple(session_ids.shape),
+                    "micro_batch": tuple(micro_batch_ids.shape),
+                    "token": tuple(token_ids.shape),
+                    "expert_offset": tuple(expert_offsets.shape),
+                },
+                metadata_sample={
+                    "session": session_ids[:sample_num].cpu().tolist(),
+                    "micro_batch": micro_batch_ids[:sample_num].cpu().tolist(),
+                    "token": token_ids[:sample_num].cpu().tolist(),
+                    "expert_offset": expert_offsets[:sample_num].cpu().tolist(),
+                },
             )
         logger.debug(
             "Window FFN batching completed layer=%d stage=%d",
@@ -801,6 +1036,41 @@ class WindowAFDConnector(AFDConnectorBase):
                 f"{[tuple(value.shape) for value in metadata]}"
             )
 
+        layer_idx = int(context.metadata.layer_idx)
+        if self._trace_allowed("op3-f2a", layer_idx, "ffn"):
+            sample_num = min(actual_num, 4)
+            self._trace(
+                "op3-f2a",
+                layer=layer_idx,
+                routed_output=f"{tuple(routed_output.shape)}/{routed_output.dtype}",
+                output_row0=(
+                    routed_output[0, :4].float().cpu().tolist()
+                    if actual_num > 0
+                    else []
+                ),
+                metadata_shapes={
+                    "session": tuple(state.session_ids.shape),
+                    "micro_batch": tuple(state.micro_batch_ids.shape),
+                    "token": tuple(state.token_ids.shape),
+                    "expert_offset": tuple(state.expert_offsets.shape),
+                },
+                metadata_sample={
+                    "session": state.session_ids[:sample_num].cpu().tolist(),
+                    "micro_batch": state.micro_batch_ids[:sample_num].cpu().tolist(),
+                    "token": state.token_ids[:sample_num].cpu().tolist(),
+                    "expert_offset": state.expert_offsets[:sample_num].cpu().tolist(),
+                },
+                actual_token_num=actual_num,
+                attn_rank_table=self.attn_rank_table.cpu().tolist(),
+                attn_info=[1, self.micro_batch_size, self.selected_expert_num],
+                attn_data=[
+                    1,
+                    self.micro_batch_size,
+                    self.selected_expert_num,
+                    self.hidden_size,
+                ],
+                effect="no return tensor; writes expert outputs to Attention Window",
+            )
         torch_npu.npu_ffn_to_attention(
             routed_output,
             state.session_ids,
