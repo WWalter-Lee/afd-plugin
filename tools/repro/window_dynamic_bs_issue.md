@@ -47,6 +47,18 @@ rank 0 模拟 FFN，rank 1 模拟 Attention。FFN 计算被固定 BF16 输出替
 
 动态模式已经在 A3 复现：前两次调用正常；第三次 `actual_token_num=56`，但 combine 后只有 token 0 的 7 个 flag 被清零，token 1～7 的 flag 均保持为 1。最初脚本随后出现的 `HcclAllreduce error code 5` 来自测试结尾在 Window HCCL group 上调用 `dist.barrier()`，不属于四核心算子的报错；脚本现已改用独立 Gloo group 做结束同步。
 
+进一步最小化时，优先使用 [`window_dynamic_bs_f2a_combine.py`](window_dynamic_bs_f2a_combine.py)。它删除 A2F 和 batching，在 FFN rank 直接构造 `session_ids`、`micro_batch_ids`、`token_ids`、`expert_offsets` 和 `actual_token_num`，只保留 `FfnToAttention → AttentionWorkerCombine`：
+
+```bash
+torchrun --standalone --nproc-per-node=2 \
+  tools/repro/window_dynamic_bs_f2a_combine.py --mode dynamic
+
+torchrun --standalone --nproc-per-node=2 \
+  tools/repro/window_dynamic_bs_f2a_combine.py --mode fixed
+```
+
+若两算子动态模式仍出现第三次 flag 残留，就可以确认 A2F 和 batching 不是复现所必需；若两算子模式通过，则必须保留四算子用例，说明前两个算子生成的元数据或状态参与触发问题。
+
 ## 为什么 vLLM 的 BS 会变，而 ref 不变
 
 这里有两个不同的 BS 概念：

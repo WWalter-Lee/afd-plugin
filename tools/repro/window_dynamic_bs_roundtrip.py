@@ -253,11 +253,18 @@ def main() -> int:
     dist.destroy_process_group(control_group)
     dist.destroy_process_group()
     if rank == ATTENTION_RANK:
-        print(
-            f"RESULT: mode={args.mode} {'FAIL' if failed else 'PASS'}",
-            flush=True,
-        )
-    return int(failed)
+        expected_failure = args.mode == "dynamic"
+        if failed and expected_failure:
+            result = "ISSUE_REPRODUCED"
+        elif not failed and not expected_failure:
+            result = "PASS"
+        elif failed:
+            result = "UNEXPECTED_FIXED_MODE_FAILURE"
+        else:
+            result = "ISSUE_NOT_REPRODUCED"
+        print(f"RESULT: mode={args.mode} {result}", flush=True)
+        return int(failed != expected_failure)
+    return 0
 
 
 if __name__ == "__main__":
