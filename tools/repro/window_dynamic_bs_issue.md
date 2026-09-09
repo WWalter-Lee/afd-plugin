@@ -61,6 +61,8 @@ torchrun --standalone --nproc-per-node=2 \
 
 两算子脚本必须在 Attention 完成 `ScheduleContext` 初始化后同步一次，并在每一轮 F2A/combine 后用独立 Gloo group 同步。完整链路中，这些时序由两侧 context 初始化以及“下一轮 batching 等待下一轮 A2F”自然保证；删除 A2F 和 batching 后若不补控制同步，FFN 可能在 Attention 初始化清零期间写 Window，或在 Attention 清理本轮 flag 前发送下一轮数据，形成测试脚本自身的 Window 覆盖竞争。
 
+A3 实测结果已经确认：修正初始化同步、逐轮同步和 expert-major 元数据后，两算子 dynamic 模式的三次调用全部数值正确，combine 后 flags 全部为 0。因此 `FfnToAttention + AttentionWorkerCombine` 单独支持 `BS=8 → 1 → 8`，不能复现线上问题。与之对照，四算子 dynamic 模式稳定在第三次调用出现数值误差和 `[0, 7, 7, 7, 7, 7, 7, 7]` 的残留 flags。最终复现必须保留四算子链路，问题应描述为动态 BS 下的跨算子状态或执行信息复用异常，不能直接归因于 combine 单算子。
+
 ## 为什么 vLLM 的 BS 会变，而 ref 不变
 
 这里有两个不同的 BS 概念：
