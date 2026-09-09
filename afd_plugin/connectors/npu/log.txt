@@ -1,0 +1,84 @@
+[root@devserver-hps-e0117616-00029 /]# ASCEND_LAUNCH_BLOCKING=1 torchrun --standalone --nproc-per-node=2 /data/l00951847/afd-plugin/tools/repro/window_dynamic_bs_roundtrip.py --mode dynamic
+W0908 20:48:13.531000 1203612 usr/local/python3.11.10/lib/python3.11/site-packages/torch/distributed/run.py:852] 
+W0908 20:48:13.531000 1203612 usr/local/python3.11.10/lib/python3.11/site-packages/torch/distributed/run.py:852] *****************************************
+W0908 20:48:13.531000 1203612 usr/local/python3.11.10/lib/python3.11/site-packages/torch/distributed/run.py:852] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0908 20:48:13.531000 1203612 usr/local/python3.11.10/lib/python3.11/site-packages/torch/distributed/run.py:852] *****************************************
+ffn call=1 actual_token_num=56
+attention call=1 mode=dynamic bs=8 max_abs_error=0.000000 flags=[0, 0, 0, 0, 0, 0, 0, 0] status=PASS
+ffn call=2 actual_token_num=7
+attention call=2 mode=dynamic bs=1 max_abs_error=0.000000 flags=[0] status=PASS
+ffn call=3 actual_token_num=56
+/usr/local/python3.11.10/lib/python3.11/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+return func(*args, **kwargs)
+attention call=3 mode=dynamic bs=8 max_abs_error=0.000000 flags=[0, 7, 7, 7, 7, 7, 7, 7] status=FAIL
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/data/l00951847/afd-plugin/tools/repro/window_dynamic_bs_roundtrip.py", line 259, in <module>
+[rank0]:     sys.exit(main())
+[rank0]:              ^^^^^^
+[rank0]:   File "/data/l00951847/afd-plugin/tools/repro/window_dynamic_bs_roundtrip.py", line 247, in main
+[rank0]:     dist.barrier()
+[rank0]:   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/distributed/c10d_logger.py", line 83, in wrapper
+[rank0]:     return func(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 4969, in barrier
+[rank0]:     work = group.barrier(opts=opts)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]: RuntimeError: InnerRunOpApi:../torch_npu/csrc/framework/OpParamMaker.cpp:287 OPS function error: HcclAllreduce, error code is 5
+[rank0]: [ERROR] 2026-09-08-20:48:22 (PID:1203693, Device:0, RankID:0) ERR01100 OPS call acl api failed.
+
+[rank1]: Traceback (most recent call last):
+[rank1]:   File "/data/l00951847/afd-plugin/tools/repro/window_dynamic_bs_roundtrip.py", line 259, in <module>
+[rank1]:     sys.exit(main())
+[rank1]:              ^^^^^^
+[rank1]:   File "/data/l00951847/afd-plugin/tools/repro/window_dynamic_bs_roundtrip.py", line 247, in main
+[rank1]:     dist.barrier()
+[rank1]:   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/distributed/c10d_logger.py", line 83, in wrapper
+[rank1]:     return func(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 4969, in barrier
+[rank1]:     work = group.barrier(opts=opts)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]: RuntimeError: InnerRunOpApi:../torch_npu/csrc/framework/OpParamMaker.cpp:287 OPS function error: HcclAllreduce, error code is 5
+[rank1]: [ERROR] 2026-09-08-20:48:22 (PID:1203694, Device:1, RankID:1) ERR01100 OPS call acl api failed.
+
+W0908 20:48:29.606000 1203612 usr/local/python3.11.10/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 1203693 closing signal SIGTERM
+E0908 20:48:29.638000 1203612 usr/local/python3.11.10/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/api.py:984] failed (exitcode: 1) local_rank: 1 (pid: 1203694) of binary: /usr/local/python3.11.10/bin/python3.11
+Traceback (most recent call last):
+File "/usr/local/python3.11.10/bin/torchrun", line 8, in <module>
+sys.exit(main())
+^^^^^^
+File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 362, in wrapper
+return f(*args, **kwargs)
+^^^^^^^^^^^^^^^^^^
+File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/distributed/run.py", line 991, in main
+run(args)
+File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/distributed/run.py", line 982, in run
+elastic_launch(
+File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 170, in __call__
+return launch_agent(self._config, self._entrypoint, list(args))
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 317, in launch_agent
+raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+/data/l00951847/afd-plugin/tools/repro/window_dynamic_bs_roundtrip.py FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+time      : 2026-09-08_20:48:29
+host      : devserver-hps-e0117616-00029
+rank      : 0 (local_rank: 0)
+exitcode  : 1 (pid: 1203693)
+error_file: <N/A>
+traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+time      : 2026-09-08_20:48:29
+host      : devserver-hps-e0117616-00029
+rank      : 1 (local_rank: 1)
+exitcode  : 1 (pid: 1203694)
+error_file: <N/A>
+traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================
+[ERROR] 2026-09-08-20:48:29 (PID:1203612, Device:-1, RankID:-1) ERR99999 UNKNOWN applicaiton exception

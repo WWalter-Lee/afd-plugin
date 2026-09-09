@@ -25,6 +25,7 @@ SUPPORTED_AFD_CONNECTORS: Final[tuple[str, ...]] = (
     "P2pHcclAFDConnector",
     "CAMP2pAFDConnector",
     AFD_ASYNC_CONNECTOR,
+    "WindowAFDConnector",
 )
 
 _ALIASES: Final[dict[str, str]] = {
@@ -96,6 +97,7 @@ class AFDConfig:
             self.role,
             self.num_attention_ranks,
             self.num_ffn_ranks,
+            self.compute_gate_on_attention,
         ]
         return hashlib.sha256(str(factors).encode()).hexdigest()
 

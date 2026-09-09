@@ -215,9 +215,63 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 "execute_connector_driven_step requires a connector-driven "
                 "AFD connector",
             )
+        if getattr(self.connector, "is_window_connector", False):
+            step_afd_npu_profiler(self.prof)
+            self._window_ffn_forward()
+            return None
         step_afd_npu_profiler(self.prof)
         self._ffn_forward_connector_driven()
         return None
+
+    def _window_ffn_forward(self) -> None:
+        """Run one synchronous Window exchange across all routed layers."""
+        for layer_idx in _ffn_layer_indices(self):
+            payload = self.connector.recv_attn_output(
+                ubatch_idx=0,
+                layer_idx=int(layer_idx),
+                max_num_tokens=self.max_num_tokens,
+            )
+            states = payload.context.states
+            if states is None:
+                raise RuntimeError("Window batching returned no transfer state")
+            hidden_states = payload.hidden_states
+            num_tokens = int(hidden_states.shape[0])
+            afd_metadata = AFDForwardContextMetadata(
+                tokens_start_loc=[0],
+                requests_start_loc=[0],
+                stage_idx=0,
+                connector=self.connector,
+                tokens_lens=[num_tokens],
+                num_stages=1,
+                tokens_unpadded_lens=[num_tokens],
+            )
+            with ascend_forward_context(
+                vllm_config=self.vllm_config,
+                afd_metadata=afd_metadata,
+                model_instance=self.model,
+                input_ids=payload.input_ids,
+                num_tokens=num_tokens,
+            ) as forward_context:
+                # ``afd_metadata`` must remain the plugin forward metadata
+                # object; the transfer metadata has no connector reference.
+                forward_context.additional_kwargs["afd_metadata"] = afd_metadata
+                _set_moe_layer_index(forward_context, int(layer_idx))
+                rank_output = self.model.compute_ffn_output(
+                    hidden_states=hidden_states,
+                    layer_idx=int(layer_idx),
+                    group_list=states.group_list,
+                    dynamic_scales=states.dynamic_scale,
+                    # Window normalizes batching's compact type-2 output to
+                    # the cumulative type-0 form used by the native P2P/MC2
+                    # W8A8 MLP path.
+                    group_list_type=0,
+                    input_ids=payload.input_ids,
+                )
+            self.connector.send_ffn_output(
+                rank_output,
+                payload.context,
+                ubatch_idx=0,
+            )
 
     def execute_model(
         self,
@@ -1020,12 +1074,19 @@ def _ffn_layer_indices(runner: AFDNPUFFNModelRunner) -> range | list[int]:
 
 
 def _is_moe_layer(hf_config: object, layer_idx: int) -> bool:
+    n_routed_experts = getattr(hf_config, "n_routed_experts", None)
+    if n_routed_experts is None:
+        return False
+
+    # DSV4 constructs a routed MoE in every decoder layer.  Its config does
+    # not define the DSV2 dense-prefix fields below, so do not infer the
+    # layer layout from those optional compatibility fields.
+    if getattr(hf_config, "model_type", None) == "deepseek_v4":
+        return True
+
     moe_layer_freq = getattr(hf_config, "moe_layer_freq", 1)
-    return (
-        hf_config.n_routed_experts is not None
-        and layer_idx >= hf_config.first_k_dense_replace
-        and layer_idx % moe_layer_freq == 0
-    )
+    first_k_dense_replace = getattr(hf_config, "first_k_dense_replace", 0)
+    return layer_idx >= first_k_dense_replace and layer_idx % moe_layer_freq == 0
 
 
 def _make_dp_metadata_payload(

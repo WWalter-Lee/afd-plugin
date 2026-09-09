@@ -2004,7 +2004,9 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             )
             return should_ubatch, num_tokens_padded, None, cudagraph_mode
 
-        if self.connector.control_plane is None:
+        if self.connector.control_plane is None and not bool(
+            getattr(self.connector, "requires_lockstep_dp_sync", False)
+        ):
             self._afd_unpadded_tokens_across_dp = torch.tensor(
                 [num_tokens_unpadded] * self.dp_size,
                 dtype=torch.int32,
