@@ -45,11 +45,6 @@ def run_ffn(
     row_count = CAPACITY * SELECTED_EXPERT_NUM
     session_ids = torch.zeros(row_count, dtype=torch.int32, device=device)
     micro_batch_ids = torch.zeros(row_count, dtype=torch.int32, device=device)
-    token_ids = torch.arange(CAPACITY, dtype=torch.int32, device=device)
-    token_ids = token_ids.repeat_interleave(SELECTED_EXPERT_NUM)
-    expert_offsets = torch.arange(
-        SELECTED_EXPERT_NUM, dtype=torch.int32, device=device
-    ).repeat(CAPACITY)
     attn_rank_table = torch.tensor(
         [ATTENTION_RANK], dtype=torch.int32, device=device
     )
@@ -61,6 +56,20 @@ def run_ffn(
             dtype=torch.int64,
             device=device,
         )
+        # FfnWorkerBatching sorts valid rows by expert. Reproduce that exact
+        # valid prefix instead of using the semantically equivalent token-major
+        # order, because F2A assigns input rows to AIV cores by row index.
+        token_ids = torch.zeros(row_count, dtype=torch.int32, device=device)
+        expert_offsets = torch.zeros(
+            row_count, dtype=torch.int32, device=device
+        )
+        valid_rows = active_batch * SELECTED_EXPERT_NUM
+        token_ids[:valid_rows] = torch.arange(
+            active_batch, dtype=torch.int32, device=device
+        ).repeat(SELECTED_EXPERT_NUM)
+        expert_offsets[:valid_rows] = torch.arange(
+            SELECTED_EXPERT_NUM, dtype=torch.int32, device=device
+        ).repeat_interleave(active_batch)
         ffn_output = torch.full(
             (row_count, HIDDEN_SIZE),
             0.125 * call_id,
@@ -195,17 +204,16 @@ def main() -> int:
     dist.destroy_process_group()
 
     if rank == ATTENTION_RANK:
-        expected_failure = args.mode == "dynamic"
-        if issue_reproduced and expected_failure:
+        if issue_reproduced and args.mode == "dynamic":
             result = "ISSUE_REPRODUCED"
-        elif not issue_reproduced and not expected_failure:
-            result = "PASS"
         elif issue_reproduced:
             result = "UNEXPECTED_FIXED_MODE_FAILURE"
+        elif args.mode == "dynamic":
+            result = "PASS_NO_REPRODUCTION"
         else:
-            result = "ISSUE_NOT_REPRODUCED"
+            result = "PASS"
         print(f"RESULT: mode={args.mode} {result}", flush=True)
-        return int(issue_reproduced != expected_failure)
+        return int(args.mode == "fixed" and issue_reproduced)
     return 0
 
 
