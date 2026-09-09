@@ -26,12 +26,26 @@ python tools/repro/window_dynamic_bs_combine.py
 1. A2F 从“只将真实 BS 标记为 active”改为“将固定容量 256 全部标记为 active，并重复填充有效输入”。
 2. combine scales 从真实形状 `[actual_bs, 6]` 改为固定形状 `[256, 6]`，最后只截取真实 token 输出。
 
-因此下一个有判别力的测试不能只加 F2A，而应使用两张 NPU 跑完整的 `AttentionToFfn → FfnWorkerBatching → FfnToAttention → AttentionWorkerCombine` 闭环，对比两种模式：
+因此下一个有判别力的测试不能只加 F2A，而应使用两张 NPU 跑完整的 `AttentionToFfn → FfnWorkerBatching → FfnToAttention → AttentionWorkerCombine` 闭环。[`window_dynamic_bs_roundtrip.py`](window_dynamic_bs_roundtrip.py) 实现了这个测试，不依赖模型和 vLLM scheduler，并提供两种模式：
 
 - 动态模式：固定物理容量 256，但 `active_mask` 和 combine scales 使用 `BS=8 → 1 → 8`。
 - 固定模式：四算子始终处理 256 行，真实行以外使用重复输入填充，最终截取真实行。
 
 如果只有动态模式失败、固定模式通过，才构成可以提交给算子上游的独立复现；同时还能通过每一步的 `actual_token_num` 和 Attention Window flags 判断问题起于 A2F/batching、F2A 写回，还是 combine 消费。
+
+分别运行，每次使用两张 NPU：
+
+```bash
+torchrun --standalone --nproc-per-node=2 \
+  tools/repro/window_dynamic_bs_roundtrip.py --mode dynamic
+
+torchrun --standalone --nproc-per-node=2 \
+  tools/repro/window_dynamic_bs_roundtrip.py --mode fixed
+```
+
+rank 0 模拟 FFN，rank 1 模拟 Attention。FFN 计算被固定 BF16 输出替代，因此结果不受模型、权重或 MoE 数学影响。第 `n` 次调用的每个 routed slot 和 shared slot 都返回 `0.125 × n`，路由权重之和为 1，所以 combine 的期望值为 `0.25 × n`。每轮使用不同值，可以让未处理行的陈旧输出直接表现为数值误差。
+
+动态模式已经在 A3 复现：前两次调用正常；第三次 `actual_token_num=56`，但 combine 后只有 token 0 的 7 个 flag 被清零，token 1～7 的 flag 均保持为 1。最初脚本随后出现的 `HcclAllreduce error code 5` 来自测试结尾在 Window HCCL group 上调用 `dist.barrier()`，不属于四核心算子的报错；脚本现已改用独立 Gloo group 做结束同步。
 
 ## 为什么 vLLM 的 BS 会变，而 ref 不变
 

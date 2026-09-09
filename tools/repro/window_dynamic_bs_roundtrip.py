@@ -155,7 +155,10 @@ def run_attention(
         )
         torch.npu.synchronize()
 
-        max_error = (output[:batch_size].float() - 0.5).abs().max().item()
+        expected_value = 0.25 * call_id
+        max_error = (
+            output[:batch_size].float() - expected_value
+        ).abs().max().item()
         remaining_flags = flags[:batch_size].sum(dim=1).cpu().tolist()
         call_failed = max_error > 0.01 or any(remaining_flags)
         failed |= call_failed
@@ -194,7 +197,7 @@ def run_ffn(group_name: str, context: torch.Tensor) -> None:
         ) = outputs
         ffn_output = torch.full(
             (hidden_states.shape[0], HIDDEN_SIZE),
-            0.25,
+            0.125 * call_id,
             dtype=torch.bfloat16,
             device=device,
         )
@@ -229,6 +232,7 @@ def main() -> int:
         raise RuntimeError("This test requires exactly two processes")
     torch.npu.set_device(local_rank)
     dist.init_process_group(backend="hccl")
+    control_group = dist.new_group(ranks=[FFN_RANK, ATTENTION_RANK], backend="gloo")
 
     process_group = dist.distributed_c10d._get_default_group()
     backend = process_group._get_backend(torch.device("npu"))
@@ -244,8 +248,9 @@ def main() -> int:
     else:
         run_ffn(group_name, context)
 
-    dist.barrier()
+    dist.barrier(group=control_group)
     holder.stop_schedule()
+    dist.destroy_process_group(control_group)
     dist.destroy_process_group()
     if rank == ATTENTION_RANK:
         print(
