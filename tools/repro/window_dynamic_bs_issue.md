@@ -59,6 +59,8 @@ torchrun --standalone --nproc-per-node=2 \
 
 若两算子动态模式仍出现第三次 flag 残留，就可以确认 A2F 和 batching 不是复现所必需；若两算子模式通过，则必须保留四算子用例，说明前两个算子生成的元数据或状态参与触发问题。
 
+两算子脚本必须在 Attention 完成 `ScheduleContext` 初始化后同步一次，并在每一轮 F2A/combine 后用独立 Gloo group 同步。完整链路中，这些时序由两侧 context 初始化以及“下一轮 batching 等待下一轮 A2F”自然保证；删除 A2F 和 batching 后若不补控制同步，FFN 可能在 Attention 初始化清零期间写 Window，或在 Attention 清理本轮 flag 前发送下一轮数据，形成测试脚本自身的 Window 覆盖竞争。
+
 ## 为什么 vLLM 的 BS 会变，而 ref 不变
 
 这里有两个不同的 BS 概念：

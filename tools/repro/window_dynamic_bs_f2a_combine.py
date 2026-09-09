@@ -36,7 +36,12 @@ def attention_window_size() -> int:
     return info + data
 
 
-def run_ffn(mode: str, group_name: str, device: torch.device) -> None:
+def run_ffn(
+    mode: str,
+    group_name: str,
+    device: torch.device,
+    control_group: dist.ProcessGroup,
+) -> None:
     row_count = CAPACITY * SELECTED_EXPERT_NUM
     session_ids = torch.zeros(row_count, dtype=torch.int32, device=device)
     micro_batch_ids = torch.zeros(row_count, dtype=torch.int32, device=device)
@@ -80,12 +85,16 @@ def run_ffn(mode: str, group_name: str, device: torch.device) -> None:
             f"ffn call={call_id} actual_token_num={actual_token_num.item()}",
             flush=True,
         )
+        # A2F/batching provides this per-step handshake in the full pipeline.
+        # Keep F2A from overwriting flags before Attention clears this call.
+        dist.barrier(group=control_group)
 
 
 def run_attention(
     mode: str,
     context: torch.Tensor,
     window: torch.Tensor,
+    control_group: dist.ProcessGroup,
 ) -> bool:
     device = window.device
     scale_row = torch.zeros(ROUTED_TOPK, dtype=torch.float32, device=device)
@@ -123,6 +132,7 @@ def run_attention(
             f"status={'STALE' if call_failed else 'PASS'}",
             flush=True,
         )
+        dist.barrier(group=control_group)
     return issue_reproduced
 
 
@@ -148,6 +158,7 @@ def main() -> int:
     window = backend._get_window_mem()
 
     holder = None
+    context = None
     issue_reproduced = False
     if rank == ATTENTION_RANK:
         holder = torch_npu._afd.create_schedule_context_holder(
@@ -163,11 +174,21 @@ def main() -> int:
             attention_window_size=window.numel() * window.element_size(),
         )
         context = holder.get_schedule_context_tensor()
-        issue_reproduced = run_attention(args.mode, context, window)
-    else:
-        run_ffn(args.mode, group_name, device)
 
+    # Do not let FFN write the Window while Attention is still initializing
+    # its ScheduleContext and zeroing the token-info area.
     dist.barrier(group=control_group)
+    if rank == ATTENTION_RANK:
+        assert context is not None
+        issue_reproduced = run_attention(
+            args.mode,
+            context,
+            window,
+            control_group,
+        )
+    else:
+        run_ffn(args.mode, group_name, device, control_group)
+
     if holder is not None:
         holder.stop_schedule()
     dist.destroy_process_group(control_group)
