@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Window-based AFD connector initialization for Ascend NPU.
 
-The connector owns the communication resources and the lock-step A2F/F2A
-data path used by the initial A3 implementation.
+The connector owns the communication resources and the synchronous A2F/F2A
+data path.
 """
 
 from __future__ import annotations
@@ -13,7 +13,9 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
+import cann_ops_transformer as cot
 import torch
+import torch_npu
 import torch.distributed as dist
 from torch.distributed.distributed_c10d import ProcessGroup
 from vllm.logger import init_logger
@@ -114,59 +116,58 @@ def _window_sizes(
     hidden_size: int,
     quant_mode: int,
 ) -> tuple[int, int, int, int]:
-    """Return ``(attn_size, ffn_size, a2f_token_size, f2a_token_size)``.
+    """Return Window sizes and per-token byte strides for both directions.
 
-    The byte formulas mirror ref/local_window_utils.py.  Stage one computes
-    them once from the configured maximum batch capacity.
+    The result is ``(attn_window_bytes, ffn_window_bytes,
+    a2f_token_bytes, f2a_token_bytes)``.  Window sizes include both metadata
+    and token data.  The formulas mirror ref/local_window_utils.py and are
+    evaluated once from the configured maximum batch capacity.
     """
 
-    attn_info = _align_up(
-        4 * selected_expert_num * micro_batch_size * micro_batch_num,
-    )
     if quant_mode == 2:
-        attn_token_size = _align_up(hidden_size + 4, 512)
+        # H INT8 bytes plus one FP32 scale, padded to a 512-byte record.
+        a2f_token_bytes = _align_up(hidden_size + 4, 512)
     elif quant_mode == 0:
-        # Non-quantized A2F payloads use the model dtype (two bytes/value).
-        attn_token_size = hidden_size * 2
+        # H fp16/bfloat16 values, each occupying two bytes.
+        a2f_token_bytes = hidden_size * 2
     else:
         raise ValueError(f"unsupported Window quant_mode={quant_mode}")
-    attn_data = (
-        2 * hidden_size * selected_expert_num * micro_batch_size * micro_batch_num
+    # F2A always returns H fp16/bfloat16 values.
+    f2a_token_bytes = hidden_size * 2
+
+    attention_window_info_bytes = _align_up(
+        4 * selected_expert_num * micro_batch_size * micro_batch_num,
+    )
+    attention_window_data_bytes = (
+        f2a_token_bytes
+        * selected_expert_num
+        * micro_batch_size
+        * micro_batch_num
     )
 
-    ffn_info = _align_up(
+    ffn_window_info_bytes = _align_up(
         4
         * (selected_expert_num * micro_batch_size + 2)
         * micro_batch_num
         * attention_size,
     )
-    if quant_mode == 2:
-        ffn_token_size = _align_up(hidden_size + 4, 512)
-    elif quant_mode == 0:
-        ffn_token_size = hidden_size * 2
-    else:
-        ffn_token_size = hidden_size
-    ffn_data = (
-        ffn_token_size
+    ffn_window_data_bytes = (
+        a2f_token_bytes
         * selected_expert_num
         * micro_batch_size
         * micro_batch_num
         * attention_size
     )
     return (
-        attn_info + attn_data,
-        ffn_info + ffn_data,
-        attn_token_size,
-        hidden_size * 2,
+        attention_window_info_bytes + attention_window_data_bytes,
+        ffn_window_info_bytes + ffn_window_data_bytes,
+        a2f_token_bytes,
+        f2a_token_bytes,
     )
 
 
 class WindowAFDConnector(AFDConnectorBase):
-    """Create the shared M2N HCCL Window and schedule context.
-
-    The connector owns both the M2N Window resources and the lock-step
-    operator data path used by the initial A3 implementation.
-    """
+    """Create the M2N communication context, Window, and schedule context."""
 
     yield_after_attn_send = True
     supports_connector_driven_loop = True
@@ -194,10 +195,12 @@ class WindowAFDConnector(AFDConnectorBase):
         self.world_size = self.mapping.world_size
         self.attn_size = self.mapping.attention_size
         self.ffn_size = self.mapping.ffn_size
-        self.peer_ranks = self.mapping.peer_ranks
         self.process_group: ProcessGroup | None = None
         self.hccl_comm_name: str | None = None
         self.window_tensor: torch.Tensor | None = None
+        self.comm_buffer: Any | None = None
+        self.attn_window_size = 0
+        self.ffn_window_size = 0
         self.window_size = 0
         self.window_addr = 0
         self.context_holder: Any | None = None
@@ -238,7 +241,7 @@ class WindowAFDConnector(AFDConnectorBase):
         if self.micro_batch_size > 512:
             raise ValueError(
                 "WindowAFDConnector requires max_num_batched_tokens <= 512 "
-                "for the current A3 operators, "
+                "for the current AttentionToFfn operator, "
                 f"got {self.micro_batch_size}",
             )
         routed_topk = self.selected_expert_num - self.shared_expert_num
@@ -249,7 +252,7 @@ class WindowAFDConnector(AFDConnectorBase):
             )
         if self.shared_expert_num != 1:
             raise ValueError(
-                "WindowAFDConnector requires one dedicated shared expert rank, "
+                "WindowAFDConnector currently supports exactly one shared expert, "
                 f"got {self.shared_expert_num}",
             )
         routed_ffn_size = self.ffn_size - self.shared_expert_num
@@ -258,7 +261,19 @@ class WindowAFDConnector(AFDConnectorBase):
                 "WindowAFDConnector requires at least one routed-expert FFN rank"
             )
 
-        import torch_npu
+        (
+            self.attn_window_size,
+            self.ffn_window_size,
+            a2f_token_size,
+            f2a_token_size,
+        ) = _window_sizes(
+            attention_size=self.attn_size,
+            micro_batch_num=self.extra_info.micro_batch_num,
+            micro_batch_size=self.micro_batch_size,
+            selected_expert_num=self.selected_expert_num,
+            hidden_size=self.hidden_size,
+            quant_mode=self.extra_info.quant_mode,
+        )
 
         timeout = timedelta(minutes=30)
         try:
@@ -278,22 +293,39 @@ class WindowAFDConnector(AFDConnectorBase):
                 raise RuntimeError("HCCL ProcessGroup does not expose comm name API")
             self.hccl_comm_name = str(getter(self.world_rank))
 
-            self.window_size = self._compute_window_size()
-            backend._window_register_and_exchange(
-                self.window_size,
-                list(self.peer_ranks),
+            self.window_size = (
+                self.attn_window_size
+                if self.afd_config.role == "attention"
+                else self.ffn_window_size
             )
-            self.window_tensor = backend._get_window_mem()
+            self.window_tensor = torch.zeros(
+                self.window_size,
+                dtype=torch.uint8,
+                device=torch.device("npu"),
+            )
             self.window_addr = int(self.window_tensor.data_ptr())
 
-            _, _, a2f_token_size, f2a_token_size = _window_sizes(
-                attention_size=self.attn_size,
-                micro_batch_num=self.extra_info.micro_batch_num,
-                micro_batch_size=self.micro_batch_size,
-                selected_expert_num=self.selected_expert_num,
-                hidden_size=self.hidden_size,
-                quant_mode=self.extra_info.quant_mode,
-            )
+            ffn_info, ffn_data, attn_info, attn_data = self._operator_shapes()
+            if self.afd_config.role == "attention":
+                self.comm_buffer = cot.get_buffer_for_attention_to_ffn(
+                    self.process_group,
+                    self.world_size,
+                    ffn_info,
+                    ffn_data,
+                    quant_mode=self.extra_info.quant_mode,
+                    window_addr=self.window_addr,
+                    window_size=self.window_size,
+                )
+            else:
+                self.comm_buffer = cot.get_buffer_for_ffn_to_attention(
+                    self.process_group,
+                    self.world_size,
+                    attn_info,
+                    attn_data,
+                    window_addr=self.window_addr,
+                    window_size=self.window_size,
+                )
+
             context_factory = torch_npu._afd.create_schedule_context_holder
             kwargs = {
                 "schedule_mode": 1 if self.afd_config.role == "attention" else 0,
@@ -346,17 +378,6 @@ class WindowAFDConnector(AFDConnectorBase):
             self.close()
             raise
 
-    def _compute_window_size(self) -> int:
-        attn_size, ffn_size, _, _ = _window_sizes(
-            attention_size=self.attn_size,
-            micro_batch_num=self.extra_info.micro_batch_num,
-            micro_batch_size=self.micro_batch_size,
-            selected_expert_num=self.selected_expert_num,
-            hidden_size=self.hidden_size,
-            quant_mode=self.extra_info.quant_mode,
-        )
-        return attn_size if self.afd_config.role == "attention" else ffn_size
-
     def close(self) -> None:
         self._pending_transfers.clear()
         holder = self.context_holder
@@ -367,6 +388,18 @@ class WindowAFDConnector(AFDConnectorBase):
                 holder.stop_schedule()
             except Exception:
                 pass
+        comm_buffer = self.comm_buffer
+        self.comm_buffer = None
+        if comm_buffer is not None:
+            try:
+                comm_buffer.destroy()
+            except Exception:
+                pass
+        self.window_tensor = None
+        self.window_size = 0
+        self.window_addr = 0
+        self.attn_window_size = 0
+        self.ffn_window_size = 0
         group = self.process_group
         self.process_group = None
         if group is not None:
@@ -374,16 +407,19 @@ class WindowAFDConnector(AFDConnectorBase):
                 dist.destroy_process_group(group)
             except Exception:
                 pass
-        self.window_tensor = None
         self.hccl_comm_name = None
-        self.window_size = 0
-        self.window_addr = 0
         self._initialized = False
 
     def _build_rank_tables(self) -> None:
         """Build a balanced routed table plus one shared-first FFN rank."""
-        device = self.window_tensor.device if self.window_tensor is not None else "npu"
-        table = torch.zeros((1, self.expert_num, 3), dtype=torch.int32, device=device)
+        if self.schedule_context is None:
+            raise RuntimeError("ScheduleContext must be created before rank tables")
+        device = self.schedule_context.device
+        table = torch.zeros(
+            (1, self.expert_num, 3),
+            dtype=torch.int32,
+            device=device,
+        )
         for ffn_rank in range(self.ffn_size):
             layout = build_window_expert_layout(
                 routed_expert_num=self.routed_expert_num,
@@ -421,15 +457,25 @@ class WindowAFDConnector(AFDConnectorBase):
     def _operator_shapes(self) -> tuple[list[int], list[int], list[int], list[int]]:
         batch_size = self.micro_batch_size
         quant_mode = self.extra_info.quant_mode
-        token_size = (
+        # This is the last dimension of one A2F token record in the FFN
+        # Window, not its byte size in every mode.  For H=7168 it is 7168
+        # fp16/bfloat16 elements in mode 0, or 7680 one-byte storage elements
+        # in mode 2: align(7168 INT8 bytes + 4 scale bytes, 512) = 7680.
+        a2f_token_data_dim = (
             _align_up(self.hidden_size + 4, 512)
             if quant_mode == 2
-            else self.hidden_size * 2
+            else self.hidden_size
         )
         ffn_info = [self.attn_size, 1, 2 + batch_size * self.selected_expert_num]
-        ffn_data = [self.attn_size, 1, batch_size, self.selected_expert_num, token_size]
+        ffn_data = [
+            self.attn_size,
+            1,
+            batch_size,
+            self.selected_expert_num,
+            a2f_token_data_dim,
+        ]
         attn_info = [1, batch_size, self.selected_expert_num]
-        attn_data = [1, batch_size, self.selected_expert_num, token_size]
+        attn_data = [1, batch_size, self.selected_expert_num, self.hidden_size]
         return ffn_info, ffn_data, attn_info, attn_data
 
     def _token_dtype(self) -> int:
@@ -454,8 +500,6 @@ class WindowAFDConnector(AFDConnectorBase):
         context: AFDTransferContext,
         **kwargs: Any,
     ) -> None:
-        import torch_npu
-
         self._require_data_path()
         expert_ids = kwargs.get("expert_ids")
         expert_scales = kwargs.get("expert_scales")
@@ -514,7 +558,7 @@ class WindowAFDConnector(AFDConnectorBase):
             (self.micro_batch_size, routed_topk),
         )
         combine_scales[:batch_size].copy_(expert_scales)
-        ffn_info, ffn_data, attn_info, _ = self._operator_shapes()
+        _, _, attn_info, _ = self._operator_shapes()
         session_id = torch.tensor([self.role_rank], dtype=torch.int32, device=x.device)
         micro_batch_id = torch.tensor(
             [int(kwargs.get("micro_batch_id", 0))],
@@ -524,20 +568,16 @@ class WindowAFDConnector(AFDConnectorBase):
         # The Window A2F operator models one active MoE layer per invocation;
         # the model layer index is carried by the surrounding execution order.
         layer_id = torch.zeros((1,), dtype=torch.int32, device=x.device)
-        torch_npu.npu_attention_to_ffn(
+        cot.attention_to_ffn(
+            self.comm_buffer,
             x,
             session_id,
             micro_batch_id,
             layer_id,
             padded_expert_ids,
             self.expert_rank_table,
-            self.hccl_comm_name,
-            self.world_size,
-            ffn_info,
-            ffn_data,
             attn_info,
             self.routed_expert_num,
-            quant_mode=self.extra_info.quant_mode,
             sync_flag=0,
             ffn_start_rank_id=0,
             active_mask=active_mask,
@@ -563,8 +603,6 @@ class WindowAFDConnector(AFDConnectorBase):
         ubatch_idx: int = 0,
         **kwargs: Any,
     ) -> torch.Tensor:
-        import torch_npu
-
         self._require_data_path()
         key = (int(ubatch_idx), int(kwargs.get("layer_idx", 0)))
         context = self._pending_transfers.pop(key, None)
@@ -589,8 +627,6 @@ class WindowAFDConnector(AFDConnectorBase):
         ubatch_idx: int = 0,
         **kwargs: Any,
     ) -> AFDA2FTransferPayload:
-        import torch_npu
-
         self._require_data_path()
         batch_size = self.micro_batch_size
         # The operator expects the logical dimensions [A, BS, K+1, H].
@@ -743,8 +779,6 @@ class WindowAFDConnector(AFDConnectorBase):
         context: AFDTransferContext,
         **kwargs: Any,
     ) -> None:
-        import torch_npu
-
         self._require_data_path()
         if not isinstance(context.states, WindowAFDTransferState):
             raise RuntimeError("Window F2A requires batching state")
@@ -801,17 +835,14 @@ class WindowAFDConnector(AFDConnectorBase):
                 f"{[tuple(value.shape) for value in metadata]}"
             )
 
-        torch_npu.npu_ffn_to_attention(
+        cot.ffn_to_attention(
+            self.comm_buffer,
             routed_output,
             state.session_ids,
             state.micro_batch_ids,
             state.token_ids,
             state.expert_offsets,
             actual_token_num,
-            self.hccl_comm_name,
-            self.world_size,
-            [1, self.micro_batch_size, self.selected_expert_num],
-            [1, self.micro_batch_size, self.selected_expert_num, self.hidden_size],
             attn_rank_table=self.attn_rank_table,
         )
         logger.debug(
