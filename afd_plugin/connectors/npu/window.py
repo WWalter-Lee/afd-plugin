@@ -37,6 +37,7 @@ from afd_plugin.distributed import (
 
 logger = init_logger(__name__)
 
+_COMM_CONTEXT_WINDOW_ALIGNMENT = 2 * 1024 * 1024
 
 @dataclass(slots=True)
 class WindowAFDTransferState(AFDTransferState):
@@ -120,7 +121,8 @@ def _window_sizes(
 
     The result is ``(attn_window_bytes, ffn_window_bytes,
     a2f_token_bytes, f2a_token_bytes)``.  Window sizes include both metadata
-    and token data.  The formulas mirror ref/local_window_utils.py and are
+    and token data, with the final capacity aligned to 2 MiB for the external
+    CommContext Window.  The formulas mirror ref/local_window_utils.py and are
     evaluated once from the configured maximum batch capacity.
     """
 
@@ -158,9 +160,19 @@ def _window_sizes(
         * micro_batch_num
         * attention_size
     )
-    return (
+    # The external Window passed to CommContextManager must satisfy the same
+    # 2 MiB capacity alignment used by the operators' ccl_buffer_size helpers.
+    attention_window_bytes = _align_up(
         attention_window_info_bytes + attention_window_data_bytes,
+        _COMM_CONTEXT_WINDOW_ALIGNMENT,
+    )
+    ffn_window_bytes = _align_up(
         ffn_window_info_bytes + ffn_window_data_bytes,
+        _COMM_CONTEXT_WINDOW_ALIGNMENT,
+    )
+    return (
+        attention_window_bytes,
+        ffn_window_bytes,
         a2f_token_bytes,
         f2a_token_bytes,
     )
