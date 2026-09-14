@@ -209,6 +209,8 @@ def compute_attention_gate_moe_ffn(
 
     experts = layer.mlp.experts
     quant_type = experts.quant_type
+    moe_quant_params = MoEQuantParams(quant_type=quant_type)
+    swiglu_limit = 0.0
     if quant_type == QuantType.NONE:
         moe_weights = MoEWeights(
             w1=_get_expert_parameter(experts, "w13_weight"),
@@ -244,10 +246,43 @@ def compute_attention_gate_moe_ffn(
                 ],
                 w2_scale=[_get_expert_parameter(experts, "w2_weight_scale")],
             )
+    elif quant_type == QuantType.W4A8MXFP:
+        if experts.dynamic_eplb:
+            raise RuntimeError("DSV4 Window W4A8MXFP does not support EPLB")
+        if hidden_states.dtype not in (torch.float16, torch.bfloat16):
+            raise RuntimeError(
+                "DSV4 Window W4A8MXFP requires non-quantized FP16/BF16 "
+                f"batching output, got {hidden_states.dtype}"
+            )
+
+        import torch_npu
+        from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
+        from vllm_ascend.ops.fused_moe.moe_stage_params import MoEMxfpParams
+
+        moe_weights = MoEWeights(
+            w1=_get_expert_parameter(experts, "w13_weight"),
+            w2=_get_expert_parameter(experts, "w2_weight"),
+            w1_scale=_get_expert_parameter(experts, "w13_weight_scale"),
+            w2_scale=_get_expert_parameter(experts, "w2_weight_scale"),
+        )
+        moe_quant_params = MoEQuantParams(
+            quant_type=quant_type,
+            mxfp=MoEMxfpParams(
+                act_quant_type=torch.float8_e4m3fn,
+                weight_quant_type=torch_npu.float4_e2m1fn_x2,
+                scale_dtype=FLOAT8_E8M0FNU_DTYPE,
+                per_token_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
+                use_bf16=hidden_states.dtype == torch.bfloat16,
+            ),
+        )
+        # Non-quantized Window batching returns no usable activation scale.
+        # Let the native MXFP MLP dynamically quantize the FP16/BF16 input.
+        dynamic_scales = None
+        swiglu_limit = getattr(experts, "swiglu_limit", 0.0) or 0.0
     else:
         raise RuntimeError(
             "compute_gate_on_attention currently supports only unquantized "
-            f"or W8A8 Ascend MoE experts, got {quant_type}",
+            f"W8A8, or W4A8MXFP Ascend MoE experts, got {quant_type}",
         )
     use_gmmswigluquant_fusion = (
         quant_type in (QuantType.W8A8, getattr(QuantType, "MXFP8", None))
@@ -285,11 +320,12 @@ def compute_attention_gate_moe_ffn(
             dynamic_scale=dynamic_scales,
             topk_scales=topk_scales,
             weights=moe_weights,
-            quant=MoEQuantParams(quant_type=quant_type),
+            quant=moe_quant_params,
             fusion=use_gmmswigluquant_fusion,
             activation=experts.activation,
             need_trans=False,
             dynamic_eplb=experts.dynamic_eplb,
+            swiglu_limit=swiglu_limit,
         ),
     )
 
