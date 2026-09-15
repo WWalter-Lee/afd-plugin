@@ -462,6 +462,9 @@ class WindowAFDConnector(AFDConnectorBase):
                 table[0, expert_id, 0] = 1
                 table[0, expert_id, 1] = ffn_rank
                 table[0, expert_id, 2] = local_id
+        # All layers share the same deployment. Sync A2F indexes layer 0;
+        # async A2F indexes the real model layer in this same table.
+        table = table.expand(self.num_layers, -1, -1).contiguous()
         self.expert_rank_table = table
         if self.afd_config.role == "ffn":
             self.local_expert_num = build_window_expert_layout(
