@@ -278,7 +278,7 @@ def is_afd_active(source: Any) -> bool:
 
 
 def is_afd_async_dp(vllm_config: VllmConfig) -> bool:
-    """Return whether ``vllm_config`` selects AFD's async connector mode.
+    """Return whether CAM's global async-DP runtime patches are selected.
 
     This is a lightweight selector for import-time async-DP patches, not a full
     activation validator. Use ``is_afd_active`` or ``parse_afd_config`` when
@@ -289,7 +289,7 @@ def is_afd_async_dp(vllm_config: VllmConfig) -> bool:
     return (
         config is not None
         and config.async_dp
-        and config.connector in AFD_ASYNC_DP_CONNECTORS
+        and config.connector == AFD_ASYNC_CONNECTOR
     )
 
 

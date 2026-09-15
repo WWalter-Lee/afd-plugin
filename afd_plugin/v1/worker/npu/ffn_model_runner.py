@@ -337,12 +337,21 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             num_stages=1,
             tokens_unpadded_lens=[num_tokens],
         )
+        num_tokens_across_dp = None
+        if self.afd_config.async_dp:
+            num_tokens_across_dp = torch.full(
+                (int(self.vllm_config.parallel_config.data_parallel_size),),
+                num_tokens,
+                dtype=torch.int32,
+                device="cpu",
+            )
         with ascend_forward_context(
             vllm_config=self.vllm_config,
             afd_metadata=afd_metadata,
             model_instance=self.model,
             input_ids=payload.input_ids,
             num_tokens=num_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
         ) as forward_context:
             forward_context.additional_kwargs["afd_metadata"] = afd_metadata
             _set_moe_layer_index(forward_context, layer_idx)
