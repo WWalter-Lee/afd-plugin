@@ -1890,8 +1890,16 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             runtime_mode = CUDAGraphMode.FULL
         connector = getattr(self, "connector", None)
         enable_layer_major_eager_u2 = bool(
-            isinstance(connector, P2pHcclAFDConnector)
-            and connector.stream_overlap_enabled
+            (
+                (
+                    isinstance(connector, P2pHcclAFDConnector)
+                    and connector.stream_overlap_enabled
+                )
+                or (
+                    getattr(connector, "is_window_connector", False)
+                    and connector.extra_info.micro_batch_num == 2
+                )
+            )
             and callable(
                 getattr(model, "forward_ubatches_layer_major", None),
             )

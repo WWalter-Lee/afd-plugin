@@ -68,8 +68,8 @@ class WindowAFDTransferState(AFDTransferState):
 class WindowAFDExtraInfo(ConnectorExtraInfo):
     """Window protocol options.
 
-    The current implementation requires one micro-batch. Scheduling is
-    lock-step or independent per Attention session according to ``async_dp``.
+    One or two Window micro-batch slots are supported. Scheduling is lock-step
+    or independent per Attention session according to ``async_dp``.
     """
 
     micro_batch_num: int = 1
@@ -245,7 +245,13 @@ class WindowAFDConnector(AFDConnectorBase):
         self.routed_expert_num = int(hf_config.n_routed_experts)
         self.selected_expert_num = routed_topk + shared_expert_num
         self.expert_num = self.routed_expert_num + shared_expert_num
-        self.micro_batch_size = int(vllm_config.scheduler_config.max_num_batched_tokens)
+        self.micro_batch_num = self.extra_info.micro_batch_num
+        # Each Window micro-batch slot keeps the complete scheduler capacity.
+        # DBO may leave small steps unsplit, so dividing this capacity by M
+        # would make a valid unsplit step overflow slot 0.
+        self.micro_batch_size = int(
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
 
     @property
     def is_initialized(self) -> bool:
@@ -259,10 +265,18 @@ class WindowAFDConnector(AFDConnectorBase):
                 "WindowAFDConnector requires compute_gate_on_attention=true "
                 "for the ref-style Attention-to-FFN route",
             )
-        if self.extra_info.micro_batch_num != 1:
+        if self.micro_batch_num not in (1, 2):
             raise ValueError(
-                "WindowAFDConnector stage one supports only micro_batch_num=1, "
-                f"got {self.extra_info.micro_batch_num}",
+                "WindowAFDConnector supports micro_batch_num=1 or 2, "
+                f"got {self.micro_batch_num}",
+            )
+        parallel_config = self.vllm_config.parallel_config
+        runtime_micro_batch_num = 2 if parallel_config.enable_dbo else 1
+        if self.micro_batch_num != runtime_micro_batch_num:
+            raise ValueError(
+                "Window micro_batch_num must match the vLLM DBO mode: "
+                f"window={self.micro_batch_num} "
+                f"runtime={runtime_micro_batch_num}"
             )
         if self.micro_batch_size > 512:
             raise ValueError(
@@ -485,6 +499,7 @@ class WindowAFDConnector(AFDConnectorBase):
 
     def _operator_shapes(self) -> tuple[list[int], list[int], list[int], list[int]]:
         batch_size = self.micro_batch_size
+        micro_batch_num = self.micro_batch_num
         quant_mode = self.extra_info.quant_mode
         # This is the last dimension of one A2F token record in the FFN
         # Window, not its byte size in every mode.  For H=7168 it is 7168
@@ -495,16 +510,25 @@ class WindowAFDConnector(AFDConnectorBase):
             if quant_mode == 2
             else self.hidden_size
         )
-        ffn_info = [self.attn_size, 1, 2 + batch_size * self.selected_expert_num]
+        ffn_info = [
+            self.attn_size,
+            micro_batch_num,
+            2 + batch_size * self.selected_expert_num,
+        ]
         ffn_data = [
             self.attn_size,
-            1,
+            micro_batch_num,
             batch_size,
             self.selected_expert_num,
             a2f_token_data_dim,
         ]
-        attn_info = [1, batch_size, self.selected_expert_num]
-        attn_data = [1, batch_size, self.selected_expert_num, self.hidden_size]
+        attn_info = [micro_batch_num, batch_size, self.selected_expert_num]
+        attn_data = [
+            micro_batch_num,
+            batch_size,
+            self.selected_expert_num,
+            self.hidden_size,
+        ]
         return ffn_info, ffn_data, attn_info, attn_data
 
     def _token_dtype(self) -> int:
@@ -589,10 +613,14 @@ class WindowAFDConnector(AFDConnectorBase):
         combine_scales[:batch_size].copy_(expert_scales)
         _, _, attn_info, _ = self._operator_shapes()
         session_id = torch.tensor([self.role_rank], dtype=torch.int32, device=x.device)
+        stage_idx = int(context.metadata.stage_idx)
+        if stage_idx < 0 or stage_idx >= self.micro_batch_num:
+            raise RuntimeError(
+                "Window A2F received an out-of-range micro batch: "
+                f"micro_batch_id={stage_idx} micro_batch_num={self.micro_batch_num}"
+            )
         micro_batch_id = torch.tensor(
-            [int(kwargs.get("micro_batch_id", 0))],
-            dtype=torch.int32,
-            device=x.device,
+            [stage_idx], dtype=torch.int32, device=x.device
         )
         model_layer_idx = int(context.metadata.layer_idx)
         if model_layer_idx < 0 or model_layer_idx >= self.num_layers:

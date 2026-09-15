@@ -833,6 +833,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         connector = connectors[0]
         if any(stage_connector is not connector for stage_connector in connectors[1:]):
             raise RuntimeError("DSV4 layer-major U2 stages must share one connector")
+        is_window_connector = bool(getattr(connector, "is_window_connector", False))
         require_idle = getattr(connector, "require_attention_pipeline_idle", None)
         wait_for_receive = getattr(
             connector,
@@ -840,7 +841,18 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
             None,
         )
         reset_pipeline = getattr(connector, "reset_attention_pipeline_state", None)
-        if not all(callable(method) for method in (require_idle, wait_for_receive)):
+        if is_window_connector:
+            # Window Combine has completed before receive_remote_ffn returns,
+            # so the layer-major loop needs no stream/event wait operation.
+            def require_idle() -> None:
+                return None
+
+            def wait_for_receive(**_: Any) -> None:
+                return None
+
+        elif not all(
+            callable(method) for method in (require_idle, wait_for_receive)
+        ):
             raise RuntimeError("DSV4 layer-major U2 requires the HCCL stream connector")
 
         hidden_ubatches: list[torch.Tensor] = []
