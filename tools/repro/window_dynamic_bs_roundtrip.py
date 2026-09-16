@@ -1,8 +1,10 @@
-"""Run a minimal four-operator Window AFD round trip on two NPUs.
+"""Run a minimal four-operator Window AFD round trip on two A5 NPUs.
 
 Rank 0 is one FFN worker and rank 1 is one Attention worker. No model or vLLM
 scheduler is involved. Use --mode dynamic for the pre-fix input contract and
---mode fixed for the fixed-capacity workaround.
+--mode fixed for the fixed-capacity workaround. Both modes keep A2F and Window
+capacity fixed; only dynamic mode changes the Combine scales shape (8, 1, 8).
+The default payload is BF16; --quant-mode 2 tests the original INT8 payload.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import argparse
 import os
 import sys
 
+import cann_ops_transformer as cot
 import torch
 import torch.distributed as dist
 import torch_npu
@@ -25,31 +28,35 @@ WORLD_SIZE = 2
 FFN_RANK = 0
 ATTENTION_RANK = 1
 ALIGNMENT = 512
-QUANT_MODE = 2
+WINDOW_ALIGNMENT = 2 * 1024 * 1024
 
 
 def align_up(value: int) -> int:
     return (value + ALIGNMENT - 1) // ALIGNMENT * ALIGNMENT
 
 
-def get_window_size(rank: int) -> int:
+def get_window_size(rank: int, quant_mode: int) -> int:
     if rank == ATTENTION_RANK:
         info = align_up(4 * CAPACITY * SELECTED_EXPERT_NUM)
         data = 2 * CAPACITY * SELECTED_EXPERT_NUM * HIDDEN_SIZE
-        return info + data
-    info = align_up(4 * (CAPACITY * SELECTED_EXPERT_NUM + 2))
-    data = align_up(HIDDEN_SIZE + 4) * CAPACITY * SELECTED_EXPERT_NUM
-    return info + data
+    else:
+        info = align_up(4 * (CAPACITY * SELECTED_EXPERT_NUM + 2))
+        token_bytes = align_up(HIDDEN_SIZE + 4) if quant_mode == 2 else HIDDEN_SIZE * 2
+        data = token_bytes * CAPACITY * SELECTED_EXPERT_NUM
+    # A5 Channel/URMA requires the registered CCL buffer size to be 2MB aligned.
+    return (info + data + WINDOW_ALIGNMENT - 1) // WINDOW_ALIGNMENT * WINDOW_ALIGNMENT
 
 
-def create_context(rank: int, window: torch.Tensor):
+def create_context(rank: int, window: torch.Tensor, quant_mode: int):
     common = {
         "session_num": 1,
         "micro_batch_num": 1,
         "micro_batch_size": CAPACITY,
         "selected_expert_num": SELECTED_EXPERT_NUM,
         "expert_num": SELECTED_EXPERT_NUM,
-        "attn_to_ffn_token_size": align_up(HIDDEN_SIZE + 4),
+        "attn_to_ffn_token_size": (
+            align_up(HIDDEN_SIZE + 4) if quant_mode == 2 else HIDDEN_SIZE * 2
+        ),
         "ffn_to_attn_token_size": HIDDEN_SIZE * 2,
     }
     if rank == ATTENTION_RANK:
@@ -69,7 +76,7 @@ def create_context(rank: int, window: torch.Tensor):
 
 def run_attention(
     mode: str,
-    group_name: str,
+    comm_buffer,
     context: torch.Tensor,
     window: torch.Tensor,
 ) -> bool:
@@ -127,20 +134,16 @@ def run_attention(
             )
             combine_scales[:batch_size] = scale_row
 
-        torch_npu.npu_attention_to_ffn(
+        cot.attention_to_ffn(
+            comm_buffer,
             x,
             session_id,
             micro_batch_id,
             layer_id,
             expert_ids,
             expert_rank_table,
-            group_name,
-            WORLD_SIZE,
-            [1, 1, 2 + CAPACITY * SELECTED_EXPERT_NUM],
-            [1, 1, CAPACITY, SELECTED_EXPERT_NUM, align_up(HIDDEN_SIZE + 4)],
             [1, CAPACITY, SELECTED_EXPERT_NUM],
             ROUTED_TOPK,
-            quant_mode=QUANT_MODE,
             sync_flag=0,
             ffn_start_rank_id=FFN_RANK,
             active_mask=active_mask,
@@ -171,19 +174,20 @@ def run_attention(
     return failed
 
 
-def run_ffn(group_name: str, context: torch.Tensor) -> None:
+def run_ffn(comm_buffer, context: torch.Tensor, quant_mode: int) -> None:
     device = context.device
     attn_rank_table = torch.tensor(
         [ATTENTION_RANK], dtype=torch.int32, device=device
     )
     for call_id, _ in enumerate(BATCH_SEQUENCE, start=1):
-        outputs = torch_npu.npu_ffn_worker_batching(
+        outputs = cot.ffn_worker_batching(
             context,
             SELECTED_EXPERT_NUM,
             [1, CAPACITY, SELECTED_EXPERT_NUM, HIDDEN_SIZE],
-            token_dtype=2,
+            token_dtype=2 if quant_mode == 2 else 1,
             need_schedule=1,
             layer_num=0,
+            sync_flag=0,
         )
         (
             hidden_states,
@@ -201,17 +205,14 @@ def run_ffn(group_name: str, context: torch.Tensor) -> None:
             dtype=torch.bfloat16,
             device=device,
         )
-        torch_npu.npu_ffn_to_attention(
+        cot.ffn_to_attention(
+            comm_buffer,
             ffn_output,
             session_ids,
             micro_batch_ids,
             token_ids,
             expert_offsets,
             actual_token_num.reshape(-1),
-            group_name,
-            WORLD_SIZE,
-            [1, CAPACITY, SELECTED_EXPERT_NUM],
-            [1, CAPACITY, SELECTED_EXPERT_NUM, HIDDEN_SIZE],
             attn_rank_table=attn_rank_table,
         )
         torch.npu.synchronize()
@@ -224,6 +225,7 @@ def run_ffn(group_name: str, context: torch.Tensor) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("dynamic", "fixed"), default="dynamic")
+    parser.add_argument("--quant-mode", type=int, choices=(0, 2), default=0)
     args = parser.parse_args()
 
     rank = int(os.environ["RANK"])
@@ -235,21 +237,45 @@ def main() -> int:
     control_group = dist.new_group(ranks=[FFN_RANK, ATTENTION_RANK], backend="gloo")
 
     process_group = dist.distributed_c10d._get_default_group()
-    backend = process_group._get_backend(torch.device("npu"))
-    group_name = str(backend.get_hccl_comm_name(rank))
-    backend._window_register_and_exchange(get_window_size(rank), [1 - rank])
-    window = backend._get_window_mem()
-    holder = create_context(rank, window)
+    window = torch.zeros(
+        get_window_size(rank, args.quant_mode),
+        dtype=torch.uint8,
+        device=torch.device("npu", local_rank),
+    )
+    # Each rank registers its own receiving Window. Keep both window and buffer
+    # alive until all round trips finish; no A3 _window_register_* API is used.
+    if rank == ATTENTION_RANK:
+        token_dim = align_up(HIDDEN_SIZE + 4) if args.quant_mode == 2 else HIDDEN_SIZE
+        comm_buffer = cot.get_buffer_for_attention_to_ffn(
+            process_group,
+            WORLD_SIZE,
+            [1, 1, 2 + CAPACITY * SELECTED_EXPERT_NUM],
+            [1, 1, CAPACITY, SELECTED_EXPERT_NUM, token_dim],
+            quant_mode=args.quant_mode,
+            window_addr=window.data_ptr(),
+            window_size=window.numel(),
+        )
+    else:
+        comm_buffer = cot.get_buffer_for_ffn_to_attention(
+            process_group,
+            WORLD_SIZE,
+            [1, CAPACITY, SELECTED_EXPERT_NUM],
+            [1, CAPACITY, SELECTED_EXPERT_NUM, HIDDEN_SIZE],
+            window_addr=window.data_ptr(),
+            window_size=window.numel(),
+        )
+    holder = create_context(rank, window, args.quant_mode)
     context = holder.get_schedule_context_tensor()
 
     failed = False
     if rank == ATTENTION_RANK:
-        failed = run_attention(args.mode, group_name, context, window)
+        failed = run_attention(args.mode, comm_buffer, context, window)
     else:
-        run_ffn(group_name, context)
+        run_ffn(comm_buffer, context, args.quant_mode)
 
     dist.barrier(group=control_group)
     holder.stop_schedule()
+    comm_buffer.destroy()
     dist.destroy_process_group(control_group)
     dist.destroy_process_group()
     if rank == ATTENTION_RANK:
@@ -263,7 +289,8 @@ def main() -> int:
         else:
             result = "ISSUE_NOT_REPRODUCED"
         print(f"RESULT: mode={args.mode} {result}", flush=True)
-        return int(failed != expected_failure)
+        # On A5, a corrected dynamic path is a successful test, not an error.
+        return int(failed)
     return 0
 
 
