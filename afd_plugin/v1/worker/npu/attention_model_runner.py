@@ -1029,10 +1029,22 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         previous = self._afd_is_graph_capturing
         self._afd_is_graph_capturing = bool(is_graph_capturing)
+        is_window_microbatch = bool(
+            getattr(self.connector, "is_window_connector", False)
+            and int(getattr(self.connector, "micro_batch_num", 1)) > 1
+        )
+        print(
+            "[Window][dummy-dispatch] "
+            f"dp_rank={self.dp_rank} tokens={num_tokens} "
+            f"use_ubatching={self.vllm_config.parallel_config.use_ubatching} "
+            f"allow_microbatching={allow_microbatching} "
+            f"is_profile={is_profile} window_microbatch={is_window_microbatch}",
+            flush=True,
+        )
         if not (
             bool(self.vllm_config.parallel_config.use_ubatching)
             and allow_microbatching
-            and not is_profile
+            and (not is_profile or is_window_microbatch)
         ):
             try:
                 return super()._dummy_run(
@@ -1300,6 +1312,15 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             force_num_active_loras=num_active_loras,
         )
         # ### PATCH END: AFD dummy ubatch decision
+        if (
+            getattr(self.connector, "is_window_connector", False)
+            and int(getattr(self.connector, "micro_batch_num", 1)) > 1
+            and not should_ubatch
+        ):
+            raise RuntimeError(
+                "Window micro_batch_num > 1 requires this execution to be "
+                "split into multiple ubatches"
+            )
         if _uses_legacy_dcp_manager(self):
             self.dcp_manager.init_batch_info(
                 num_scheduled_tokens,
