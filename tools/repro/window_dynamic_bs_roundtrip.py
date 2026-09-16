@@ -296,8 +296,7 @@ def main() -> int:
         else:
             result = "ISSUE_NOT_REPRODUCED"
         print(f"RESULT: mode={args.mode} {result}", flush=True)
-        # On A5, a corrected dynamic path is a successful test, not an error.
-        return int(failed)
+        return int(failed != expected_failure)
     return 0
 
 
