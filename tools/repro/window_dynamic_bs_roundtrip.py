@@ -237,6 +237,13 @@ def main() -> int:
     control_group = dist.new_group(ranks=[FFN_RANK, ATTENTION_RANK], backend="gloo")
 
     process_group = dist.distributed_c10d._get_default_group()
+    # Match the full-network initialization order. The A5 buffer wrapper asks
+    # for an already-created communicator with init_comm=False, so force HCCL
+    # initialization before constructing the CommContextManager.
+    backend = process_group._get_backend(torch.device("npu"))
+    group_name = str(backend.get_hccl_comm_name(rank))
+    if not group_name:
+        raise RuntimeError("Failed to initialize the HCCL communicator")
     window = torch.zeros(
         get_window_size(rank, args.quant_mode),
         dtype=torch.uint8,
