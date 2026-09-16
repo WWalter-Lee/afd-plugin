@@ -155,8 +155,18 @@ class AFDNPUFFNWorker(NPUWorker):
         torch.npu.set_device(self.device)
         while not event.is_set():
             if self.model_runner.connector.control_plane is None:
+                role_rank = self.model_runner.connector.role_rank
+                print(f"[Window][ffn-step][begin] ffn_rank={role_rank}", flush=True)
                 self.model_runner.execute_connector_driven_step()
+                print(
+                    f"[Window][ffn-step][host-return] ffn_rank={role_rank}",
+                    flush=True,
+                )
                 torch.npu.synchronize()
+                print(
+                    f"[Window][ffn-step][device-complete] ffn_rank={role_rank}",
+                    flush=True,
+                )
                 continue
 
             payload = self.model_runner.connector.control_plane.recv_dp_metadata_list()

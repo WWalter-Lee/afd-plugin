@@ -1524,12 +1524,30 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     self.eplb_heat_collection_status if self.dynamic_eplb else False
                 ),
             ):
+                print(
+                    "[Window][attention-model][begin] "
+                    f"dp_rank={self.dp_rank} tokens={num_tokens_padded} "
+                    f"ubatch={should_ubatch} profile={is_profile} "
+                    f"capture={is_graph_capturing}",
+                    flush=True,
+                )
                 outputs = self._model_forward(
                     num_tokens_padded,
                     input_ids,
                     positions,
                     intermediate_tensors,
                     inputs_embeds,
+                )
+                print(
+                    "[Window][attention-model][host-return] "
+                    f"dp_rank={self.dp_rank} tokens={num_tokens_padded}",
+                    flush=True,
+                )
+                torch.npu.synchronize()
+                print(
+                    "[Window][attention-model][device-complete] "
+                    f"dp_rank={self.dp_rank} tokens={num_tokens_padded}",
+                    flush=True,
                 )
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
@@ -1557,6 +1575,12 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             if self.use_compress and force_attention:
                 self.positions.fill_(0)
                 self._dsa_positions_cpu_buf.fill_(0)
+            print(
+                "[Window][dummy-run][complete] "
+                f"dp_rank={self.dp_rank} tokens={num_tokens_padded} "
+                f"profile={is_profile} capture={is_graph_capturing}",
+                flush=True,
+            )
             return hidden_states, hidden_states
 
     def _build_afd_metadata(

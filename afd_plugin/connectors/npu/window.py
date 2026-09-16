@@ -674,6 +674,11 @@ class WindowAFDConnector(AFDConnectorBase):
         context = self._pending_transfers.pop(key, None)
         if context is None or not isinstance(context.states, WindowAFDTransferState):
             raise RuntimeError(f"Window F2A has no pending transfer for {key}")
+        print(
+            "[Window][combine][begin] "
+            f"attn_rank={self.role_rank} microbatch={key[0]} layer={key[1]}",
+            flush=True,
+        )
         output, _ = torch_npu.npu_attention_worker_combine(
             self.schedule_context,
             context.states.expert_scales,
@@ -685,6 +690,17 @@ class WindowAFDConnector(AFDConnectorBase):
             # dtype as the Attention continuation/residual, as P2P does.
             token_dtype=self._token_dtype_for_tensor(ref_tensor),
             need_schedule=1,
+        )
+        print(
+            "[Window][combine][host-return] "
+            f"attn_rank={self.role_rank} microbatch={key[0]} layer={key[1]}",
+            flush=True,
+        )
+        torch.npu.synchronize()
+        print(
+            "[Window][combine][device-complete] "
+            f"attn_rank={self.role_rank} microbatch={key[0]} layer={key[1]}",
+            flush=True,
         )
         return output[: ref_tensor.shape[0]].reshape_as(ref_tensor)
 
