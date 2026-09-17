@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Window-based AFD connector initialization for Ascend NPU.
 
-The connector owns the communication resources and the synchronous A2F/F2A
-data path.
+The connector owns the communication resources and the Window A2F/F2A data
+path.
 """
 
 from __future__ import annotations
@@ -39,6 +39,29 @@ logger = init_logger(__name__)
 
 _COMM_CONTEXT_WINDOW_ALIGNMENT = 2 * 1024 * 1024
 
+
+def _record_npu_stream(tensor: torch.Tensor, stream: Any) -> None:
+    if tensor.device.type == "npu":
+        tensor.record_stream(stream)
+
+
+@dataclass(frozen=True, slots=True)
+class WindowAttentionPipelineEvents:
+    """One Attention layer/stage's compute, A2F, and Combine events."""
+
+    compute_done: Any
+    send_done: Any
+    recv_done: Any
+
+
+@dataclass(frozen=True, slots=True)
+class WindowAttentionReceiveDependency:
+    """A deferred Combine result consumed by the next Attention layer."""
+
+    tensor: torch.Tensor
+    event: Any
+
+
 @dataclass(frozen=True, slots=True)
 class WindowLayerBatch:
     """One layer's contiguous token range in an asynchronous FFN batch."""
@@ -61,6 +84,7 @@ class WindowAFDTransferState(AFDTransferState):
     token_ids: torch.Tensor | None = None
     expert_offsets: torch.Tensor | None = None
     actual_token_num: torch.Tensor | None = None
+    actual_token_count: int | None = None
     layer_batches: tuple[WindowLayerBatch, ...] = ()
 
 
@@ -234,6 +258,14 @@ class WindowAFDConnector(AFDConnectorBase):
         self.attn_rank_table: torch.Tensor | None = None
         self.local_expert_num = 0
         self._pending_transfers: dict[tuple[int, int], AFDTransferContext] = {}
+        self.a2f_send_stream = None
+        self.f2a_recv_stream = None
+        self.attention_pipeline_events: dict[
+            tuple[int, int], WindowAttentionPipelineEvents
+        ] = {}
+        self.attention_receive_dependencies: dict[
+            int, WindowAttentionReceiveDependency
+        ] = {}
         self._initialized = False
 
         hf_config = vllm_config.model_config.hf_config
@@ -246,6 +278,9 @@ class WindowAFDConnector(AFDConnectorBase):
         self.selected_expert_num = routed_topk + shared_expert_num
         self.expert_num = self.routed_expert_num + shared_expert_num
         self.micro_batch_num = self.extra_info.micro_batch_num
+        self.stream_overlap_enabled = bool(
+            self.async_mode and self.micro_batch_num > 1
+        )
         # M is an independent Window slot dimension, not a divisor of BS.
         # Keep the operator's per-slot capacity equal to scheduler capacity.
         self.micro_batch_size = int(
@@ -393,6 +428,11 @@ class WindowAFDConnector(AFDConnectorBase):
             self.context_holder = context_factory(**kwargs)
             self.schedule_context = self.context_holder.get_schedule_context_tensor()
             self._build_rank_tables()
+            if (
+                self.stream_overlap_enabled
+                and self.afd_config.role == "attention"
+            ):
+                self._initialize_attention_stream_pipeline()
             ffn_kind = ""
             if self.afd_config.role == "ffn":
                 ffn_kind = build_window_expert_layout(
@@ -423,6 +463,10 @@ class WindowAFDConnector(AFDConnectorBase):
 
     def close(self) -> None:
         self._pending_transfers.clear()
+        self.attention_receive_dependencies.clear()
+        self.attention_pipeline_events.clear()
+        self.a2f_send_stream = None
+        self.f2a_recv_stream = None
         holder = self.context_holder
         self.context_holder = None
         self.schedule_context = None
@@ -452,6 +496,44 @@ class WindowAFDConnector(AFDConnectorBase):
                 pass
         self.hccl_comm_name = None
         self._initialized = False
+
+    def _initialize_attention_stream_pipeline(self) -> None:
+        """Create eager A2F and Combine streams for two-stage overlap."""
+        device = torch.device("npu", self.local_rank)
+        self.a2f_send_stream = torch.npu.Stream(device=device)
+        self.f2a_recv_stream = torch.npu.Stream(device=device)
+        self.attention_pipeline_events = {
+            (layer_idx, stage_idx): WindowAttentionPipelineEvents(
+                compute_done=torch.npu.Event(),
+                send_done=torch.npu.Event(),
+                recv_done=torch.npu.Event(),
+            )
+            for layer_idx in range(self.num_layers)
+            for stage_idx in range(self.micro_batch_num)
+        }
+
+    @property
+    def attention_stream_pipeline_ready(self) -> bool:
+        return bool(
+            self.stream_overlap_enabled
+            and self.afd_config.role == "attention"
+            and self.a2f_send_stream is not None
+            and self.f2a_recv_stream is not None
+            and self.attention_pipeline_events
+        )
+
+    def _attention_events(
+        self,
+        layer_idx: int,
+        stage_idx: int,
+    ) -> WindowAttentionPipelineEvents:
+        try:
+            return self.attention_pipeline_events[(layer_idx, stage_idx)]
+        except KeyError as exc:
+            raise RuntimeError(
+                "Window Attention pipeline event is not initialized: "
+                f"layer={layer_idx} stage={stage_idx}"
+            ) from exc
 
     def _build_rank_tables(self) -> None:
         """Build a balanced routed table plus one shared-first FFN rank."""
@@ -586,8 +668,8 @@ class WindowAFDConnector(AFDConnectorBase):
                 "Window A2F received an unexpected routed expert scale width: "
                 f"got {expert_scales.shape[1]}, expected {routed_topk}",
             )
-        # The synchronous Window operators reuse one ScheduleContext and
-        # therefore run with the fixed capacity shape used by the ref path.
+        # Window operators reuse one ScheduleContext and run with the fixed
+        # capacity shape used by the ref path.
         # Repeat valid inputs into padding slots so dynamic quantization never
         # receives artificial all-zero rows; padded results are discarded.
         repeat_indices = torch.arange(
@@ -636,21 +718,49 @@ class WindowAFDConnector(AFDConnectorBase):
             dtype=torch.int32,
             device=x.device,
         )
-        cot.attention_to_ffn(
-            self.comm_buffer,
-            x,
-            session_id,
-            micro_batch_id,
-            layer_id,
-            padded_expert_ids,
-            self.expert_rank_table,
-            attn_info,
-            self.routed_expert_num,
-            # 0 notifies every FFN rank; 1 only notifies ranks receiving tokens.
-            sync_flag=1 if self.async_mode else 0,
-            ffn_start_rank_id=0,
-            active_mask=active_mask,
-        )
+
+        def enqueue_a2f() -> None:
+            cot.attention_to_ffn(
+                self.comm_buffer,
+                x,
+                session_id,
+                micro_batch_id,
+                layer_id,
+                padded_expert_ids,
+                self.expert_rank_table,
+                attn_info,
+                self.routed_expert_num,
+                # 0 notifies every FFN rank; 1 only notifies ranks receiving tokens.
+                sync_flag=1 if self.async_mode else 0,
+                ffn_start_rank_id=0,
+                active_mask=active_mask,
+            )
+
+        if self.attention_stream_pipeline_ready:
+            if stage_idx in self.attention_receive_dependencies:
+                raise RuntimeError(
+                    "Window Attention stage has an unconsumed Combine result: "
+                    f"stage={stage_idx}"
+                )
+            events = self._attention_events(model_layer_idx, stage_idx)
+            compute_stream = torch.npu.current_stream()
+            events.compute_done.record(compute_stream)
+            assert self.a2f_send_stream is not None
+            with torch.npu.stream(self.a2f_send_stream):
+                events.compute_done.wait(self.a2f_send_stream)
+                for tensor in (
+                    x,
+                    session_id,
+                    micro_batch_id,
+                    layer_id,
+                    padded_expert_ids,
+                    active_mask,
+                ):
+                    _record_npu_stream(tensor, self.a2f_send_stream)
+                enqueue_a2f()
+                events.send_done.record(self.a2f_send_stream)
+        else:
+            enqueue_a2f()
         logger.debug(
             "Window A2F sent layer=%d stage=%d batch=%d topk=%d",
             context.metadata.layer_idx,
@@ -677,25 +787,92 @@ class WindowAFDConnector(AFDConnectorBase):
         context = self._pending_transfers.pop(key, None)
         if context is None or not isinstance(context.states, WindowAFDTransferState):
             raise RuntimeError(f"Window F2A has no pending transfer for {key}")
-        output, _ = torch_npu.npu_attention_worker_combine(
-            self.schedule_context,
-            context.states.expert_scales,
-            torch.tensor([key[1]], dtype=torch.int32, device=ref_tensor.device),
-            self.hidden_size,
-            # ``token_dtype=2`` is only the INT8 payload mode of
-            # ``ffn_worker_batching``.  ``attention_worker_combine`` accepts
-            # only the output dtype modes: 0=FP16 and 1=BF16.  Use the same
-            # dtype as the Attention continuation/residual, as P2P does.
-            token_dtype=self._token_dtype_for_tensor(ref_tensor),
-            need_schedule=1,
+
+        def enqueue_combine(layer_id: torch.Tensor) -> torch.Tensor:
+            output, _ = torch_npu.npu_attention_worker_combine(
+                self.schedule_context,
+                context.states.expert_scales,
+                layer_id,
+                self.hidden_size,
+                # ``token_dtype=2`` is only the INT8 payload mode of
+                # ``ffn_worker_batching``.  ``attention_worker_combine`` accepts
+                # only the output dtype modes: 0=FP16 and 1=BF16.  Use the same
+                # dtype as the Attention continuation/residual, as P2P does.
+                token_dtype=self._token_dtype_for_tensor(ref_tensor),
+                need_schedule=1,
+            )
+            return output[: ref_tensor.shape[0]].reshape_as(ref_tensor)
+
+        if not self.attention_stream_pipeline_ready:
+            layer_id = torch.tensor(
+                [key[1]], dtype=torch.int32, device=ref_tensor.device
+            )
+            return enqueue_combine(layer_id)
+
+        events = self._attention_events(key[1], key[0])
+        assert self.f2a_recv_stream is not None
+        with torch.npu.stream(self.f2a_recv_stream):
+            events.send_done.wait(self.f2a_recv_stream)
+            layer_id = torch.tensor(
+                [key[1]], dtype=torch.int32, device=ref_tensor.device
+            )
+            _record_npu_stream(
+                context.states.expert_scales,
+                self.f2a_recv_stream,
+            )
+            output = enqueue_combine(layer_id)
+            _record_npu_stream(output, self.f2a_recv_stream)
+            events.recv_done.record(self.f2a_recv_stream)
+        if key[0] in self.attention_receive_dependencies:
+            raise RuntimeError(
+                "Window Attention stage already has a deferred Combine result: "
+                f"stage={key[0]}"
+            )
+        self.attention_receive_dependencies[key[0]] = (
+            WindowAttentionReceiveDependency(
+                tensor=output,
+                event=events.recv_done,
+            )
         )
-        return output[: ref_tensor.shape[0]].reshape_as(ref_tensor)
+        return output
 
     def require_attention_pipeline_idle(self) -> None:
-        """Window Combine completes synchronously before returning."""
+        """Reject a new layer-major step if prior stream state is stale."""
+        if self._pending_transfers or self.attention_receive_dependencies:
+            raise RuntimeError(
+                "Window Attention pipeline is not idle: "
+                f"pending={tuple(self._pending_transfers)} "
+                f"deferred={tuple(self.attention_receive_dependencies)}"
+            )
 
-    def wait_for_attention_stage_receive(self, **_: Any) -> None:
-        """Window F2A has already completed when recv_ffn_output returns."""
+    def wait_for_attention_stage_receive(
+        self,
+        *,
+        stage_idx: int,
+        tensor: torch.Tensor,
+    ) -> None:
+        """Make the current compute stream consume one deferred Combine."""
+        if not self.attention_stream_pipeline_ready:
+            return
+        dependency = self.attention_receive_dependencies.pop(stage_idx, None)
+        if dependency is None:
+            raise RuntimeError(
+                "Window Attention stage has no deferred Combine result: "
+                f"stage={stage_idx}"
+            )
+        if dependency.tensor is not tensor:
+            raise RuntimeError(
+                "Window Attention stage received an unexpected tensor: "
+                f"stage={stage_idx}"
+            )
+        compute_stream = torch.npu.current_stream()
+        dependency.event.wait(compute_stream)
+        _record_npu_stream(tensor, compute_stream)
+
+    def reset_attention_pipeline_state(self) -> None:
+        """Discard per-step stream bookkeeping after a failed forward."""
+        self._pending_transfers.clear()
+        self.attention_receive_dependencies.clear()
 
     def recv_attn_output(
         self,
@@ -887,6 +1064,7 @@ class WindowAFDConnector(AFDConnectorBase):
                 token_ids=token_ids,
                 expert_offsets=expert_offsets,
                 actual_token_num=actual_token_num,
+                actual_token_count=actual_num,
                 layer_batches=layer_batches,
             ),
         )
@@ -932,7 +1110,9 @@ class WindowAFDConnector(AFDConnectorBase):
                 "Window batching returned actual_token_num with unexpected "
                 f"shape {tuple(state.actual_token_num.shape)}"
             )
-        actual_num = int(actual_token_num.item())
+        actual_num = state.actual_token_count
+        if actual_num is None:
+            raise RuntimeError("Window batching state has no actual token count")
         if actual_num < 0:
             raise RuntimeError(
                 f"Window batching returned negative actual_token_num={actual_num}"
