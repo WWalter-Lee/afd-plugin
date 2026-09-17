@@ -266,6 +266,7 @@ class WindowAFDConnector(AFDConnectorBase):
         self.attention_receive_dependencies: dict[
             int, WindowAttentionReceiveDependency
         ] = {}
+        self.attention_layer_ids: torch.Tensor | None = None
         self._initialized = False
 
         hf_config = vllm_config.model_config.hf_config
@@ -465,6 +466,7 @@ class WindowAFDConnector(AFDConnectorBase):
         self._pending_transfers.clear()
         self.attention_receive_dependencies.clear()
         self.attention_pipeline_events.clear()
+        self.attention_layer_ids = None
         self.a2f_send_stream = None
         self.f2a_recv_stream = None
         holder = self.context_holder
@@ -502,6 +504,13 @@ class WindowAFDConnector(AFDConnectorBase):
         device = torch.device("npu", self.local_rank)
         self.a2f_send_stream = torch.npu.Stream(device=device)
         self.f2a_recv_stream = torch.npu.Stream(device=device)
+        # Cache immutable layer IDs so Combine never performs a synchronous
+        # host-to-device copy behind the A2F send event.
+        self.attention_layer_ids = torch.tensor(
+            list(range(self.num_layers)),
+            dtype=torch.int32,
+            device=device,
+        )
         self.attention_pipeline_events = {
             (layer_idx, stage_idx): WindowAttentionPipelineEvents(
                 compute_done=torch.npu.Event(),
@@ -811,11 +820,10 @@ class WindowAFDConnector(AFDConnectorBase):
 
         events = self._attention_events(key[1], key[0])
         assert self.f2a_recv_stream is not None
+        assert self.attention_layer_ids is not None
+        layer_id = self.attention_layer_ids[key[1] : key[1] + 1]
         with torch.npu.stream(self.f2a_recv_stream):
             events.send_done.wait(self.f2a_recv_stream)
-            layer_id = torch.tensor(
-                [key[1]], dtype=torch.int32, device=ref_tensor.device
-            )
             _record_npu_stream(
                 context.states.expert_scales,
                 self.f2a_recv_stream,
