@@ -307,10 +307,12 @@ def _fail_if_unsupported_deepseek_v4_features(
             )
         if (
             parallel_config.use_ubatching
-            and afd_config.connector != "P2pHcclAFDConnector"
+            and afd_config.connector
+            not in {"P2pHcclAFDConnector", "WindowAFDConnector"}
         ):
             raise RuntimeError(
-                "DeepSeek-V4 AFD graph U2 supports only P2pHcclAFDConnector"
+                "DeepSeek-V4 AFD graph U2 supports only P2pHcclAFDConnector "
+                "or WindowAFDConnector"
             )
     _fail_if_unsupported_deepseek_v4_pd(vllm_config, afd_config)
 

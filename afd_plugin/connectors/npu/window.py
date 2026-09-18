@@ -8,7 +8,8 @@ path.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -18,6 +19,7 @@ import torch
 import torch_npu
 import torch.distributed as dist
 from torch.distributed.distributed_c10d import ProcessGroup
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 
 from afd_plugin.config import AFDConfig
@@ -49,7 +51,9 @@ def _record_npu_stream(tensor: torch.Tensor, stream: Any) -> None:
 class WindowAttentionPipelineEvents:
     """One Attention layer/stage's compute, A2F, and Combine events."""
 
+    ready: Any
     compute_done: Any
+    send_ready: Any
     send_done: Any
     recv_done: Any
 
@@ -260,6 +264,7 @@ class WindowAFDConnector(AFDConnectorBase):
         self._pending_transfers: dict[tuple[int, int], AFDTransferContext] = {}
         self.a2f_send_stream = None
         self.f2a_recv_stream = None
+        self.attention_graph_compute_stream = None
         self.attention_pipeline_events: dict[
             tuple[int, int], WindowAttentionPipelineEvents
         ] = {}
@@ -469,6 +474,7 @@ class WindowAFDConnector(AFDConnectorBase):
         self.attention_layer_ids = None
         self.a2f_send_stream = None
         self.f2a_recv_stream = None
+        self.attention_graph_compute_stream = None
         holder = self.context_holder
         self.context_holder = None
         self.schedule_context = None
@@ -500,10 +506,11 @@ class WindowAFDConnector(AFDConnectorBase):
         self._initialized = False
 
     def _initialize_attention_stream_pipeline(self) -> None:
-        """Create eager A2F and Combine streams for two-stage overlap."""
+        """Create eager communication and ACLGraph compute streams/events."""
         device = torch.device("npu", self.local_rank)
         self.a2f_send_stream = torch.npu.Stream(device=device)
         self.f2a_recv_stream = torch.npu.Stream(device=device)
+        self.attention_graph_compute_stream = torch.npu.Stream(device=device)
         # Cache immutable layer IDs so Combine never performs a synchronous
         # host-to-device copy behind the A2F send event.
         self.attention_layer_ids = torch.tensor(
@@ -513,11 +520,14 @@ class WindowAFDConnector(AFDConnectorBase):
         )
         self.attention_pipeline_events = {
             (layer_idx, stage_idx): WindowAttentionPipelineEvents(
+                ready=torch.npu.Event(),
                 compute_done=torch.npu.Event(),
+                send_ready=torch.npu.Event(),
                 send_done=torch.npu.Event(),
                 recv_done=torch.npu.Event(),
             )
-            for layer_idx in range(self.num_layers)
+            # The final pseudo-layer runs the post-HC continuation.
+            for layer_idx in range(self.num_layers + 1)
             for stage_idx in range(self.micro_batch_num)
         }
 
@@ -529,6 +539,24 @@ class WindowAFDConnector(AFDConnectorBase):
             and self.a2f_send_stream is not None
             and self.f2a_recv_stream is not None
             and self.attention_pipeline_events
+        )
+
+    def _attention_stream_pipeline_active(self) -> bool:
+        """Return whether the eager U2 stream pipeline owns this forward."""
+        if (
+            torch.compiler.is_compiling()
+            or not self.attention_stream_pipeline_ready
+        ):
+            return False
+        try:
+            forward_context = get_forward_context()
+        except AssertionError:
+            return False
+        if bool(getattr(forward_context, "afd_graph_ubatching", False)):
+            return False
+        return bool(
+            getattr(forward_context, "dbo_enabled", False)
+            and int(getattr(forward_context, "num_ubatches", 1)) > 1
         )
 
     def _attention_events(
@@ -543,6 +571,91 @@ class WindowAFDConnector(AFDConnectorBase):
                 "Window Attention pipeline event is not initialized: "
                 f"layer={layer_idx} stage={stage_idx}"
             ) from exc
+
+    def attention_graph_compute_pipeline_active(self) -> bool:
+        """Return whether ACLGraph U2 should use the side compute stream."""
+        if torch.compiler.is_compiling():
+            return False
+        if not (
+            self.stream_overlap_enabled
+            and self.afd_config.role == "attention"
+            and self.attention_graph_compute_stream is not None
+            and self.attention_pipeline_events
+        ):
+            return False
+        try:
+            forward_context = get_forward_context()
+        except AssertionError:
+            return False
+        return bool(
+            getattr(forward_context, "afd_graph_ubatching", False)
+            and getattr(forward_context, "afd_layer_major_u2", False)
+            and getattr(forward_context, "dbo_enabled", False)
+            and int(getattr(forward_context, "num_ubatches", 1)) > 1
+        )
+
+    def attention_graph_hybrid_dag_active(self) -> bool:
+        """Window Graph U2 consumes Combine through the existing dependency."""
+        return False
+
+    @contextmanager
+    def attention_graph_compute(
+        self,
+        *,
+        layer_idx: int,
+        stage_idx: int,
+        tensors: tuple[torch.Tensor, ...] = (),
+        wait_for_receive_layer_idx: int | None = None,
+    ) -> Iterator[None]:
+        """Fork one ACLGraph Attention computation to the compute stream."""
+        if not self.attention_graph_compute_pipeline_active():
+            raise RuntimeError("Window Attention Graph compute pipeline is inactive")
+        events = self._attention_events(layer_idx, stage_idx)
+        parent_stream = torch.npu.current_stream()
+        if wait_for_receive_layer_idx is None:
+            events.ready.record(parent_stream)
+            ready_event = events.ready
+        else:
+            ready_event = self._attention_events(
+                wait_for_receive_layer_idx,
+                stage_idx,
+            ).recv_done
+        assert self.attention_graph_compute_stream is not None
+        with torch.npu.stream(self.attention_graph_compute_stream):
+            ready_event.wait(self.attention_graph_compute_stream)
+            for tensor in tensors:
+                _record_npu_stream(tensor, self.attention_graph_compute_stream)
+            yield
+            events.compute_done.record(self.attention_graph_compute_stream)
+
+    def wait_for_attention_graph_compute(
+        self,
+        *,
+        layer_idx: int,
+        stage_idx: int,
+        tensors: tuple[torch.Tensor, ...] = (),
+    ) -> None:
+        """Make the parent capture stream wait for one Attention compute."""
+        if not self.attention_graph_compute_pipeline_active():
+            raise RuntimeError("Window Attention Graph compute pipeline is inactive")
+        parent_stream = torch.npu.current_stream()
+        self._attention_events(layer_idx, stage_idx).compute_done.wait(parent_stream)
+        for tensor in tensors:
+            _record_npu_stream(tensor, parent_stream)
+
+    def join_attention_graph_compute(
+        self,
+        *,
+        layer_idx: int,
+        stage_idx: int,
+        tensors: tuple[torch.Tensor, ...] = (),
+    ) -> None:
+        """Join final post-HC compute back to the parent capture stream."""
+        self.wait_for_attention_graph_compute(
+            layer_idx=layer_idx,
+            stage_idx=stage_idx,
+            tensors=tensors,
+        )
 
     def _build_rank_tables(self) -> None:
         """Build a balanced routed table plus one shared-first FFN rank."""
@@ -745,7 +858,34 @@ class WindowAFDConnector(AFDConnectorBase):
                 active_mask=active_mask,
             )
 
-        if self.attention_stream_pipeline_ready:
+        if self.attention_graph_compute_pipeline_active():
+            if stage_idx in self.attention_receive_dependencies:
+                raise RuntimeError(
+                    "Window Attention stage has an unconsumed Combine result: "
+                    f"stage={stage_idx}"
+            )
+            events = self._attention_events(model_layer_idx, stage_idx)
+            parent_stream = torch.npu.current_stream()
+            # Gate/top-k and fixed-capacity A2F inputs are produced on the
+            # parent capture stream after Attention compute has joined it.
+            # A distinct event prevents the send stream from reading them
+            # as soon as the earlier compute_done event fires.
+            events.send_ready.record(parent_stream)
+            assert self.a2f_send_stream is not None
+            with torch.npu.stream(self.a2f_send_stream):
+                events.send_ready.wait(self.a2f_send_stream)
+                for tensor in (
+                    x,
+                    session_id,
+                    micro_batch_id,
+                    layer_id,
+                    padded_expert_ids,
+                    active_mask,
+                ):
+                    _record_npu_stream(tensor, self.a2f_send_stream)
+                enqueue_a2f()
+                events.send_done.record(self.a2f_send_stream)
+        elif self._attention_stream_pipeline_active():
             if stage_idx in self.attention_receive_dependencies:
                 raise RuntimeError(
                     "Window Attention stage has an unconsumed Combine result: "
@@ -812,7 +952,9 @@ class WindowAFDConnector(AFDConnectorBase):
             )
             return output[: ref_tensor.shape[0]].reshape_as(ref_tensor)
 
-        if not self.attention_stream_pipeline_ready:
+        graph_pipeline_active = self.attention_graph_compute_pipeline_active()
+        eager_pipeline_active = self._attention_stream_pipeline_active()
+        if not (graph_pipeline_active or eager_pipeline_active):
             layer_id = torch.tensor(
                 [key[1]], dtype=torch.int32, device=ref_tensor.device
             )
@@ -860,7 +1002,10 @@ class WindowAFDConnector(AFDConnectorBase):
         tensor: torch.Tensor,
     ) -> None:
         """Make the current compute stream consume one deferred Combine."""
-        if not self.attention_stream_pipeline_ready:
+        if not (
+            self.attention_graph_compute_pipeline_active()
+            or self._attention_stream_pipeline_active()
+        ):
             return
         dependency = self.attention_receive_dependencies.pop(stage_idx, None)
         if dependency is None:
