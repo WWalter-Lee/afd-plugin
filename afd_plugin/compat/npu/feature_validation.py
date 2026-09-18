@@ -144,6 +144,8 @@ def _fail_if_unsupported_deepseek_v4_features(
     afd_config: AFDConfig,
 ) -> None:
     """Keep DSV4 AFD inside its validated eager and graph feature boxes."""
+    from vllm_ascend.utils import is_dspark_config
+
     parallel_config = vllm_config.parallel_config
     supported_connectors = {
         "CAMP2pAFDConnector",
@@ -232,33 +234,64 @@ def _fail_if_unsupported_deepseek_v4_features(
             )
     speculative_config = vllm_config.speculative_config
     if speculative_config is not None:
-        if afd_config.connector != "P2pHcclAFDConnector":
+        uses_dspark = is_dspark_config(vllm_config)
+        if uses_dspark and afd_config.role != "attention":
+            raise RuntimeError(
+                "DeepSeek-V4 AFD DSpark speculative config belongs only to "
+                "the Attention service"
+            )
+        if not uses_dspark and afd_config.connector != "P2pHcclAFDConnector":
             raise RuntimeError("DeepSeek-V4 AFD MTP supports only P2pHcclAFDConnector")
         if getattr(speculative_config, "method", None) != "mtp":
             raise RuntimeError("DeepSeek-V4 AFD supports only MTP speculative method")
-        if int(getattr(speculative_config, "num_speculative_tokens", 0)) != 1:
-            raise RuntimeError("DeepSeek-V4 AFD MTP supports num_speculative_tokens=1")
         draft_enforce_eager = bool(getattr(speculative_config, "enforce_eager", False))
         target_enforce_eager = bool(vllm_config.model_config.enforce_eager)
         if target_enforce_eager and not draft_enforce_eager:
             raise RuntimeError(
-                "DeepSeek-V4 AFD MTP eager execution requires draft enforce_eager=true"
+                "DeepSeek-V4 AFD speculative eager execution requires draft "
+                "enforce_eager=true"
             )
-        if (
-            tensor_parallel_size == 2
-            and not target_enforce_eager
-            and not draft_enforce_eager
-            and parallel_config.use_ubatching
-        ):
-            raise RuntimeError(
-                "DeepSeek-V4 AFD TP2 full-draft MTP Graph U2 is not validated; "
-                "use the TP2 eager/U1 baseline or TP1 for this combined mode"
+        if uses_dspark:
+            draft_hf_config = speculative_config.draft_model_config.hf_config
+            dspark_block_size = int(
+                getattr(draft_hf_config, "dspark_block_size", 0)
             )
-        num_mtp_layers = int(
-            getattr(vllm_config.model_config.hf_config, "num_nextn_predict_layers", 1)
-        )
-        if num_mtp_layers != 1:
-            raise RuntimeError("DeepSeek-V4 AFD MTP supports exactly one MTP layer")
+            num_speculative_tokens = int(
+                getattr(speculative_config, "num_speculative_tokens", 0)
+            )
+            if num_speculative_tokens != dspark_block_size:
+                raise RuntimeError(
+                    "DeepSeek-V4 AFD DSpark requires num_speculative_tokens "
+                    "to match dspark_block_size: "
+                    f"{num_speculative_tokens} != {dspark_block_size}"
+                )
+        else:
+            if int(getattr(speculative_config, "num_speculative_tokens", 0)) != 1:
+                raise RuntimeError(
+                    "DeepSeek-V4 AFD MTP supports num_speculative_tokens=1"
+                )
+            if (
+                tensor_parallel_size == 2
+                and not target_enforce_eager
+                and not draft_enforce_eager
+                and parallel_config.use_ubatching
+            ):
+                raise RuntimeError(
+                    "DeepSeek-V4 AFD TP2 full-draft MTP Graph U2 is not "
+                    "validated; use the TP2 eager/U1 baseline or TP1 for "
+                    "this combined mode"
+                )
+            num_mtp_layers = int(
+                getattr(
+                    vllm_config.model_config.hf_config,
+                    "num_nextn_predict_layers",
+                    1,
+                )
+            )
+            if num_mtp_layers != 1:
+                raise RuntimeError(
+                    "DeepSeek-V4 AFD MTP supports exactly one MTP layer"
+                )
     if not vllm_config.model_config.enforce_eager:
         cudagraph_mode = getattr(
             getattr(vllm_config, "compilation_config", None),
