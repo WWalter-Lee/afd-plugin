@@ -246,9 +246,13 @@ def _fail_if_unsupported_deepseek_v4_features(
             raise RuntimeError("DeepSeek-V4 AFD supports only MTP speculative method")
         draft_enforce_eager = bool(getattr(speculative_config, "enforce_eager", False))
         target_enforce_eager = bool(vllm_config.model_config.enforce_eager)
-        if target_enforce_eager and not draft_enforce_eager:
+        if (
+            not uses_dspark
+            and target_enforce_eager
+            and not draft_enforce_eager
+        ):
             raise RuntimeError(
-                "DeepSeek-V4 AFD speculative eager execution requires draft "
+                "DeepSeek-V4 AFD MTP eager execution requires draft "
                 "enforce_eager=true"
             )
         if uses_dspark:
