@@ -973,7 +973,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     cm.slot_mapping_cpu = slot_mapping_cpu
             if self.speculative_config and isinstance(
                 self.drafter,
-                AscendStep3p5MTPProposer | AscendDSparkProposer,
+                AscendStep3p5MTPProposer,
             ):
                 self.drafter.set_per_group_attn_metadata(
                     kv_cache_gid,
@@ -981,12 +981,14 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     cm.slot_mapping,
                 )
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(
+                if isinstance(self.drafter, AscendDSparkProposer):
+                    if self.drafter.kv_cache_gid == kv_cache_gid:
+                        spec_decode_common_attn_metadata = cm
+                elif isinstance(
                     self.drafter,
                     AscendEagleProposer
                     | AscendDraftModelProposer
                     | AscendDflashProposer
-                    | AscendDSparkProposer,
                 ):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
                         spec_decode_common_attn_metadata = cm
