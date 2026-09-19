@@ -2264,11 +2264,11 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         fixed_window_u2 = self._uses_fixed_window_u2()
         if fixed_window_u2:
             # Window M=2 is a communication protocol, not an optional DBO
-            # optimization.  Keep both Window slots active even for a
-            # single-token dummy or live step.  Graph/U2 integration is a
-            # separate feature; eager execution keeps the padded split exact.
+            # optimization. Keep both Window slots active even for a
+            # single-token dummy or live step. Do not force eager here: the
+            # dispatcher must retain FULL during ACLGraph warmup/capture, while
+            # an enforce-eager launch already reaches this method with NONE.
             num_tokens_padded = max(num_tokens_padded, 2)
-            force_eager = True
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
         uniform_decode = (
             (
