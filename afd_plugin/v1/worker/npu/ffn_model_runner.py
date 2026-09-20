@@ -307,6 +307,10 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             ubatch_idx=0,
             max_num_tokens=self.max_num_tokens,
         )
+        # Temporary correctness barrier.  The A5 Batching output is not yet
+        # safe for the following device-side metadata conversion without an
+        # explicit completion wait.  Remove after the operator chain is fixed.
+        compute_stream.synchronize()
         full_output = self._compute_window_async_batch(payload)
         compute_event.record(compute_stream)
 
@@ -331,6 +335,18 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             raise RuntimeError("Window batching returned invalid transfer state")
         if states.group_list is None or states.actual_token_num is None:
             raise RuntimeError("Window batching returned incomplete global metadata")
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        print(
+            "[FFN_COMPARE][BATCH]",
+            f"rank={rank}",
+            f"hidden_shape={tuple(payload.hidden_states.shape)}",
+            f"hidden_head={payload.hidden_states.reshape(-1)[:8].float().cpu().tolist()}",
+            f"group_shape={tuple(states.group_list.shape)}",
+            f"group_head={states.group_list.reshape(-1)[:16].cpu().tolist()}",
+            f"actual={states.actual_token_num.reshape(-1).cpu().tolist()}",
+            flush=True,
+        )
 
         num_tokens = int(payload.hidden_states.shape[0])
         afd_metadata = AFDForwardContextMetadata(
@@ -358,11 +374,19 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         ) as forward_context:
             forward_context.additional_kwargs["afd_metadata"] = afd_metadata
             _set_moe_layer_index(forward_context, 0)
-            return self.model.compute_window_global_ffn_output(
+            output = self.model.compute_window_global_ffn_output(
                 hidden_states=payload.hidden_states,
                 group_list=states.group_list,
                 actual_token_num=states.actual_token_num,
             )
+        print(
+            "[FFN_COMPARE][OUTPUT]",
+            f"rank={rank}",
+            f"shape={tuple(output.shape)}",
+            f"head={output.reshape(-1)[:8].float().cpu().tolist()}",
+            flush=True,
+        )
+        return output
 
     def _compute_window_ffn_layer(
         self,
