@@ -29,6 +29,13 @@ if TYPE_CHECKING:
 _FFN_COMPARE_WEIGHT_PRINTED = False
 
 
+def _ffn_compare_rank_enabled() -> bool:
+    return (
+        torch.distributed.is_initialized()
+        and torch.distributed.get_rank() in (0, 1)
+    )
+
+
 def _get_expert_parameter(experts: torch.nn.Module, name: str):
     """Read MoE weights across vLLM-Ascend EPLB API generations."""
 
@@ -189,7 +196,7 @@ def compute_attention_gate_moe_ffn(
         shared_experts = getattr(layer.mlp, "shared_experts", None)
         if shared_experts is None:
             raise RuntimeError("Window shared FFN rank has no shared expert module")
-        if not _FFN_COMPARE_WEIGHT_PRINTED:
+        if not _FFN_COMPARE_WEIGHT_PRINTED and _ffn_compare_rank_enabled():
             import torch_npu
 
             rank = (
@@ -324,7 +331,11 @@ def compute_attention_gate_moe_ffn(
         and _gmmswigluquant_fusion_enabled()
     )
 
-    if not _FFN_COMPARE_WEIGHT_PRINTED and quant_type == QuantType.W4A8MXFP:
+    if (
+        not _FFN_COMPARE_WEIGHT_PRINTED
+        and quant_type == QuantType.W4A8MXFP
+        and _ffn_compare_rank_enabled()
+    ):
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
         print(
             "[FFN_COMPARE][WEIGHT]",
