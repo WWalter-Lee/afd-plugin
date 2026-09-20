@@ -339,7 +339,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         if not isinstance(states, WindowAFDTransferState):
             raise RuntimeError("Window batching returned invalid transfer state")
 
-        role_rank = int(self.connector.topology.role_rank)
+        role_rank = int(self.connector.role_rank)
         compare_enabled = role_rank in (0, 1) and not getattr(
             self,
             "_ffn_compare_batch_printed",
