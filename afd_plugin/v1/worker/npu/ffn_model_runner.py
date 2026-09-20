@@ -340,12 +340,35 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             raise RuntimeError("Window batching returned invalid transfer state")
 
         role_rank = int(self.connector.topology.role_rank)
-        compare_enabled = role_rank in (0, 1)
+        compare_enabled = role_rank in (0, 1) and not getattr(
+            self,
+            "_ffn_compare_batch_printed",
+            False,
+        )
         rank = (
             torch.distributed.get_rank()
             if compare_enabled and torch.distributed.is_initialized()
             else -1
         )
+        if compare_enabled:
+            self._ffn_compare_batch_printed = True
+            layer_ids = [batch.layer_idx for batch in states.layer_batches]
+            layer_tokens = [
+                batch.token_end - batch.token_start for batch in states.layer_batches
+            ]
+            print(
+                "[FFN_COMPARE][BATCH]",
+                f"rank={rank}",
+                f"role_rank={role_rank}",
+                f"layer_count={len(layer_ids)}",
+                f"layers={layer_ids}",
+                f"layer_tokens={layer_tokens}",
+                f"hidden_shape={tuple(payload.hidden_states.shape)}",
+                f"hidden_head={payload.hidden_states.reshape(-1)[:8].float().cpu().tolist()}",
+                f"group_head={states.group_list.reshape(-1)[:16].cpu().tolist()}",
+                f"actual={states.actual_token_num.reshape(-1).cpu().tolist()}",
+                flush=True,
+            )
         if not states.layer_batches:
             # A ready Attention snapshot may contain no token routed to this
             # FFN rank. It must still enter F2A with actual_token_num=0 so
@@ -354,6 +377,15 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 payload.hidden_states.shape,
                 dtype=self.model_config.dtype,
             )
+            if compare_enabled:
+                print(
+                    "[FFN_COMPARE][OUTPUT]",
+                    f"rank={rank}",
+                    f"role_rank={role_rank}",
+                    f"shape={tuple(full_output.shape)}",
+                    f"head={full_output.reshape(-1)[:8].float().cpu().tolist()}",
+                    flush=True,
+                )
             return full_output
 
         hidden_states = payload.hidden_states
@@ -362,18 +394,6 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             layer_hidden = hidden_states[
                 layer_batch.token_start : layer_batch.token_end
             ]
-            compare_layer = compare_enabled and layer_batch.layer_idx == 0
-            if compare_layer:
-                print(
-                    "[FFN_COMPARE][BATCH]",
-                    f"rank={rank}",
-                    f"role_rank={role_rank} layer=0",
-                    f"hidden_shape={tuple(layer_hidden.shape)}",
-                    f"hidden_head={layer_hidden.reshape(-1)[:8].float().cpu().tolist()}",
-                    f"group_head={layer_batch.group_list.reshape(-1)[:16].cpu().tolist()}",
-                    f"actual={layer_batch.token_end - layer_batch.token_start}",
-                    flush=True,
-                )
             dynamic_scale = (
                 states.dynamic_scale[layer_batch.token_start : layer_batch.token_end]
                 if states.dynamic_scale is not None
@@ -389,15 +409,6 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             routed_output = getattr(layer_output, "routed_output", layer_output)
             if not isinstance(routed_output, torch.Tensor):
                 raise RuntimeError("Window FFN layer returned no routed output tensor")
-            if compare_layer:
-                print(
-                    "[FFN_COMPARE][OUTPUT]",
-                    f"rank={rank}",
-                    f"role_rank={role_rank} layer=0",
-                    f"shape={tuple(routed_output.shape)}",
-                    f"head={routed_output.reshape(-1)[:8].float().cpu().tolist()}",
-                    flush=True,
-                )
             routed_outputs.append(routed_output)
 
         valid_output = torch.cat(routed_outputs, dim=0)
@@ -413,6 +424,15 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             (hidden_states.shape[0], *valid_output.shape[1:])
         )
         full_output[:actual_num].copy_(valid_output)
+        if compare_enabled:
+            print(
+                "[FFN_COMPARE][OUTPUT]",
+                f"rank={rank}",
+                f"role_rank={role_rank}",
+                f"shape={tuple(full_output.shape)}",
+                f"head={full_output.reshape(-1)[:8].float().cpu().tolist()}",
+                flush=True,
+            )
         return full_output
 
     def _compute_window_ffn_layer(
