@@ -238,11 +238,15 @@ def compute_window_global_mxfp_ffn(
             f"w1_shape={tuple(weights.w1[0].shape)}",
             f"w1_dtype={weights.w1.dtype}",
             f"w1_format={torch_npu.get_npu_format(weights.w1)}",
-            f"w1_scale_head={weights.w1_scale[0].reshape(-1)[:8].cpu().tolist()}",
+            f"w1_scale_shape={tuple(weights.w1_scale[0].shape)}",
+            f"w1_scale_dtype={weights.w1_scale.dtype}",
+            f"w1_scale_format={torch_npu.get_npu_format(weights.w1_scale)}",
             f"w2_shape={tuple(weights.w2[0].shape)}",
             f"w2_dtype={weights.w2.dtype}",
             f"w2_format={torch_npu.get_npu_format(weights.w2)}",
-            f"w2_scale_head={weights.w2_scale[0].reshape(-1)[:8].cpu().tolist()}",
+            f"w2_scale_shape={tuple(weights.w2_scale[0].shape)}",
+            f"w2_scale_dtype={weights.w2_scale.dtype}",
+            f"w2_scale_format={torch_npu.get_npu_format(weights.w2_scale)}",
             flush=True,
         )
         _FFN_COMPARE_WEIGHT_PRINTED = True
