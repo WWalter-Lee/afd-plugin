@@ -101,7 +101,6 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self.ffn_recv_events: dict[tuple[int, int], Any] = {}
         self.ffn_compute_events: dict[tuple[int, int], Any] = {}
         self.ffn_send_events: dict[tuple[int, int], Any] = {}
-        self.window_ffn_recv_events: list[Any] = []
         self.window_ffn_compute_events: list[Any] = []
         self.window_ffn_send_events: list[Any] = []
         self.window_ffn_round_index = 0
@@ -126,9 +125,6 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self.ffn_send_stream = torch.npu.Stream(device=device)
         if self.window_ffn_stream_overlap_enabled:
             slot_num = int(self.vllm_config.parallel_config.num_ubatches)
-            self.window_ffn_recv_events = [
-                torch.npu.Event() for _ in range(slot_num)
-            ]
             self.window_ffn_compute_events = [
                 torch.npu.Event() for _ in range(slot_num)
             ]
@@ -292,7 +288,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         assert self.ffn_recv_stream is not None
         assert self.ffn_compute_stream is not None
         assert self.ffn_send_stream is not None
-        slot_num = len(self.window_ffn_recv_events)
+        slot_num = len(self.window_ffn_compute_events)
         if slot_num == 0:
             raise RuntimeError("Window FFN stream events are not initialized")
         round_index = self.window_ffn_round_index
@@ -300,22 +296,19 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         # This is a local event-ring slot, not the micro_batch_id selected by
         # FFNWorkerBatching.
         slot = round_index % slot_num
-        recv_event = self.window_ffn_recv_events[slot]
         compute_event = self.window_ffn_compute_events[slot]
         send_event = self.window_ffn_send_events[slot]
 
-        with torch.npu.stream(self.ffn_recv_stream):
+        # Window Batching and FFN compute are serial by design.  Submit both on
+        # the compute stream so the stream itself provides their dependency;
+        # F2A remains on the send stream and may overlap the next transaction.
+        with torch.npu.stream(self.ffn_compute_stream):
             if round_index >= slot_num:
-                send_event.wait(self.ffn_recv_stream)
+                send_event.wait(self.ffn_compute_stream)
             payload = self.connector.recv_attn_output(
                 ubatch_idx=0,
                 max_num_tokens=self.max_num_tokens,
             )
-            recv_event.record(self.ffn_recv_stream)
-
-        with torch.npu.stream(self.ffn_compute_stream):
-            recv_event.wait(self.ffn_compute_stream)
-            _record_window_payload_stream(payload, self.ffn_compute_stream)
             full_output = self._compute_window_async_batch(payload)
             compute_event.record(self.ffn_compute_stream)
 
