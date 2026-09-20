@@ -338,14 +338,34 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         states = payload.context.states
         if not isinstance(states, WindowAFDTransferState):
             raise RuntimeError("Window batching returned invalid transfer state")
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        print(
+            "[FFN_COMPARE][BATCH]",
+            f"rank={rank}",
+            f"hidden_shape={tuple(payload.hidden_states.shape)}",
+            f"hidden_head={payload.hidden_states.reshape(-1)[:8].float().cpu().tolist()}",
+            f"group_shape={tuple(states.group_list.shape)}",
+            f"group_head={states.group_list.reshape(-1)[:16].cpu().tolist()}",
+            f"actual={states.actual_token_num.reshape(-1).cpu().tolist()}",
+            flush=True,
+        )
         if not states.layer_batches:
             # A ready Attention snapshot may contain no token routed to this
             # FFN rank. It must still enter F2A with actual_token_num=0 so
             # the other FFN ranks and Attention combine can make progress.
-            return payload.hidden_states.new_zeros(
+            full_output = payload.hidden_states.new_zeros(
                 payload.hidden_states.shape,
                 dtype=self.model_config.dtype,
             )
+            print(
+                "[FFN_COMPARE][OUTPUT]",
+                f"rank={rank}",
+                f"shape={tuple(full_output.shape)}",
+                f"head={full_output.reshape(-1)[:8].float().cpu().tolist()}",
+                flush=True,
+            )
+            return full_output
 
         hidden_states = payload.hidden_states
         routed_outputs = []
@@ -382,6 +402,13 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             (hidden_states.shape[0], *valid_output.shape[1:])
         )
         full_output[:actual_num].copy_(valid_output)
+        print(
+            "[FFN_COMPARE][OUTPUT]",
+            f"rank={rank}",
+            f"shape={tuple(full_output.shape)}",
+            f"head={full_output.reshape(-1)[:8].float().cpu().tolist()}",
+            flush=True,
+        )
         return full_output
 
     def _compute_window_ffn_layer(

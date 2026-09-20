@@ -26,6 +26,9 @@ if TYPE_CHECKING:
     )
 
 
+_FFN_COMPARE_WEIGHT_PRINTED = False
+
+
 def _get_expert_parameter(experts: torch.nn.Module, name: str):
     """Read MoE weights across vLLM-Ascend EPLB API generations."""
 
@@ -288,6 +291,24 @@ def compute_attention_gate_moe_ffn(
         quant_type in (QuantType.W8A8, getattr(QuantType, "MXFP8", None))
         and _gmmswigluquant_fusion_enabled()
     )
+
+    global _FFN_COMPARE_WEIGHT_PRINTED
+    if not _FFN_COMPARE_WEIGHT_PRINTED and quant_type == QuantType.W4A8MXFP:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        print(
+            "[FFN_COMPARE][WEIGHT]",
+            f"rank={rank}",
+            f"w1_shape={tuple(moe_weights.w1[0].shape)}",
+            f"w1_dtype={moe_weights.w1.dtype}",
+            f"w1_head={moe_weights.w1[0].reshape(-1)[:8].float().cpu().tolist()}",
+            f"w1_scale_head={moe_weights.w1_scale[0].reshape(-1)[:8].cpu().tolist()}",
+            f"w2_shape={tuple(moe_weights.w2[0].shape)}",
+            f"w2_dtype={moe_weights.w2.dtype}",
+            f"w2_head={moe_weights.w2[0].reshape(-1)[:8].float().cpu().tolist()}",
+            f"w2_scale_head={moe_weights.w2_scale[0].reshape(-1)[:8].cpu().tolist()}",
+            flush=True,
+        )
+        _FFN_COMPARE_WEIGHT_PRINTED = True
 
     # Preserve the existing DSV2 path, where routed and shared experts are
     # colocated inside one FusedMoE.  DSV4 Window routed ranks have no embedded
