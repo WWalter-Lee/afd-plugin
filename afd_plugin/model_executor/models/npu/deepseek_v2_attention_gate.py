@@ -29,19 +29,6 @@ if TYPE_CHECKING:
 _FFN_COMPARE_WEIGHT_PRINTED = False
 
 
-def _ffn_compare_weight_head(weight: torch.Tensor) -> list[float]:
-    import torch_npu
-
-    if torch_npu.get_npu_format(weight) == 2:
-        logical_weight = weight
-    else:
-        logical_weight = torch_npu.npu_format_cast(
-            weight.transpose(-2, -1),
-            2,
-        ).transpose(-2, -1).contiguous()
-    return logical_weight.reshape(-1)[:8].float().cpu().tolist()
-
-
 def _get_expert_parameter(experts: torch.nn.Module, name: str):
     """Read MoE weights across vLLM-Ascend EPLB API generations."""
 
@@ -203,6 +190,8 @@ def compute_attention_gate_moe_ffn(
         if shared_experts is None:
             raise RuntimeError("Window shared FFN rank has no shared expert module")
         if not _FFN_COMPARE_WEIGHT_PRINTED:
+            import torch_npu
+
             rank = (
                 torch.distributed.get_rank()
                 if torch.distributed.is_initialized()
@@ -218,11 +207,11 @@ def compute_attention_gate_moe_ffn(
                 "kind=shared",
                 f"w1_shape={tuple(w1.shape)}",
                 f"w1_dtype={w1.dtype}",
-                f"w1_head={_ffn_compare_weight_head(w1)}",
+                f"w1_format={torch_npu.get_npu_format(w1)}",
                 f"w1_scale_head={w1_scale.reshape(-1)[:8].cpu().tolist()}",
                 f"w2_shape={tuple(w2.shape)}",
                 f"w2_dtype={w2.dtype}",
-                f"w2_head={_ffn_compare_weight_head(w2)}",
+                f"w2_format={torch_npu.get_npu_format(w2)}",
                 f"w2_scale_head={w2_scale.reshape(-1)[:8].cpu().tolist()}",
                 flush=True,
             )
@@ -339,11 +328,11 @@ def compute_attention_gate_moe_ffn(
             "kind=routed",
             f"w1_shape={tuple(moe_weights.w1[0].shape)}",
             f"w1_dtype={moe_weights.w1.dtype}",
-            f"w1_head={_ffn_compare_weight_head(moe_weights.w1[:1])}",
+            f"w1_format={torch_npu.get_npu_format(moe_weights.w1)}",
             f"w1_scale_head={moe_weights.w1_scale[0].reshape(-1)[:8].cpu().tolist()}",
             f"w2_shape={tuple(moe_weights.w2[0].shape)}",
             f"w2_dtype={moe_weights.w2.dtype}",
-            f"w2_head={_ffn_compare_weight_head(moe_weights.w2[:1])}",
+            f"w2_format={torch_npu.get_npu_format(moe_weights.w2)}",
             f"w2_scale_head={moe_weights.w2_scale[0].reshape(-1)[:8].cpu().tolist()}",
             flush=True,
         )
