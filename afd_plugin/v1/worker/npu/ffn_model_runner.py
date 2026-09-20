@@ -336,50 +336,48 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         if states.group_list is None or states.actual_token_num is None:
             raise RuntimeError("Window batching returned incomplete global metadata")
 
-        compare_range = None
         role_rank = int(self.connector.topology.role_rank)
-        if role_rank in (0, 1):
+        compare_enabled = role_rank in (0, 1) and not getattr(
+            self,
+            "_ffn_compare_batch_printed",
+            False,
+        )
+        rank = (
+            torch.distributed.get_rank()
+            if compare_enabled and torch.distributed.is_initialized()
+            else -1
+        )
+        if compare_enabled:
+            self._ffn_compare_batch_printed = True
             actual = int(states.actual_token_num.item())
             experts_per_layer = int(self.connector.local_expert_num)
-            group_counts = [0] * experts_per_layer
+            layer_tokens: dict[int, int] = {}
             token_offset = 0
-            layer_start = None
-            layer_end = None
             for expert_id, token_count in states.group_list.cpu().tolist():
                 token_count = min(int(token_count), actual - token_offset)
                 if token_count <= 0:
                     break
                 layer_idx = int(expert_id) // experts_per_layer
-                if layer_idx == 0:
-                    layer_start = token_offset if layer_start is None else layer_start
-                    layer_end = token_offset + token_count
-                    group_counts[int(expert_id) % experts_per_layer] += token_count
+                layer_tokens[layer_idx] = (
+                    layer_tokens.get(layer_idx, 0) + token_count
+                )
                 token_offset += token_count
                 if token_offset >= actual:
                     break
-            if layer_start is not None and layer_end is not None:
-                cumulative_group = []
-                cumulative = 0
-                for token_count in group_counts:
-                    cumulative += token_count
-                    cumulative_group.append(cumulative)
-                compare_range = (layer_start, layer_end)
-                layer_hidden = payload.hidden_states[layer_start:layer_end]
-                rank = (
-                    torch.distributed.get_rank()
-                    if torch.distributed.is_initialized()
-                    else -1
-                )
-                print(
-                    "[FFN_COMPARE][BATCH]",
-                    f"rank={rank}",
-                    f"role_rank={role_rank} layer=0",
-                    f"hidden_shape={tuple(layer_hidden.shape)}",
-                    f"hidden_head={layer_hidden.reshape(-1)[:8].float().cpu().tolist()}",
-                    f"group_head={cumulative_group[:16]}",
-                    f"actual={layer_end - layer_start}",
-                    flush=True,
-                )
+            layer_ids = list(layer_tokens)
+            print(
+                "[FFN_COMPARE][BATCH]",
+                f"rank={rank}",
+                f"role_rank={role_rank}",
+                f"layer_count={len(layer_ids)}",
+                f"layers={layer_ids}",
+                f"layer_tokens={[layer_tokens[layer] for layer in layer_ids]}",
+                f"hidden_shape={tuple(payload.hidden_states.shape)}",
+                f"hidden_head={payload.hidden_states.reshape(-1)[:8].float().cpu().tolist()}",
+                f"group_head={states.group_list.reshape(-1)[:16].cpu().tolist()}",
+                f"actual={actual}",
+                flush=True,
+            )
 
         num_tokens = int(payload.hidden_states.shape[0])
         afd_metadata = AFDForwardContextMetadata(
@@ -412,14 +410,13 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 group_list=states.group_list,
                 actual_token_num=states.actual_token_num,
             )
-        if compare_range is not None:
-            layer_output = output[compare_range[0] : compare_range[1]]
+        if compare_enabled:
             print(
                 "[FFN_COMPARE][OUTPUT]",
                 f"rank={rank}",
-                f"role_rank={role_rank} layer=0",
-                f"shape={tuple(layer_output.shape)}",
-                f"head={layer_output.reshape(-1)[:8].float().cpu().tolist()}",
+                f"role_rank={role_rank}",
+                f"shape={tuple(output.shape)}",
+                f"head={output.reshape(-1)[:8].float().cpu().tolist()}",
                 flush=True,
             )
         return output
