@@ -285,8 +285,6 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             )
             return
 
-        assert self.ffn_recv_stream is not None
-        assert self.ffn_compute_stream is not None
         assert self.ffn_send_stream is not None
         slot_num = len(self.window_ffn_compute_events)
         if slot_num == 0:
@@ -299,18 +297,18 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         compute_event = self.window_ffn_compute_events[slot]
         send_event = self.window_ffn_send_events[slot]
 
-        # Window Batching and FFN compute are serial by design.  Submit both on
-        # the compute stream so the stream itself provides their dependency;
-        # F2A remains on the send stream and may overlap the next transaction.
-        with torch.npu.stream(self.ffn_compute_stream):
-            if round_index >= slot_num:
-                send_event.wait(self.ffn_compute_stream)
-            payload = self.connector.recv_attn_output(
-                ubatch_idx=0,
-                max_num_tokens=self.max_num_tokens,
-            )
-            full_output = self._compute_window_async_batch(payload)
-            compute_event.record(self.ffn_compute_stream)
+        # Match the reference execution model: Batching, metadata conversion,
+        # and FFN compute are serial on the caller's current stream.  Only F2A
+        # uses a side stream, so this path needs no host synchronization.
+        compute_stream = torch.npu.current_stream()
+        if round_index >= slot_num:
+            send_event.wait(compute_stream)
+        payload = self.connector.recv_attn_output(
+            ubatch_idx=0,
+            max_num_tokens=self.max_num_tokens,
+        )
+        full_output = self._compute_window_async_batch(payload)
+        compute_event.record(compute_stream)
 
         with torch.npu.stream(self.ffn_send_stream):
             compute_event.wait(self.ffn_send_stream)
