@@ -242,17 +242,19 @@ def compute_window_global_mxfp_ffn(
     global _FFN_COMPARE_WEIGHT_PRINTED
     if not _FFN_COMPARE_WEIGHT_PRINTED:
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        w1_sample = weights.w1[:1] if weights.is_routed else weights.w1[0]
+        w2_sample = weights.w2[:1] if weights.is_routed else weights.w2[0]
         print(
             "[FFN_COMPARE][WEIGHT]",
             f"rank={rank}",
             f"kind={'routed' if weights.is_routed else 'shared'}",
             f"w1_shape={tuple(weights.w1[0].shape)}",
             f"w1_dtype={weights.w1.dtype}",
-            f"w1_head={_ffn_compare_weight_head(weights.w1[0])}",
+            f"w1_head={_ffn_compare_weight_head(w1_sample)}",
             f"w1_scale_head={weights.w1_scale[0].reshape(-1)[:8].cpu().tolist()}",
             f"w2_shape={tuple(weights.w2[0].shape)}",
             f"w2_dtype={weights.w2.dtype}",
-            f"w2_head={_ffn_compare_weight_head(weights.w2[0])}",
+            f"w2_head={_ffn_compare_weight_head(w2_sample)}",
             f"w2_scale_head={weights.w2_scale[0].reshape(-1)[:8].cpu().tolist()}",
             flush=True,
         )
