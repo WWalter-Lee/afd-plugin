@@ -336,7 +336,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         if states.group_list is None or states.actual_token_num is None:
             raise RuntimeError("Window batching returned incomplete global metadata")
 
-        role_rank = int(self.connector.topology.role_rank)
+        role_rank = int(self.connector.role_rank)
         compare_enabled = role_rank in (0, 1) and not getattr(
             self,
             "_ffn_compare_batch_printed",
