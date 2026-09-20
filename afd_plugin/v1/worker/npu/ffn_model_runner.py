@@ -334,55 +334,44 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self,
         payload: AFDA2FTransferPayload,
     ) -> torch.Tensor:
-        """Compute all active layers returned by one Window batching call."""
+        """Compute one asynchronous Window transaction without host parsing."""
         states = payload.context.states
         if not isinstance(states, WindowAFDTransferState):
             raise RuntimeError("Window batching returned invalid transfer state")
-        if not states.layer_batches:
-            # A ready Attention snapshot may contain no token routed to this
-            # FFN rank. It must still enter F2A with actual_token_num=0 so
-            # the other FFN ranks and Attention combine can make progress.
-            return payload.hidden_states.new_zeros(
-                payload.hidden_states.shape,
-                dtype=self.model_config.dtype,
-            )
+        if states.group_list is None or states.actual_token_num is None:
+            raise RuntimeError("Window batching returned incomplete global metadata")
 
-        hidden_states = payload.hidden_states
-        routed_outputs = []
-        for layer_batch in states.layer_batches:
-            dynamic_scale = (
-                states.dynamic_scale[layer_batch.token_start : layer_batch.token_end]
-                if states.dynamic_scale is not None
-                else None
-            )
-            layer_output = self._compute_window_ffn_layer(
-                payload=payload,
-                hidden_states=hidden_states[
-                    layer_batch.token_start : layer_batch.token_end
-                ],
-                layer_idx=layer_batch.layer_idx,
-                group_list=layer_batch.group_list,
-                dynamic_scale=dynamic_scale,
-            )
-            routed_output = getattr(layer_output, "routed_output", layer_output)
-            if not isinstance(routed_output, torch.Tensor):
-                raise RuntimeError("Window FFN layer returned no routed output tensor")
-            routed_outputs.append(routed_output)
-
-        valid_output = torch.cat(routed_outputs, dim=0)
-        actual_num = sum(
-            batch.token_end - batch.token_start for batch in states.layer_batches
+        num_tokens = int(payload.hidden_states.shape[0])
+        afd_metadata = AFDForwardContextMetadata(
+            tokens_start_loc=[0],
+            requests_start_loc=[0],
+            stage_idx=0,
+            connector=self.connector,
+            tokens_lens=[num_tokens],
+            num_stages=1,
+            tokens_unpadded_lens=[num_tokens],
         )
-        if valid_output.shape[0] != actual_num:
-            raise RuntimeError(
-                "Window FFN layer outputs do not match the batching token count: "
-                f"output={valid_output.shape[0]} actual={actual_num}"
-            )
-        full_output = valid_output.new_zeros(
-            (hidden_states.shape[0], *valid_output.shape[1:])
+        num_tokens_across_dp = torch.full(
+            (int(self.vllm_config.parallel_config.data_parallel_size),),
+            num_tokens,
+            dtype=torch.int32,
+            device="cpu",
         )
-        full_output[:actual_num].copy_(valid_output)
-        return full_output
+        with ascend_forward_context(
+            vllm_config=self.vllm_config,
+            afd_metadata=afd_metadata,
+            model_instance=self.model,
+            input_ids=payload.input_ids,
+            num_tokens=num_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
+        ) as forward_context:
+            forward_context.additional_kwargs["afd_metadata"] = afd_metadata
+            _set_moe_layer_index(forward_context, 0)
+            return self.model.compute_window_global_ffn_output(
+                hidden_states=payload.hidden_states,
+                group_list=states.group_list,
+                actual_token_num=states.actual_token_num,
+            )
 
     def _compute_window_ffn_layer(
         self,
@@ -1242,8 +1231,6 @@ def _record_window_payload_stream(
     ):
         if isinstance(tensor, torch.Tensor):
             _record_npu_stream(tensor, stream)
-    for layer_batch in states.layer_batches:
-        _record_npu_stream(layer_batch.group_list, stream)
 
 
 def _ffn_layer_indices(runner: AFDNPUFFNModelRunner) -> range | list[int]:

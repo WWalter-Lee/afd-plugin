@@ -92,16 +92,25 @@ def _iter_role_weights(
     role: str,
     compute_gate_on_attention: bool,
     window_ffn_kind: str | None,
+    num_hidden_layers: int,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Consume a checkpoint iterator once and retain the active role's keys."""
     for name, loaded_weight in weights:
+        normalized = name.removeprefix("model.")
+        parts = normalized.split(".")
+        if (
+            len(parts) >= 2
+            and parts[0] == "layers"
+            and parts[1].isdigit()
+            and int(parts[1]) >= num_hidden_layers
+        ):
+            continue
         if role not in _checkpoint_weight_roles(
             name,
             compute_gate_on_attention=compute_gate_on_attention,
         ):
             continue
         if role == "ffn" and window_ffn_kind is not None:
-            normalized = name.removeprefix("model.")
             is_shared = any(
                 marker in f".{normalized}"
                 for marker in (".ffn.shared_experts.", ".mlp.shared_experts.")
@@ -632,6 +641,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         nn.Module.__init__(self)
         self.afd_config = parse_afd_config(vllm_config, validate=False)
         self.afd_role = self.afd_config.role
+        self._window_global_mxfp_weights = None
         # ### PATCH END
 
         config = vllm_config.model_config.hf_config
@@ -1272,6 +1282,62 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
     ) -> torch.Tensor | AFDF2ATransferPayload:
         return self.layers[layer_idx].compute_ffn_output(hidden_states, **kwargs)
 
+    def compute_window_global_ffn_output(
+        self,
+        hidden_states: torch.Tensor,
+        group_list: torch.Tensor,
+        actual_token_num: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute every ready Window layer without host-side layer parsing."""
+
+        if self._window_global_mxfp_weights is None:
+            # Routed WeightNZ tensors must be packed before native post-load
+            # processing and are initialized by ``load_weights()``.  Shared
+            # MXFP8 tensors remain ND, so initialize them here after their
+            # native per-layer post-load processing has completed.
+            first_local_layer = next(
+                layer
+                for layer in self.layers
+                if not isinstance(layer, native.PPMissingLayer)
+            )
+            if getattr(first_local_layer.mlp, "experts", None) is not None:
+                raise RuntimeError(
+                    "Window routed FFN weights were not initialized before "
+                    "MXFP post-load processing"
+                )
+            self.initialize_window_global_mxfp_weights()
+        from afd_plugin.model_executor.models.npu.deepseek_v2_attention_gate import (
+            compute_window_global_mxfp_ffn,
+        )
+
+        return compute_window_global_mxfp_ffn(
+            hidden_states=hidden_states,
+            compact_group_list=group_list,
+            actual_token_num=actual_token_num,
+            weights=self._window_global_mxfp_weights,
+        )
+
+    def initialize_window_global_mxfp_weights(self) -> None:
+        """Pack Window FFN weights while checkpoint tensors are still ND."""
+
+        from afd_plugin.model_executor.models.npu.deepseek_v2_attention_gate import (
+            build_window_global_mxfp_weights,
+        )
+
+        local_layers = [
+            layer
+            for layer in self.layers
+            if not isinstance(layer, native.PPMissingLayer)
+        ]
+        if len(local_layers) != int(self.config.num_hidden_layers):
+            raise RuntimeError(
+                "Window global FFN requires every decoder layer on the FFN rank: "
+                f"local={len(local_layers)} total={self.config.num_hidden_layers}"
+            )
+        self._window_global_mxfp_weights = build_window_global_mxfp_weights(
+            local_layers
+        )
+
 
 class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
     """DSV4 causal LM wrapper with strict role ownership."""
@@ -1338,6 +1404,18 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
     ) -> torch.Tensor | AFDF2ATransferPayload:
         return self.model.compute_ffn_output(hidden_states, layer_idx, **kwargs)
 
+    def compute_window_global_ffn_output(
+        self,
+        hidden_states: torch.Tensor,
+        group_list: torch.Tensor,
+        actual_token_num: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.model.compute_window_global_ffn_output(
+            hidden_states,
+            group_list,
+            actual_token_num,
+        )
+
     def forward_ubatches_layer_major(
         self,
         ubatch_metadata: list[Any],
@@ -1359,14 +1437,18 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
                 self.vllm_config,
                 role_rank,
             ).kind
-        return super().load_weights(
+        loaded_weights = super().load_weights(
             _iter_role_weights(
                 weights,
                 role=self.afd_role,
                 compute_gate_on_attention=self.afd_config.compute_gate_on_attention,
                 window_ffn_kind=window_ffn_kind,
+                num_hidden_layers=int(self.model.config.num_hidden_layers),
             )
         )
+        if window_ffn_kind == "routed":
+            self.model.initialize_window_global_mxfp_weights()
+        return loaded_weights
 
 
 class AFDDeepSeekMultiTokenPredictorLayer(native_mtp.DeepSeekMultiTokenPredictorLayer):
