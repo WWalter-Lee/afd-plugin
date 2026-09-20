@@ -58,6 +58,19 @@ class WindowGlobalMXFPWeights:
 _FFN_COMPARE_WEIGHT_PRINTED = False
 
 
+def _ffn_compare_weight_head(weight: torch.Tensor) -> list[float]:
+    import torch_npu
+
+    if torch_npu.get_npu_format(weight) == 2:
+        logical_weight = weight
+    else:
+        logical_weight = torch_npu.npu_format_cast(
+            weight.transpose(-2, -1),
+            2,
+        ).transpose(-2, -1).contiguous()
+    return logical_weight.reshape(-1)[:8].float().cpu().tolist()
+
+
 def _stack_mxfp_weights(parts: list[torch.Tensor]) -> torch.Tensor:
     """Stack FP8 logical weights without using unsupported aclnnStack."""
 
@@ -228,22 +241,18 @@ def compute_window_global_mxfp_ffn(
 
     global _FFN_COMPARE_WEIGHT_PRINTED
     if not _FFN_COMPARE_WEIGHT_PRINTED:
-        import torch_npu
-
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-        w1_nd = torch_npu.npu_format_cast(weights.w1[0], 2)
-        w2_nd = torch_npu.npu_format_cast(weights.w2[0], 2)
         print(
             "[FFN_COMPARE][WEIGHT]",
             f"rank={rank}",
             f"kind={'routed' if weights.is_routed else 'shared'}",
             f"w1_shape={tuple(weights.w1[0].shape)}",
             f"w1_dtype={weights.w1.dtype}",
-            f"w1_head={w1_nd.reshape(-1)[:8].float().cpu().tolist()}",
+            f"w1_head={_ffn_compare_weight_head(weights.w1[0])}",
             f"w1_scale_head={weights.w1_scale[0].reshape(-1)[:8].cpu().tolist()}",
             f"w2_shape={tuple(weights.w2[0].shape)}",
             f"w2_dtype={weights.w2.dtype}",
-            f"w2_head={w2_nd.reshape(-1)[:8].float().cpu().tolist()}",
+            f"w2_head={_ffn_compare_weight_head(weights.w2[0])}",
             f"w2_scale_head={weights.w2_scale[0].reshape(-1)[:8].cpu().tolist()}",
             flush=True,
         )
