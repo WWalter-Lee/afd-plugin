@@ -642,6 +642,12 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         self.afd_config = parse_afd_config(vllm_config, validate=False)
         self.afd_role = self.afd_config.role
         self._window_global_mxfp_weights = None
+        self._ffn_compare_role_rank = (
+            resolve_role_rank(vllm_config, self.afd_config)
+            if self.afd_role == "attention"
+            else -1
+        )
+        self._ffn_compare_attention_layers: set[int] = set()
         # ### PATCH END
 
         config = vllm_config.model_config.hf_config
@@ -1244,6 +1250,22 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
             hidden_ubatches[stage_idx],
             continuation,
         )
+        layer_idx = int(pending_layer.layer_idx)
+        if (
+            self._ffn_compare_role_rank == 0
+            and layer_idx not in self._ffn_compare_attention_layers
+        ):
+            self._ffn_compare_attention_layers.add(layer_idx)
+            layer_output = hidden_ubatches[stage_idx]
+            print(
+                "[FFN_COMPARE][ATTENTION_LAYER_OUTPUT]",
+                f"role_rank={self._ffn_compare_role_rank}",
+                f"layer={layer_idx}",
+                f"stage={stage_idx}",
+                f"shape={tuple(layer_output.shape)}",
+                f"head={layer_output.reshape(-1)[:8].float().cpu().tolist()}",
+                flush=True,
+            )
         if pending_layer.layer_idx + 1 in self.aux_hidden_state_layers:
             aux_hidden_ubatches[stage_idx].append(
                 hidden_ubatches[stage_idx].mean(dim=1)
