@@ -338,7 +338,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
 
         compare_range = None
         role_rank = int(self.connector.topology.role_rank)
-        if role_rank == 1:
+        if role_rank in (0, 1):
             actual = int(states.actual_token_num.item())
             experts_per_layer = int(self.connector.local_expert_num)
             group_counts = [0] * experts_per_layer
@@ -373,7 +373,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 print(
                     "[FFN_COMPARE][BATCH]",
                     f"rank={rank}",
-                    "role_rank=1 layer=0",
+                    f"role_rank={role_rank} layer=0",
                     f"hidden_shape={tuple(layer_hidden.shape)}",
                     f"hidden_head={layer_hidden.reshape(-1)[:8].float().cpu().tolist()}",
                     f"group_head={cumulative_group[:16]}",
@@ -417,7 +417,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             print(
                 "[FFN_COMPARE][OUTPUT]",
                 f"rank={rank}",
-                "role_rank=1 layer=0",
+                f"role_rank={role_rank} layer=0",
                 f"shape={tuple(layer_output.shape)}",
                 f"head={layer_output.reshape(-1)[:8].float().cpu().tolist()}",
                 flush=True,

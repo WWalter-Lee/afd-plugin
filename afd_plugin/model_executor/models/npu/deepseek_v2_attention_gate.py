@@ -228,27 +228,28 @@ def compute_window_global_mxfp_ffn(
 
     global _FFN_COMPARE_WEIGHT_PRINTED
     if not _FFN_COMPARE_WEIGHT_PRINTED:
-        import torch_npu
-
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-        print(
-            "[FFN_COMPARE][WEIGHT]",
-            f"rank={rank}",
-            f"kind={'routed' if weights.is_routed else 'shared'}",
-            f"w1_shape={tuple(weights.w1[0].shape)}",
-            f"w1_dtype={weights.w1.dtype}",
-            f"w1_format={torch_npu.get_npu_format(weights.w1)}",
-            f"w1_scale_shape={tuple(weights.w1_scale[0].shape)}",
-            f"w1_scale_dtype={weights.w1_scale.dtype}",
-            f"w1_scale_format={torch_npu.get_npu_format(weights.w1_scale)}",
-            f"w2_shape={tuple(weights.w2[0].shape)}",
-            f"w2_dtype={weights.w2.dtype}",
-            f"w2_format={torch_npu.get_npu_format(weights.w2)}",
-            f"w2_scale_shape={tuple(weights.w2_scale[0].shape)}",
-            f"w2_scale_dtype={weights.w2_scale.dtype}",
-            f"w2_scale_format={torch_npu.get_npu_format(weights.w2_scale)}",
-            flush=True,
-        )
+        if rank in (0, 1):
+            import torch_npu
+
+            print(
+                "[FFN_COMPARE][WEIGHT]",
+                f"rank={rank}",
+                f"kind={'routed' if weights.is_routed else 'shared'}",
+                f"w1_shape={tuple(weights.w1[0].shape)}",
+                f"w1_dtype={weights.w1.dtype}",
+                f"w1_format={torch_npu.get_npu_format(weights.w1)}",
+                f"w1_scale_shape={tuple(weights.w1_scale[0].shape)}",
+                f"w1_scale_dtype={weights.w1_scale.dtype}",
+                f"w1_scale_format={torch_npu.get_npu_format(weights.w1_scale)}",
+                f"w2_shape={tuple(weights.w2[0].shape)}",
+                f"w2_dtype={weights.w2.dtype}",
+                f"w2_format={torch_npu.get_npu_format(weights.w2)}",
+                f"w2_scale_shape={tuple(weights.w2_scale[0].shape)}",
+                f"w2_scale_dtype={weights.w2_scale.dtype}",
+                f"w2_scale_format={torch_npu.get_npu_format(weights.w2_scale)}",
+                flush=True,
+            )
         _FFN_COMPARE_WEIGHT_PRINTED = True
 
     if hidden_states.dtype not in (torch.float16, torch.bfloat16):
