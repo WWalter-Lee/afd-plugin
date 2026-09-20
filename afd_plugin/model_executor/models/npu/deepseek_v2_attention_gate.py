@@ -339,11 +339,11 @@ def compute_attention_gate_moe_ffn(
             "kind=routed",
             f"w1_shape={tuple(moe_weights.w1[0].shape)}",
             f"w1_dtype={moe_weights.w1.dtype}",
-            f"w1_head={_ffn_compare_weight_head(moe_weights.w1[0])}",
+            f"w1_head={_ffn_compare_weight_head(moe_weights.w1[:1])}",
             f"w1_scale_head={moe_weights.w1_scale[0].reshape(-1)[:8].cpu().tolist()}",
             f"w2_shape={tuple(moe_weights.w2[0].shape)}",
             f"w2_dtype={moe_weights.w2.dtype}",
-            f"w2_head={_ffn_compare_weight_head(moe_weights.w2[0])}",
+            f"w2_head={_ffn_compare_weight_head(moe_weights.w2[:1])}",
             f"w2_scale_head={moe_weights.w2_scale[0].reshape(-1)[:8].cpu().tolist()}",
             flush=True,
         )
