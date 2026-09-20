@@ -29,6 +29,19 @@ if TYPE_CHECKING:
 _FFN_COMPARE_WEIGHT_PRINTED = False
 
 
+def _ffn_compare_weight_head(weight: torch.Tensor) -> list[float]:
+    import torch_npu
+
+    if torch_npu.get_npu_format(weight) == 2:
+        logical_weight = weight
+    else:
+        logical_weight = torch_npu.npu_format_cast(
+            weight.transpose(-2, -1),
+            2,
+        ).transpose(-2, -1).contiguous()
+    return logical_weight.reshape(-1)[:8].float().cpu().tolist()
+
+
 def _get_expert_parameter(experts: torch.nn.Module, name: str):
     """Read MoE weights across vLLM-Ascend EPLB API generations."""
 
@@ -190,8 +203,6 @@ def compute_attention_gate_moe_ffn(
         if shared_experts is None:
             raise RuntimeError("Window shared FFN rank has no shared expert module")
         if not _FFN_COMPARE_WEIGHT_PRINTED:
-            import torch_npu
-
             rank = (
                 torch.distributed.get_rank()
                 if torch.distributed.is_initialized()
@@ -201,19 +212,17 @@ def compute_attention_gate_moe_ffn(
             w1_scale = shared_experts.gate_up_proj.weight_scale
             w2 = shared_experts.down_proj.weight
             w2_scale = shared_experts.down_proj.weight_scale
-            w1_nd = torch_npu.npu_format_cast(w1, 2)
-            w2_nd = torch_npu.npu_format_cast(w2, 2)
             print(
                 "[FFN_COMPARE][WEIGHT]",
                 f"rank={rank}",
                 "kind=shared",
                 f"w1_shape={tuple(w1.shape)}",
                 f"w1_dtype={w1.dtype}",
-                f"w1_head={w1_nd.reshape(-1)[:8].float().cpu().tolist()}",
+                f"w1_head={_ffn_compare_weight_head(w1)}",
                 f"w1_scale_head={w1_scale.reshape(-1)[:8].cpu().tolist()}",
                 f"w2_shape={tuple(w2.shape)}",
                 f"w2_dtype={w2.dtype}",
-                f"w2_head={w2_nd.reshape(-1)[:8].float().cpu().tolist()}",
+                f"w2_head={_ffn_compare_weight_head(w2)}",
                 f"w2_scale_head={w2_scale.reshape(-1)[:8].cpu().tolist()}",
                 flush=True,
             )
@@ -324,19 +333,17 @@ def compute_attention_gate_moe_ffn(
 
     if not _FFN_COMPARE_WEIGHT_PRINTED and quant_type == QuantType.W4A8MXFP:
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-        w1_nd = torch_npu.npu_format_cast(moe_weights.w1[0], 2)
-        w2_nd = torch_npu.npu_format_cast(moe_weights.w2[0], 2)
         print(
             "[FFN_COMPARE][WEIGHT]",
             f"rank={rank}",
             "kind=routed",
             f"w1_shape={tuple(moe_weights.w1[0].shape)}",
             f"w1_dtype={moe_weights.w1.dtype}",
-            f"w1_head={w1_nd.reshape(-1)[:8].float().cpu().tolist()}",
+            f"w1_head={_ffn_compare_weight_head(moe_weights.w1[0])}",
             f"w1_scale_head={moe_weights.w1_scale[0].reshape(-1)[:8].cpu().tolist()}",
             f"w2_shape={tuple(moe_weights.w2[0].shape)}",
             f"w2_dtype={moe_weights.w2.dtype}",
-            f"w2_head={w2_nd.reshape(-1)[:8].float().cpu().tolist()}",
+            f"w2_head={_ffn_compare_weight_head(moe_weights.w2[0])}",
             f"w2_scale_head={moe_weights.w2_scale[0].reshape(-1)[:8].cpu().tolist()}",
             flush=True,
         )
