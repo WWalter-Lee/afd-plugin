@@ -227,18 +227,22 @@ def compute_window_global_mxfp_ffn(
     """Run all ready Window layers with one layer-major MXFP MoE MLP."""
 
     global _FFN_COMPARE_WEIGHT_PRINTED
-    if not _FFN_COMPARE_WEIGHT_PRINTED:
+    if weights.is_routed and not _FFN_COMPARE_WEIGHT_PRINTED:
+        import torch_npu
+
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        w1_nd = torch_npu.npu_format_cast(weights.w1[0], 2)
+        w2_nd = torch_npu.npu_format_cast(weights.w2[0], 2)
         print(
             "[FFN_COMPARE][WEIGHT]",
             f"rank={rank}",
             f"w1_shape={tuple(weights.w1[0].shape)}",
             f"w1_dtype={weights.w1.dtype}",
-            f"w1_head={weights.w1[0].reshape(-1)[:8].float().cpu().tolist()}",
+            f"w1_head={w1_nd.reshape(-1)[:8].float().cpu().tolist()}",
             f"w1_scale_head={weights.w1_scale[0].reshape(-1)[:8].cpu().tolist()}",
             f"w2_shape={tuple(weights.w2[0].shape)}",
             f"w2_dtype={weights.w2.dtype}",
-            f"w2_head={weights.w2[0].reshape(-1)[:8].float().cpu().tolist()}",
+            f"w2_head={w2_nd.reshape(-1)[:8].float().cpu().tolist()}",
             f"w2_scale_head={weights.w2_scale[0].reshape(-1)[:8].cpu().tolist()}",
             flush=True,
         )
