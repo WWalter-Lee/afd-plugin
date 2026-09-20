@@ -227,7 +227,7 @@ def compute_window_global_mxfp_ffn(
     """Run all ready Window layers with one layer-major MXFP MoE MLP."""
 
     global _FFN_COMPARE_WEIGHT_PRINTED
-    if weights.is_routed and not _FFN_COMPARE_WEIGHT_PRINTED:
+    if not _FFN_COMPARE_WEIGHT_PRINTED:
         import torch_npu
 
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
@@ -236,6 +236,7 @@ def compute_window_global_mxfp_ffn(
         print(
             "[FFN_COMPARE][WEIGHT]",
             f"rank={rank}",
+            f"kind={'routed' if weights.is_routed else 'shared'}",
             f"w1_shape={tuple(weights.w1[0].shape)}",
             f"w1_dtype={weights.w1.dtype}",
             f"w1_head={w1_nd.reshape(-1)[:8].float().cpu().tolist()}",
