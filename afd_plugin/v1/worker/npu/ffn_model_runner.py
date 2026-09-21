@@ -64,6 +64,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# A5 Window Batching and F2A can deadlock when they wait concurrently on
+# different streams.  Keep the implementation available for later core
+# partitioning, but run the FFN Window transaction on one stream for now.
+_WINDOW_FFN_MULTISTREAM_ENABLED = False
+
 
 class AFDNPUFFNModelRunner(NPUModelRunner):
     """Connector-driven NPU FFN runner for AFD execution."""
@@ -101,7 +106,6 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self.ffn_recv_events: dict[tuple[int, int], Any] = {}
         self.ffn_compute_events: dict[tuple[int, int], Any] = {}
         self.ffn_send_events: dict[tuple[int, int], Any] = {}
-        self.window_ffn_recv_events: list[Any] = []
         self.window_ffn_compute_events: list[Any] = []
         self.window_ffn_send_events: list[Any] = []
         self.window_ffn_round_index = 0
@@ -126,9 +130,6 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self.ffn_send_stream = torch.npu.Stream(device=device)
         if self.window_ffn_stream_overlap_enabled:
             slot_num = int(self.vllm_config.parallel_config.num_ubatches)
-            self.window_ffn_recv_events = [
-                torch.npu.Event() for _ in range(slot_num)
-            ]
             self.window_ffn_compute_events = [
                 torch.npu.Event() for _ in range(slot_num)
             ]
@@ -276,7 +277,10 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
 
     def _window_ffn_forward_async(self) -> None:
         """Batch ready Attention sessions and compute their active layers."""
-        if not self.window_ffn_stream_overlap_enabled:
+        if (
+            not _WINDOW_FFN_MULTISTREAM_ENABLED
+            or not self.window_ffn_stream_overlap_enabled
+        ):
             payload = self.connector.recv_attn_output(
                 ubatch_idx=0,
                 max_num_tokens=self.max_num_tokens,
@@ -289,10 +293,8 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             )
             return
 
-        assert self.ffn_recv_stream is not None
-        assert self.ffn_compute_stream is not None
         assert self.ffn_send_stream is not None
-        slot_num = len(self.window_ffn_recv_events)
+        slot_num = len(self.window_ffn_compute_events)
         if slot_num == 0:
             raise RuntimeError("Window FFN stream events are not initialized")
         round_index = self.window_ffn_round_index
@@ -300,24 +302,21 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         # This is a local event-ring slot, not the micro_batch_id selected by
         # FFNWorkerBatching.
         slot = round_index % slot_num
-        recv_event = self.window_ffn_recv_events[slot]
         compute_event = self.window_ffn_compute_events[slot]
         send_event = self.window_ffn_send_events[slot]
 
-        with torch.npu.stream(self.ffn_recv_stream):
-            if round_index >= slot_num:
-                send_event.wait(self.ffn_recv_stream)
-            payload = self.connector.recv_attn_output(
-                ubatch_idx=0,
-                max_num_tokens=self.max_num_tokens,
-            )
-            recv_event.record(self.ffn_recv_stream)
-
-        with torch.npu.stream(self.ffn_compute_stream):
-            recv_event.wait(self.ffn_compute_stream)
-            _record_window_payload_stream(payload, self.ffn_compute_stream)
-            full_output = self._compute_window_async_batch(payload)
-            compute_event.record(self.ffn_compute_stream)
+        # Match the reference execution model: Batching, metadata conversion,
+        # and FFN compute are serial on the caller's current stream.  Only F2A
+        # uses a side stream, so this path needs no host synchronization.
+        compute_stream = torch.npu.current_stream()
+        if round_index >= slot_num:
+            send_event.wait(compute_stream)
+        payload = self.connector.recv_attn_output(
+            ubatch_idx=0,
+            max_num_tokens=self.max_num_tokens,
+        )
+        full_output = self._compute_window_async_batch(payload)
+        compute_event.record(compute_stream)
 
         with torch.npu.stream(self.ffn_send_stream):
             compute_event.wait(self.ffn_send_stream)
@@ -334,55 +333,18 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self,
         payload: AFDA2FTransferPayload,
     ) -> torch.Tensor:
-        """Compute all active layers returned by one Window batching call."""
+        """Compute one asynchronous Window transaction without host parsing."""
         states = payload.context.states
         if not isinstance(states, WindowAFDTransferState):
             raise RuntimeError("Window batching returned invalid transfer state")
-        if not states.layer_batches:
-            # A ready Attention snapshot may contain no token routed to this
-            # FFN rank. It must still enter F2A with actual_token_num=0 so
-            # the other FFN ranks and Attention combine can make progress.
-            return payload.hidden_states.new_zeros(
-                payload.hidden_states.shape,
-                dtype=self.model_config.dtype,
-            )
+        if states.group_list is None or states.actual_token_num is None:
+            raise RuntimeError("Window batching returned incomplete global metadata")
 
-        hidden_states = payload.hidden_states
-        routed_outputs = []
-        for layer_batch in states.layer_batches:
-            dynamic_scale = (
-                states.dynamic_scale[layer_batch.token_start : layer_batch.token_end]
-                if states.dynamic_scale is not None
-                else None
-            )
-            layer_output = self._compute_window_ffn_layer(
-                payload=payload,
-                hidden_states=hidden_states[
-                    layer_batch.token_start : layer_batch.token_end
-                ],
-                layer_idx=layer_batch.layer_idx,
-                group_list=layer_batch.group_list,
-                dynamic_scale=dynamic_scale,
-            )
-            routed_output = getattr(layer_output, "routed_output", layer_output)
-            if not isinstance(routed_output, torch.Tensor):
-                raise RuntimeError("Window FFN layer returned no routed output tensor")
-            routed_outputs.append(routed_output)
-
-        valid_output = torch.cat(routed_outputs, dim=0)
-        actual_num = sum(
-            batch.token_end - batch.token_start for batch in states.layer_batches
+        return self.model.compute_window_global_ffn_output(
+            hidden_states=payload.hidden_states,
+            group_list=states.group_list,
+            actual_token_num=states.actual_token_num,
         )
-        if valid_output.shape[0] != actual_num:
-            raise RuntimeError(
-                "Window FFN layer outputs do not match the batching token count: "
-                f"output={valid_output.shape[0]} actual={actual_num}"
-            )
-        full_output = valid_output.new_zeros(
-            (hidden_states.shape[0], *valid_output.shape[1:])
-        )
-        full_output[:actual_num].copy_(valid_output)
-        return full_output
 
     def _compute_window_ffn_layer(
         self,
@@ -1242,8 +1204,6 @@ def _record_window_payload_stream(
     ):
         if isinstance(tensor, torch.Tensor):
             _record_npu_stream(tensor, stream)
-    for layer_batch in states.layer_batches:
-        _record_npu_stream(layer_batch.group_list, stream)
 
 
 def _ffn_layer_indices(runner: AFDNPUFFNModelRunner) -> range | list[int]:

@@ -66,16 +66,6 @@ class WindowAttentionReceiveDependency:
     event: Any
 
 
-@dataclass(frozen=True, slots=True)
-class WindowLayerBatch:
-    """One layer's contiguous token range in an asynchronous FFN batch."""
-
-    layer_idx: int
-    token_start: int
-    token_end: int
-    group_list: torch.Tensor
-
-
 @dataclass(slots=True)
 class WindowAFDTransferState(AFDTransferState):
     """Operator-produced routing metadata for one A2F exchange."""
@@ -88,8 +78,6 @@ class WindowAFDTransferState(AFDTransferState):
     token_ids: torch.Tensor | None = None
     expert_offsets: torch.Tensor | None = None
     actual_token_num: torch.Tensor | None = None
-    actual_token_count: int | None = None
-    layer_batches: tuple[WindowLayerBatch, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1085,17 +1073,33 @@ class WindowAFDConnector(AFDConnectorBase):
                 "Window batching returned actual_token_num with unexpected "
                 f"shape {tuple(actual_token_num.shape)}",
             )
-        actual_num = int(actual_token_num.item())
-        if actual_num < 0 or actual_num > hidden_states.shape[0]:
-            raise RuntimeError(
-                "Window batching returned invalid actual_token_num: "
-                f"actual={actual_num} capacity={hidden_states.shape[0]}",
-            )
         if group_list.shape != (batching_expert_num, 2):
             raise RuntimeError(
                 "Window batching returned group_list with unexpected shape: "
                 f"got={tuple(group_list.shape)} "
                 f"expected={(batching_expert_num, 2)}",
+            )
+        if self.async_mode:
+            # Keep the compact type-2 table and scalar token count on device.
+            # The global Window FFN converts it to the GMM representation
+            # without selecting Python layer modules or synchronizing to host.
+            return self._build_ffn_transfer_payload(
+                hidden_states=hidden_states,
+                group_list=group_list,
+                dynamic_scale=dynamic_scale,
+                session_ids=session_ids,
+                micro_batch_ids=micro_batch_ids,
+                token_ids=token_ids,
+                expert_offsets=expert_offsets,
+                actual_token_num=actual_token_num,
+                layer_idx=int(kwargs.get("layer_idx", 0)),
+                ubatch_idx=ubatch_idx,
+            )
+        actual_num = int(actual_token_num.item())
+        if actual_num < 0 or actual_num > hidden_states.shape[0]:
+            raise RuntimeError(
+                "Window batching returned invalid actual_token_num: "
+                f"actual={actual_num} capacity={hidden_states.shape[0]}",
             )
         # On A3 the batching kernel writes a compact type-2 group list followed
         # by one [0, 0] sentinel, but does not clear the rest of the fixed-size
@@ -1162,45 +1166,42 @@ class WindowAFDConnector(AFDConnectorBase):
                 "Window batching cumulative group_list does not match "
                 f"actual_token_num: group_sum={group_sum} actual={actual_num}",
             )
-        layer_batches: tuple[WindowLayerBatch, ...] = ()
-        if self.async_mode and actual_num > 0:
-            experts_per_layer = self.local_expert_num
-            layer_ends = group_list[experts_per_layer - 1 :: experts_per_layer]
-            layer_starts = torch.cat((layer_ends.new_zeros(1), layer_ends[:-1]))
-            layer_bounds = (
-                torch.stack((layer_starts, layer_ends), dim=1).cpu().tolist()
-            )
-            batches = []
-            for layer_idx, (token_start, token_end) in enumerate(layer_bounds):
-                if token_start == token_end:
-                    continue
-                expert_start = layer_idx * experts_per_layer
-                expert_end = expert_start + experts_per_layer
-                batches.append(
-                    WindowLayerBatch(
-                        layer_idx=layer_idx,
-                        token_start=int(token_start),
-                        token_end=int(token_end),
-                        group_list=group_list[expert_start:expert_end] - token_start,
-                    )
-                )
-            layer_batches = tuple(batches)
-            covered_token_num = sum(
-                batch.token_end - batch.token_start for batch in layer_batches
-            )
-            if covered_token_num != actual_num:
-                raise RuntimeError(
-                    "Window batching layer slices do not cover actual_token_num: "
-                    f"layers={layer_batches} actual={actual_num}"
-                )
         logger.debug(
             "Window FFN batching completed layer=%d stage=%d",
             int(kwargs.get("layer_idx", 0)),
             ubatch_idx,
         )
+        return self._build_ffn_transfer_payload(
+            hidden_states=hidden_states,
+            group_list=group_list,
+            dynamic_scale=dynamic_scale,
+            session_ids=session_ids,
+            micro_batch_ids=micro_batch_ids,
+            token_ids=token_ids,
+            expert_offsets=expert_offsets,
+            actual_token_num=actual_token_num,
+            layer_idx=int(kwargs.get("layer_idx", 0)),
+            ubatch_idx=ubatch_idx,
+        )
+
+    @staticmethod
+    def _build_ffn_transfer_payload(
+        *,
+        hidden_states: torch.Tensor,
+        group_list: torch.Tensor,
+        dynamic_scale: torch.Tensor,
+        session_ids: torch.Tensor,
+        micro_batch_ids: torch.Tensor,
+        token_ids: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        actual_token_num: torch.Tensor,
+        layer_idx: int,
+        ubatch_idx: int,
+    ) -> AFDA2FTransferPayload:
+        """Package one Batching result without reading device values on Host."""
         context = AFDTransferContext(
             metadata=AFDTransferMetadata.create_ffn_metadata(
-                layer_idx=int(kwargs.get("layer_idx", 0)),
+                layer_idx=layer_idx,
                 stage_idx=int(ubatch_idx),
                 seq_lens=[int(hidden_states.shape[0])],
             ),
@@ -1217,14 +1218,11 @@ class WindowAFDConnector(AFDConnectorBase):
                 token_ids=token_ids,
                 expert_offsets=expert_offsets,
                 actual_token_num=actual_token_num,
-                actual_token_count=actual_num,
-                layer_batches=layer_batches,
             ),
         )
-        # Keep the static batching capacity Y.  The cumulative group_list and
-        # actual_token_num describe the valid prefix consumed by grouped
-        # matmul and F2A.  In particular, dynamic_scale must retain the same Y
-        # as hidden_states for token-wise dynamic dequantization.
+        # Keep the static batching capacity Y. Async mode keeps the compact
+        # type-2 group list; synchronous mode supplies cumulative type-0.
+        # actual_token_num identifies the valid prefix consumed by FFN and F2A.
         return AFDA2FTransferPayload(
             hidden_states=hidden_states,
             context=context,
@@ -1263,19 +1261,11 @@ class WindowAFDConnector(AFDConnectorBase):
                 "Window batching returned actual_token_num with unexpected "
                 f"shape {tuple(state.actual_token_num.shape)}"
             )
-        actual_num = state.actual_token_count
-        if actual_num is None:
-            raise RuntimeError("Window batching state has no actual token count")
-        if actual_num < 0:
-            raise RuntimeError(
-                f"Window batching returned negative actual_token_num={actual_num}"
-            )
-
         routed_output = getattr(ffn_output, "routed_output", ffn_output)
-        if routed_output.dim() != 2 or routed_output.shape[0] < actual_num:
+        if routed_output.dim() != 2:
             raise RuntimeError(
-                "Window F2A output capacity is smaller than actual token count: "
-                f"output_shape={tuple(routed_output.shape)} actual_num={actual_num}"
+                "Window F2A output must be two-dimensional: "
+                f"output_shape={tuple(routed_output.shape)}"
             )
 
         metadata = (
