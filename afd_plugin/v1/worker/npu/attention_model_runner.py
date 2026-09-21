@@ -294,7 +294,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         num_reqs: int,
         num_reqs_padded: int | None,
     ) -> None:
-        """Make the second Window U2 stage structurally valid metadata padding."""
+        """Make padded Window U2 token/request slots structurally valid."""
         if (
             not self._uses_fixed_window_u2()
             or num_tokens_padded is None
@@ -302,14 +302,9 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             or num_tokens_padded == num_tokens
         ):
             return
-        if (
-            num_tokens != 1
-            or num_tokens_padded != 2
-            or num_reqs != 1
-            or num_reqs_padded != 2
-        ):
+        if num_tokens_padded < num_tokens or num_reqs_padded < num_reqs:
             raise RuntimeError(
-                "Window U2 only supports one dummy padding stage; "
+                "Window U2 padding capacity is smaller than the live batch; "
                 f"tokens={num_tokens}/{num_tokens_padded} "
                 f"requests={num_reqs}/{num_reqs_padded}"
             )
@@ -338,9 +333,9 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         if self.use_compress:
             self._dsa_positions_cpu_buf[token_slice].fill_(127)
 
-        # Keep the padded tail structurally valid for metadata slicing.  The
-        # padding-only stage is made attention-free below, matching an idle DP
-        # rank's dummy run, while it still executes Gate and the Window path.
+        # Keep every padded tail slot structurally valid for metadata slicing.
+        # Dummy requests are attention-free below, matching an idle DP rank's
+        # dummy run, while their U2 stages still execute Gate and Window.
         self.optimistic_seq_lens_cpu[request_slice].fill_(0)
         self.seq_lens[request_slice].fill_(0)
         self.input_batch.num_computed_tokens_cpu_tensor[request_slice].fill_(0)
