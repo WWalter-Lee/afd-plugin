@@ -259,7 +259,10 @@ class WindowAFDConnector(AFDConnectorBase):
         self.attention_receive_dependencies: dict[
             int, WindowAttentionReceiveDependency
         ] = {}
+        self.attention_session_id: torch.Tensor | None = None
+        self.attention_micro_batch_ids: torch.Tensor | None = None
         self.attention_layer_ids: torch.Tensor | None = None
+        self.attention_sync_layer_id: torch.Tensor | None = None
         self._initialized = False
 
         hf_config = vllm_config.model_config.hf_config
@@ -422,11 +425,10 @@ class WindowAFDConnector(AFDConnectorBase):
             self.context_holder = context_factory(**kwargs)
             self.schedule_context = self.context_holder.get_schedule_context_tensor()
             self._build_rank_tables()
-            if (
-                self.stream_overlap_enabled
-                and self.afd_config.role == "attention"
-            ):
-                self._initialize_attention_stream_pipeline()
+            if self.afd_config.role == "attention":
+                self._initialize_attention_operator_metadata()
+                if self.stream_overlap_enabled:
+                    self._initialize_attention_stream_pipeline()
             ffn_kind = ""
             if self.afd_config.role == "ffn":
                 ffn_kind = build_window_expert_layout(
@@ -459,7 +461,10 @@ class WindowAFDConnector(AFDConnectorBase):
         self._pending_transfers.clear()
         self.attention_receive_dependencies.clear()
         self.attention_pipeline_events.clear()
+        self.attention_session_id = None
+        self.attention_micro_batch_ids = None
         self.attention_layer_ids = None
+        self.attention_sync_layer_id = None
         self.a2f_send_stream = None
         self.f2a_recv_stream = None
         self.attention_graph_compute_stream = None
@@ -493,19 +498,36 @@ class WindowAFDConnector(AFDConnectorBase):
         self.hccl_comm_name = None
         self._initialized = False
 
+    def _initialize_attention_operator_metadata(self) -> None:
+        """Cache immutable operator inputs before ACLGraph capture."""
+        device = torch.device("npu", self.local_rank)
+        self.attention_session_id = torch.tensor(
+            [self.role_rank],
+            dtype=torch.int32,
+            device=device,
+        )
+        self.attention_micro_batch_ids = torch.arange(
+            self.micro_batch_num,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.attention_layer_ids = torch.tensor(
+            list(range(self.num_layers)),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.attention_sync_layer_id = torch.zeros(
+            1,
+            dtype=torch.int32,
+            device=device,
+        )
+
     def _initialize_attention_stream_pipeline(self) -> None:
         """Create eager communication and ACLGraph compute streams/events."""
         device = torch.device("npu", self.local_rank)
         self.a2f_send_stream = torch.npu.Stream(device=device)
         self.f2a_recv_stream = torch.npu.Stream(device=device)
         self.attention_graph_compute_stream = torch.npu.Stream(device=device)
-        # Cache immutable layer IDs so Combine never performs a synchronous
-        # host-to-device copy behind the A2F send event.
-        self.attention_layer_ids = torch.tensor(
-            list(range(self.num_layers)),
-            dtype=torch.int32,
-            device=device,
-        )
         self.attention_pipeline_events = {
             (layer_idx, stage_idx): WindowAttentionPipelineEvents(
                 ready=torch.npu.Event(),
@@ -807,26 +829,28 @@ class WindowAFDConnector(AFDConnectorBase):
         )
         combine_scales[:batch_size].copy_(expert_scales)
         _, _, attn_info, _ = self._operator_shapes()
-        session_id = torch.tensor([self.role_rank], dtype=torch.int32, device=x.device)
         stage_idx = int(context.metadata.stage_idx)
         if stage_idx < 0 or stage_idx >= self.micro_batch_num:
             raise RuntimeError(
                 "Window A2F received an out-of-range micro batch: "
                 f"micro_batch_id={stage_idx} micro_batch_num={self.micro_batch_num}"
             )
-        micro_batch_id = torch.tensor(
-            [stage_idx], dtype=torch.int32, device=x.device
-        )
         model_layer_idx = int(context.metadata.layer_idx)
         if model_layer_idx < 0 or model_layer_idx >= self.num_layers:
             raise RuntimeError(
                 "Window A2F received an out-of-range model layer: "
                 f"layer={model_layer_idx} num_layers={self.num_layers}"
             )
-        layer_id = torch.tensor(
-            [model_layer_idx if self.async_mode else 0],
-            dtype=torch.int32,
-            device=x.device,
+        assert self.attention_session_id is not None
+        assert self.attention_micro_batch_ids is not None
+        assert self.attention_layer_ids is not None
+        assert self.attention_sync_layer_id is not None
+        session_id = self.attention_session_id
+        micro_batch_id = self.attention_micro_batch_ids[stage_idx : stage_idx + 1]
+        layer_id = (
+            self.attention_layer_ids[model_layer_idx : model_layer_idx + 1]
+            if self.async_mode
+            else self.attention_sync_layer_id
         )
 
         def enqueue_a2f() -> None:
@@ -943,9 +967,8 @@ class WindowAFDConnector(AFDConnectorBase):
         graph_pipeline_active = self.attention_graph_compute_pipeline_active()
         eager_pipeline_active = self._attention_stream_pipeline_active()
         if not (graph_pipeline_active or eager_pipeline_active):
-            layer_id = torch.tensor(
-                [key[1]], dtype=torch.int32, device=ref_tensor.device
-            )
+            assert self.attention_layer_ids is not None
+            layer_id = self.attention_layer_ids[key[1] : key[1] + 1]
             return enqueue_combine(layer_id)
 
         events = self._attention_events(key[1], key[0])
