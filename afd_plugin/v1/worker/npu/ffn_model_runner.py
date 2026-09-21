@@ -167,6 +167,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
     def load_model(self) -> None:
         if self.speculative_config is None:
             super().load_model()
+            self._initialize_window_global_mxfp_weights()
             return
         if self.speculative_config.method != "mtp" or self.drafter is None:
             raise RuntimeError("DSV4 AFD FFN requires an initialized MTP drafter")
@@ -179,11 +180,24 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             super().load_model()
         finally:
             self.drafter = drafter
+        self._initialize_window_global_mxfp_weights()
         if self.vllm_config.quant_config is not None:
             patch_load_weights(self.vllm_config)
         with get_tp_context(drafter):
             drafter.model = drafter._get_model()
         self.mtp_ffn_model = drafter.get_model()
+
+    def _initialize_window_global_mxfp_weights(self) -> None:
+        """Prepare static Window weights before warmup or graph capture."""
+        if not getattr(self.connector, "is_window_connector", False):
+            return
+        initializer = getattr(
+            self.model,
+            "initialize_window_global_mxfp_weights",
+            None,
+        )
+        if initializer is not None:
+            initializer()
 
     def execute_ffn_step(
         self,

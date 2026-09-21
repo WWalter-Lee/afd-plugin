@@ -271,20 +271,58 @@ def compute_window_global_mxfp_ffn(
         act_quant_type=torch.float8_e4m3fn,
         use_mxfp_quant=True,
     )
-    activated_states, activated_scale, _ = (
-        DeviceOperator.npu_grouped_matmul_swiglu_quant(
-            x=quantized_states,
+    if weights.is_routed:
+        activated_states, activated_scale, _ = (
+            DeviceOperator.npu_grouped_matmul_swiglu_quant(
+                x=quantized_states,
+                weight=weights.w1,
+                group_list=cumulative_group_list,
+                weight_scale=weights.w1_scale,
+                x_scale=input_scale,
+                use_mxfp_quant=True,
+                act_quant_type=torch.float8_e4m3fn,
+                weight_quant_type=weight_quant_type,
+                swiglu_limit=weights.swiglu_limit,
+                mxfp_quant_dtype=mxfp_quant_dtype,
+            )
+        )
+    else:
+        # Preserve the native shared-MLP quantization boundaries:
+        # gate_up_proj -> BF16 activation -> down_proj.  GMM executes every
+        # ready layer at once, while SwiGLU remains an elementwise operation.
+        gate_up_states = DeviceOperator.npu_grouped_matmul_gmm2(
+            hidden_states=quantized_states,
             weight=weights.w1,
-            group_list=cumulative_group_list,
             weight_scale=weights.w1_scale,
-            x_scale=input_scale,
-            use_mxfp_quant=True,
+            per_token_scale=input_scale,
+            group_list=cumulative_group_list,
+            group_list_type=0,
+            input_dtype=input_dtype,
             act_quant_type=torch.float8_e4m3fn,
             weight_quant_type=weight_quant_type,
-            swiglu_limit=weights.swiglu_limit,
+            scale_type=FLOAT8_E8M0FNU_DTYPE,
+            per_token_scale_type=FLOAT8_E8M0FNU_DTYPE,
+            use_bf16=input_dtype == torch.bfloat16,
+            use_mxfp_quant=True,
+            fallback_output_dtype=input_dtype,
             mxfp_quant_dtype=mxfp_quant_dtype,
         )
-    )
+        if weights.swiglu_limit > 0:
+            gate, up = gate_up_states.chunk(2, dim=-1)
+            gate = torch.clamp(gate, max=weights.swiglu_limit)
+            up = torch.clamp(
+                up,
+                min=-weights.swiglu_limit,
+                max=weights.swiglu_limit,
+            )
+            gate_up_states = torch.cat((gate, up), dim=-1)
+        activated_states = torch_npu.npu_swiglu(gate_up_states)
+        activated_states, activated_scale = DeviceOperator.npu_dynamic_quant(
+            hidden_states=activated_states,
+            dynamic_scale=None,
+            act_quant_type=torch.float8_e4m3fn,
+            use_mxfp_quant=True,
+        )
     output = DeviceOperator.npu_grouped_matmul_gmm2(
         hidden_states=activated_states,
         weight=weights.w2,

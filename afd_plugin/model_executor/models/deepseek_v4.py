@@ -1320,6 +1320,9 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
     def initialize_window_global_mxfp_weights(self) -> None:
         """Pack Window FFN weights while checkpoint tensors are still ND."""
 
+        if self._window_global_mxfp_weights is not None:
+            return
+
         from afd_plugin.model_executor.models.npu.deepseek_v4_window_ffn import (
             build_window_global_mxfp_weights,
         )
@@ -1415,6 +1418,9 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
             group_list,
             actual_token_num,
         )
+
+    def initialize_window_global_mxfp_weights(self) -> None:
+        self.model.initialize_window_global_mxfp_weights()
 
     def forward_ubatches_layer_major(
         self,
