@@ -264,6 +264,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         self._afd_in_mtp_proposal = False
         self._afd_mtp_phase_announced = False
         self._afd_mtp_graph_replayed = False
+        self._afd_engine_idle_dummy = False
         self.ubatch_slices = None
         self._afd_unpadded_tokens_across_dp: torch.Tensor | None = None
         self._afd_request_boundary_stage_counts_across_dp: (
@@ -1114,6 +1115,15 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         previous = self._afd_is_graph_capturing
         self._afd_is_graph_capturing = bool(is_graph_capturing)
         fixed_window_u2 = self._uses_fixed_window_u2()
+        previous_engine_idle_dummy = self._afd_engine_idle_dummy
+        self._afd_engine_idle_dummy = bool(
+            fixed_window_u2
+            and cudagraph_runtime_mode is None
+            and uniform_decode
+            and not is_profile
+            and not is_graph_capturing
+            and not self._is_warmup
+        )
         if not (
             bool(self.vllm_config.parallel_config.use_ubatching)
             and (
@@ -1140,6 +1150,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 )
             finally:
                 self._afd_is_graph_capturing = previous
+                self._afd_engine_idle_dummy = previous_engine_idle_dummy
                 self._afd_pending_metadata = None
                 self._afd_async_moe_ubatch_metadata = None
 
@@ -1162,6 +1173,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             )
         finally:
             self._afd_is_graph_capturing = previous
+            self._afd_engine_idle_dummy = previous_engine_idle_dummy
             self._afd_pending_metadata = None
             self._afd_async_moe_ubatch_metadata = None
 
@@ -1382,6 +1394,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             allow_microbatching=allow_microbatching,
             force_eager=is_profile
             or (cudagraph_runtime_mode == CUDAGraphMode.NONE)
+            or self._afd_engine_idle_dummy
             or profile_cpp,
             force_uniform_decode=uniform_decode,
             force_has_lora=num_active_loras > 0,
@@ -2171,7 +2184,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 num_tokens_after_padding,
                 cudagraph_mode,
             )
-        packed_tensor = torch.zeros(5, self.dp_size, device="cpu", dtype=torch.int32)
+        packed_tensor = torch.zeros(6, self.dp_size, device="cpu", dtype=torch.int32)
         packed_tensor[0][self.dp_rank] = num_tokens_unpadded
         packed_tensor[1][self.dp_rank] = num_tokens_padded
         packed_tensor[2][self.dp_rank] = cudagraph_mode.value
@@ -2179,6 +2192,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         # threshold so all ranks execute the same number of FFN stages.
         packed_tensor[3][self.dp_rank] = int(uniform_decode)
         packed_tensor[4][self.dp_rank] = int(request_boundary_stage0_tokens or 0)
+        packed_tensor[5][self.dp_rank] = int(self._afd_engine_idle_dummy)
         dist.all_reduce(packed_tensor, group=get_dp_group().cpu_group)
 
         num_tokens_unpadded_across_dp = packed_tensor[0, :]
@@ -2188,7 +2202,16 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         num_tokens_padded_across_dp = packed_tensor[1, :]
         max_tokens_across_dp = int(num_tokens_padded_across_dp.max().item())
         min_tokens_across_dp = int(num_tokens_unpadded_across_dp.min().item())
-        synced_cudagraph_mode = CUDAGraphMode(int(packed_tensor[2, :].min().item()))
+        has_engine_idle_dummy = bool(packed_tensor[5, :].max().item())
+        window_async = bool(
+            getattr(self.connector, "is_window_connector", False)
+            and getattr(self.connector, "async_mode", False)
+        )
+        synced_cudagraph_mode = (
+            cudagraph_mode
+            if window_async and has_engine_idle_dummy
+            else CUDAGraphMode(int(packed_tensor[2, :].min().item()))
+        )
         synced_uniform_decode = bool(packed_tensor[3, :].min().item())
         request_boundary_ready = True
         if request_boundary_stage0_tokens is not None:
