@@ -1960,79 +1960,6 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         self._afd_mtp_phase_announced = False
         self._afd_mtp_graph_replayed = False
         self._afd_in_mtp_proposal = True
-        original_dspark_propose = None
-        debug_runtime = bool(
-            isinstance(self.drafter, AscendDSparkProposer)
-            and self.dp_rank == 0
-            and not self._is_warmup
-            and not self._afd_is_graph_capturing
-        )
-        debug_step = getattr(self, "_dspark_input_debug_step", 0)
-        if debug_runtime and debug_step < 4:
-            raw_hidden = self.get_model().get_mtp_target_hidden_states()
-            original_dspark_propose = self.drafter._propose
-
-            def debug_dspark_propose(*args, **kwargs):
-                selected_hidden = kwargs["target_hidden_states"]
-
-                def tensor_head(value, limit=12):
-                    if value is None:
-                        return None
-                    if not isinstance(value, torch.Tensor):
-                        return (
-                            value[:limit]
-                            if isinstance(value, (list, tuple))
-                            else value
-                        )
-                    return value.reshape(-1)[:limit].cpu().tolist()
-
-                def row_signature(value):
-                    cols = min(32, int(value.shape[1]))
-                    probe = value[:, :cols].float()
-                    weights = torch.arange(
-                        1,
-                        cols + 1,
-                        dtype=probe.dtype,
-                        device=probe.device,
-                    )
-                    return (probe * weights).sum(dim=-1).cpu()
-
-                raw_signature = row_signature(raw_hidden)
-                selected_signature = row_signature(selected_hidden)
-                match_error, selected_to_raw = torch.min(
-                    torch.abs(
-                        selected_signature[:12, None] - raw_signature[None, :]
-                    ),
-                    dim=1,
-                )
-                query_start = getattr(
-                    spec_decode_common_attn_metadata,
-                    "query_start_loc",
-                    None,
-                )
-                draft_result = original_dspark_propose(*args, **kwargs)
-                print(
-                    "[DSpark input]"
-                    f" step={debug_step}"
-                    f" spec={spec_decode_metadata is not None}"
-                    f" scheduled={num_scheduled_tokens}"
-                    f" query_start={tensor_head(query_start)}"
-                    f" sampled={tensor_head(valid_sampled_token_ids)}"
-                    f" tokens={tensor_head(kwargs.get('target_token_ids'))}"
-                    f" positions={tensor_head(kwargs.get('target_positions'))}"
-                    f" raw_shape={tuple(raw_hidden.shape)}"
-                    f" raw_sig={raw_signature[:12].tolist()}"
-                    f" selected_shape={tuple(selected_hidden.shape)}"
-                    f" selected_sig={selected_signature[:12].tolist()}"
-                    f" selected_to_raw={selected_to_raw.tolist()}"
-                    f" match_error={match_error.tolist()}"
-                    f" draft={tensor_head(draft_result)}",
-                    flush=True,
-                )
-                self._dspark_input_debug_step = debug_step + 1
-                return draft_result
-
-            self.drafter._propose = debug_dspark_propose
         try:
             draft_token_ids = super().propose_draft_token_ids(
                 valid_sampled_token_ids,
@@ -2048,8 +1975,6 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 target_model_batch_desc,
             )
         finally:
-            if original_dspark_propose is not None:
-                self.drafter._propose = original_dspark_propose
             self._afd_in_mtp_proposal = False
         # A FULL draft graph enqueues its captured HCCL transfers asynchronously.
         # If the following target step misses its graph and runs eager, its IDs

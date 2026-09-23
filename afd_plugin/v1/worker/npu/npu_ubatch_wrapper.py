@@ -172,6 +172,7 @@ class AscendUBatchWrapper(UBatchWrapper):
         self.mla_full_graph_enabled = mla_full_graph_enabled
         self.full_graph_params_updater = full_graph_params_updater
         self.enable_layer_major_eager_u2 = enable_layer_major_eager_u2
+        self._graph_layout_debug_seen: set[tuple] = set()
 
     @property
     def graph_pool(self):
@@ -183,6 +184,62 @@ class AscendUBatchWrapper(UBatchWrapper):
         self.cudagraphs.clear()
         if self.cudagraph_wrapper is not None:
             self.cudagraph_wrapper.concrete_aclgraph_entries.clear()
+
+    def _debug_graph_layout(
+        self,
+        phase: str,
+        graph_key: AscendNPUGraphKey,
+        batch_descriptor,
+        ubatch_slices,
+        captured_metadata: AscendNPUGraphMetaData | None = None,
+    ) -> None:
+        if int(self.vllm_config.parallel_config.data_parallel_rank) != 0:
+            return
+
+        def descriptor(value):
+            return (value.num_tokens, value.num_reqs, value.uniform)
+
+        def layout(value):
+            return tuple(
+                (
+                    item.num_tokens,
+                    item.request_slice.start,
+                    item.request_slice.stop,
+                )
+                for item in value
+            )
+
+        current_descriptor = descriptor(batch_descriptor)
+        current_layout = layout(ubatch_slices)
+        captured_descriptor = captured_layout = None
+        if captured_metadata is not None:
+            captured_context = (
+                captured_metadata.ubatch_metadata[0].context.forward_context
+            )
+            captured_descriptor = descriptor(captured_context.batch_descriptor)
+            captured_layout = layout(captured_context.ubatch_slices)
+
+        signature = (
+            phase,
+            graph_key,
+            current_descriptor,
+            current_layout,
+            captured_descriptor,
+            captured_layout,
+        )
+        if signature in self._graph_layout_debug_seen:
+            return
+        self._graph_layout_debug_seen.add(signature)
+        print(
+            "[AFD U2 graph layout]"
+            f" phase={phase}"
+            f" key={graph_key}"
+            f" current_desc={current_descriptor}"
+            f" current_layout={current_layout}"
+            f" captured_desc={captured_descriptor}"
+            f" captured_layout={captured_layout}",
+            flush=True,
+        )
 
     def __getattr__(self, key: str):
         if hasattr(self.runnable, key):
@@ -288,6 +345,12 @@ class AscendUBatchWrapper(UBatchWrapper):
             graph_key not in self.cudagraphs
             and cudagraph_runtime_mode is CUDAGraphMode.FULL
         ):
+            self._debug_graph_layout(
+                "capture",
+                graph_key,
+                batch_descriptor,
+                ubatch_slices,
+            )
             mla_graph_params = (
                 self._new_mla_capture_params(stage_num_tokens)
                 if mla_full_graph_active
@@ -317,6 +380,13 @@ class AscendUBatchWrapper(UBatchWrapper):
             and cudagraph_runtime_mode is CUDAGraphMode.FULL
         ):
             cudagraph_metadata = self.cudagraphs[graph_key]
+            self._debug_graph_layout(
+                "replay",
+                graph_key,
+                batch_descriptor,
+                ubatch_slices,
+                cudagraph_metadata,
+            )
             if mla_full_graph_active:
                 self._replay_mla_graph(
                     cudagraph_metadata,
