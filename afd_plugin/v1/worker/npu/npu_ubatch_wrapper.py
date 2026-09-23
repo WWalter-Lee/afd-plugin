@@ -395,6 +395,26 @@ class AscendUBatchWrapper(UBatchWrapper):
                     positions,
                 )
             else:
+                captured_stage0 = (
+                    cudagraph_metadata.ubatch_metadata[0]
+                    .context.forward_context.attn_metadata
+                )
+                live_stage0 = attn_metadata[0]
+                if captured_stage0 is not None and live_stage0 is not None:
+                    updated_ptrs: set[int] = set()
+                    for layer_name, captured_meta in captured_stage0.items():
+                        live_meta = live_stage0[layer_name]
+                        if captured_meta.decode is None or live_meta.decode is None:
+                            continue
+
+                        captured_seq_lens = captured_meta.decode.seq_lens
+                        captured_ptr = captured_seq_lens.data_ptr()
+                        if captured_ptr in updated_ptrs:
+                            continue
+
+                        captured_seq_lens.copy_(live_meta.decode.seq_lens)
+                        updated_ptrs.add(captured_ptr)
+
                 torch.npu.current_stream().synchronize()
                 cudagraph_metadata.aclgraph.replay()
             forward_context.dbo_enabled = True
