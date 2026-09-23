@@ -464,6 +464,32 @@ class AscendUBatchWrapper(UBatchWrapper):
             num_tokens,
         )
 
+        spec_config = self.vllm_config.speculative_config
+        if (
+            int(self.vllm_config.parallel_config.data_parallel_rank) == 0
+            and spec_config is not None
+            and not getattr(self, "_printed_afd_mtp_graph_update", False)
+        ):
+            spec_multiple = int(spec_config.num_speculative_tokens) + 1
+            stage_metadata = list(merged_metadata.values())[:2]
+            stage_actual_q = tuple(
+                metadata.decode.actual_seq_lengths_q
+                for metadata in stage_metadata
+            )
+            upstream_actual_q = [
+                spec_multiple * (index + 1)
+                for index in range(num_tokens // spec_multiple)
+            ]
+            print(
+                "[AFD MTP graph update]"
+                f" stage_tokens={num_tokens}"
+                f" spec_multiple={spec_multiple}"
+                f" stage_actual_q={stage_actual_q}"
+                f" upstream_actual_q={upstream_actual_q}",
+                flush=True,
+            )
+            self._printed_afd_mtp_graph_update = True
+
         def update_params() -> None:
             with override_mla_graph_params(
                 forward_context,
