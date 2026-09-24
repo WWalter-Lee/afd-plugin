@@ -238,12 +238,13 @@ def _fail_if_unsupported_deepseek_v4_features(
     speculative_config = vllm_config.speculative_config
     if speculative_config is not None:
         uses_dspark = is_dspark_config(vllm_config)
-        speculative_feature = "DSpark" if uses_dspark else "MTP"
-        if afd_config.connector != "P2pHcclAFDConnector":
+        if uses_dspark and afd_config.role != "attention":
             raise RuntimeError(
-                f"DeepSeek-V4 AFD {speculative_feature} supports only "
-                "P2pHcclAFDConnector"
+                "DeepSeek-V4 AFD DSpark speculative config belongs only to "
+                "the Attention service"
             )
+        if not uses_dspark and afd_config.connector != "P2pHcclAFDConnector":
+            raise RuntimeError("DeepSeek-V4 AFD MTP supports only P2pHcclAFDConnector")
         if getattr(speculative_config, "method", None) != "mtp":
             raise RuntimeError("DeepSeek-V4 AFD supports only MTP speculative method")
         draft_enforce_eager = bool(getattr(speculative_config, "enforce_eager", False))
