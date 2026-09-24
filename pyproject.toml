@@ -44,6 +44,8 @@ Documentation = "https://github.com/vllm-project/afd-plugin#readme"
 
 [project.entry-points."vllm.general_plugins"]
 afd = "afd_plugin:register_afd"
+afd_pd_debug = "afd_plugin.diagnostics.mooncake_pd:register_mooncake_pd_debug"
+afd_dsv4_chunk_debug = "afd_plugin.diagnostics.deepseek_v4_chunk:register_dsv4_chunk_debug"
 
 [dependency-groups]
 dev = [

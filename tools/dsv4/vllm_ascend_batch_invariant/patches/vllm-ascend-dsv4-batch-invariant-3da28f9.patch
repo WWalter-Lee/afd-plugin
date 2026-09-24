@@ -1,0 +1,111 @@
+diff --git a/tests/ut/test_batch_invariant.py b/tests/ut/test_batch_invariant.py
+index b171702..54a7591 100644
+--- a/tests/ut/test_batch_invariant.py
++++ b/tests/ut/test_batch_invariant.py
+@@ -27,6 +27,37 @@ import vllm_ascend.batch_invariant as batch_invariant
+ class TestBatchInvariant:
+     """Complete test suite for batch_invariant.py"""
+ 
++    @patch("vllm_ascend.batch_invariant.torch.ops.batch_invariant_ops")
++    def test_reduce_sum_moves_non_last_dim(self, mock_batch_invariant_ops):
++        x = MagicMock(spec=torch.Tensor)
++        x.device.type = "npu"
++        x.dim.return_value = 3
++        moved = x.movedim.return_value
++        contiguous = moved.contiguous.return_value
++        expected = MagicMock(spec=torch.Tensor)
++        mock_batch_invariant_ops.npu_reduce_sum_batch_invariant.return_value = expected
++
++        result = batch_invariant.reduce_sum(x, dim=1)
++
++        x.movedim.assert_called_once_with(1, -1)
++        moved.contiguous.assert_called_once_with()
++        mock_batch_invariant_ops.npu_reduce_sum_batch_invariant.assert_called_once_with(contiguous, -1, False)
++        assert result is expected
++
++    @patch("vllm_ascend.batch_invariant.torch.ops.batch_invariant_ops")
++    def test_reduce_sum_restores_keepdim_position(self, mock_batch_invariant_ops):
++        x = MagicMock(spec=torch.Tensor)
++        x.device.type = "npu"
++        x.dim.return_value = 3
++        reduced = MagicMock(spec=torch.Tensor)
++        mock_batch_invariant_ops.npu_reduce_sum_batch_invariant.return_value = reduced
++        expected = reduced.movedim.return_value
++
++        result = batch_invariant.reduce_sum(x, dim=1, keepdim=True)
++
++        reduced.movedim.assert_called_once_with(-1, 1)
++        assert result is expected
++
+     def test_override_envs_for_invariance(self):
+         """Test Config and environment variable override"""
+         mock_config = MagicMock()
+@@ -54,16 +85,14 @@ class TestBatchInvariant:
+         batch_invariant.torch.library.Library.assert_called_once_with("aten", "IMPL")
+ 
+         # Verify operator registrations
+-        assert mock_library.impl.call_count == 3
++        assert mock_library.impl.call_count == 2
+         mock_library.impl.assert_any_call(
+             "aten::mm", batch_invariant.torch.ops.batch_invariant_ops.npu_mm_batch_invariant, "NPU"
+         )
+         mock_library.impl.assert_any_call(
+             "aten::matmul", batch_invariant.torch.ops.batch_invariant_ops.npu_matmul_batch_invariant, "NPU"
+         )
+-        mock_library.impl.assert_any_call(
+-            "aten::sum", batch_invariant.torch.ops.batch_invariant_ops.npu_reduce_sum_batch_invariant, "NPU"
+-        )
++        assert not any(call.args[0] == "aten::sum" for call in mock_library.impl.call_args_list)
+ 
+         # Verify torch_npu function patching
+         assert (
+diff --git a/vllm_ascend/batch_invariant.py b/vllm_ascend/batch_invariant.py
+index 910ccd8..996fa0d 100644
+--- a/vllm_ascend/batch_invariant.py
++++ b/vllm_ascend/batch_invariant.py
+@@ -65,10 +65,24 @@ def add_rms_norm(
+ def reduce_sum(x: torch.Tensor, dim: int | None = None, keepdim: bool = False) -> torch.Tensor:
+     """npu_reduce_sum_batch_invariant requires dim to be specified, but torch.sum
+     doesn't require it, so we set dim to -1 by default if dim is None and x.dim()==1.
++
++    The AscendC operator only supports reducing the last dimension. Move a
++    requested non-last dimension to the end while preserving torch.sum's output
++    dimension order. This is required by DeepSeek-V4's HC head, which reduces
++    dimension 1 of a 3D tensor.
+     """
+     dim = -1 if dim is None and x.dim() == 1 else dim
+-    if x.device.type == "npu" and dim is not None:
+-        return torch.ops.batch_invariant_ops.npu_reduce_sum_batch_invariant(x, dim, keepdim)
++    if x.device.type == "npu" and isinstance(dim, int):
++        normalized_dim = dim + x.dim() if dim < 0 else dim
++        if normalized_dim < 0 or normalized_dim >= x.dim():
++            return torch_sum(x, dim, keepdim)
++
++        if normalized_dim != x.dim() - 1:
++            x = x.movedim(normalized_dim, -1).contiguous()
++            result = torch.ops.batch_invariant_ops.npu_reduce_sum_batch_invariant(x, -1, keepdim)
++            return result.movedim(-1, normalized_dim) if keepdim else result
++
++        return torch.ops.batch_invariant_ops.npu_reduce_sum_batch_invariant(x, -1, keepdim)
+     # cpu tensor can't use npu_reduce_sum_batch_invariant, so we use torch.sum instead.
+     return torch_sum(x, dim, keepdim)
+ 
+@@ -111,7 +125,6 @@ def enable_batch_invariant_mode():
+     if HAS_ASCENDC_BATCH_INVARIANT:
+         _batch_invariant_LIB.impl("aten::mm", torch.ops.batch_invariant_ops.npu_mm_batch_invariant, "NPU")
+         _batch_invariant_LIB.impl("aten::matmul", torch.ops.batch_invariant_ops.npu_matmul_batch_invariant, "NPU")
+-        _batch_invariant_LIB.impl("aten::sum", torch.ops.batch_invariant_ops.npu_reduce_sum_batch_invariant, "NPU")
+         # torch_npu.npu_fused_infer_attention_score is a function of torch_npu, not a torch.ops.Operator,
+         # so we need to patch it directly.
+         torch_npu.npu_fused_infer_attention_score = (
+@@ -119,7 +132,9 @@ def enable_batch_invariant_mode():
+         )
+         # patch npu_add_rms_norm to ensure batch invariant.
+         torch_npu.npu_add_rms_norm = add_rms_norm
+-        # torch.sum can't be replaced by dispatch logic, so we patch it directly.
++        # The default aten::sum overload has no dim argument and is incompatible
++        # with npu_reduce_sum_batch_invariant. Patch explicit torch.sum calls
++        # instead of overriding the dispatcher entry used by internal ops.
+         torch.sum = reduce_sum
+ 
+     # register triton implementations if ascendc is not available.
