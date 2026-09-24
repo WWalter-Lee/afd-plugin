@@ -800,30 +800,30 @@ class WindowAFDConnector(AFDConnectorBase):
                 "Window A2F received an unexpected routed expert scale width: "
                 f"got {expert_scales.shape[1]}, expected {routed_topk}",
             )
-        # Window operators reuse one ScheduleContext and run with the fixed
-        # capacity shape used by the ref path.
-        # Repeat valid inputs into padding slots so dynamic quantization never
-        # receives artificial all-zero rows; padded results are discarded.
-        repeat_indices = torch.arange(
-            self.micro_batch_size,
-            dtype=torch.long,
+        # Window buffers keep the configured capacity shape, while active_mask
+        # marks only the rows belonging to this request as valid.
+        x = hidden_states.new_zeros(
+            (1, self.micro_batch_size, self.hidden_size),
+        )
+        x[0, :batch_size].copy_(
+            hidden_states.reshape(batch_size, self.hidden_size),
+        )
+        padded_expert_ids = torch.zeros(
+            (1, self.micro_batch_size, routed_topk),
+            dtype=torch.int32,
             device=hidden_states.device,
-        ) % batch_size
-        x = hidden_states[repeat_indices].reshape(
-            1,
-            self.micro_batch_size,
-            self.hidden_size,
         )
-        padded_expert_ids = expert_ids[repeat_indices].reshape(
-            1,
-            self.micro_batch_size,
-            routed_topk,
-        )
-        active_mask = torch.ones(
+        padded_expert_ids[0, :batch_size].copy_(expert_ids)
+        active_mask = torch.zeros(
             (1, self.micro_batch_size),
             dtype=torch.bool,
             device=hidden_states.device,
         )
+        active_mask[0, :batch_size] = True
+        # The Window token/data buffers use the configured capacity as the
+        # stride between microbatch slots. Keep the combine input at that
+        # capacity and snapshot the current scales; the operator uses its
+        # first dimension for both tiling and the microbatch offset.
         combine_scales = expert_scales.new_zeros(
             (self.micro_batch_size, routed_topk),
         )
