@@ -14,6 +14,10 @@ from afd_plugin.connectors.npu.p2p_hccl import (
     P2pHcclAFDConnector,
     P2pHcclAFDControlPlane,
 )
+from afd_plugin.connectors.npu.window import (
+    WindowAFDConnector,
+    WindowAFDExtraInfo,
+)
 
 __all__ = [
     "CAMP2pAFDConnector",
@@ -24,4 +28,6 @@ __all__ = [
     "HCCLP2PTransferState",
     "P2pHcclAFDConnector",
     "P2pHcclAFDControlPlane",
+    "WindowAFDConnector",
+    "WindowAFDExtraInfo",
 ]
