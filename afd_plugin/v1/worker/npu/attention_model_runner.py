@@ -2040,12 +2040,8 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
     def initialize_attn_backend(
         self,
         kv_cache_config: KVCacheConfig,
-        is_profiling: bool = False,
     ) -> None:
-        super().initialize_attn_backend(
-            kv_cache_config,
-            is_profiling=is_profiling,
-        )
+        super().initialize_attn_backend(kv_cache_config)
         if (
             bool(
                 self.vllm_config.parallel_config.use_ubatching,
