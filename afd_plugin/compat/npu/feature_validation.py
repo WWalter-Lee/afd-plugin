@@ -48,7 +48,10 @@ def fail_if_unsupported_npu_afd_features(
         )
         return
 
-    if afd_config.compute_gate_on_attention:
+    if (
+        afd_config.compute_gate_on_attention
+        and afd_config.connector != "WindowAFDConnector"
+    ):
         raise RuntimeError(
             "AFD NPU runtime does not support compute_gate_on_attention=true yet",
         )
