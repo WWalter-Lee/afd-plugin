@@ -8,6 +8,7 @@ path.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -40,6 +41,7 @@ from afd_plugin.distributed import (
 logger = init_logger(__name__)
 
 _COMM_CONTEXT_WINDOW_ALIGNMENT = 2 * 1024 * 1024
+_BYPASS_F2A_COMBINE = os.getenv("AFD_WINDOW_BYPASS_F2A_COMBINE", "0") == "1"
 
 
 def _record_npu_stream(tensor: torch.Tensor, stream: Any) -> None:
@@ -950,6 +952,8 @@ class WindowAFDConnector(AFDConnectorBase):
             raise RuntimeError(f"Window F2A has no pending transfer for {key}")
 
         def enqueue_combine(layer_id: torch.Tensor) -> torch.Tensor:
+            if _BYPASS_F2A_COMBINE:
+                return torch.zeros_like(ref_tensor)
             output, _ = torch_npu.npu_attention_worker_combine(
                 self.schedule_context,
                 context.states.expert_scales,
@@ -1258,6 +1262,8 @@ class WindowAFDConnector(AFDConnectorBase):
         **kwargs: Any,
     ) -> None:
         self._require_data_path()
+        if _BYPASS_F2A_COMBINE:
+            return
         if not isinstance(context.states, WindowAFDTransferState):
             raise RuntimeError("Window F2A requires batching state")
         state = context.states
