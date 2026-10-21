@@ -406,6 +406,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         return self.model.compute_window_global_ffn_output(
             hidden_states=payload.hidden_states,
             group_list=states.group_list,
+            dynamic_scale=states.dynamic_scale,
             actual_token_num=states.actual_token_num,
         )
 

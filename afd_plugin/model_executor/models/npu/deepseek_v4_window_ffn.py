@@ -200,15 +200,26 @@ def compute_window_global_mxfp_ffn(
     *,
     hidden_states: torch.Tensor,
     compact_group_list: torch.Tensor,
+    dynamic_scale: torch.Tensor | None,
     actual_token_num: torch.Tensor,
     weights: WindowGlobalMXFPWeights,
+    output_dtype: torch.dtype,
 ) -> torch.Tensor:
     """Run all ready Window layers with one layer-major MXFP MoE MLP."""
 
-    if hidden_states.dtype not in (torch.float16, torch.bfloat16):
+    if hidden_states.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+    ):
         raise RuntimeError(
-            "Window global MXFP FFN requires FP16/BF16 input, "
+            "Window global MXFP FFN requires FP16/BF16 or FP8 E4M3FN input, "
             f"got {hidden_states.dtype}"
+        )
+    if output_dtype not in (torch.float16, torch.bfloat16):
+        raise RuntimeError(
+            "Window global MXFP FFN requires FP16/BF16 output, "
+            f"got {output_dtype}"
         )
     if compact_group_list.ndim != 2 or compact_group_list.shape[1] != 2:
         raise RuntimeError(
@@ -256,7 +267,7 @@ def compute_window_global_mxfp_ffn(
     from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
     from vllm_ascend.quantization.quant_type import QuantType
 
-    input_dtype = hidden_states.dtype
+    input_dtype = output_dtype
     weight_quant_type = (
         torch_npu.float4_e2m1fn_x2
         if weights.is_routed
@@ -265,12 +276,38 @@ def compute_window_global_mxfp_ffn(
     mxfp_quant_dtype = (
         QuantType.W4A8MXFP if weights.is_routed else QuantType.MXFP8
     )
-    quantized_states, input_scale = DeviceOperator.npu_dynamic_quant(
-        hidden_states=hidden_states,
-        dynamic_scale=None,
-        act_quant_type=torch.float8_e4m3fn,
-        use_mxfp_quant=True,
-    )
+    if hidden_states.dtype in (torch.float16, torch.bfloat16):
+        quantized_states, input_scale = DeviceOperator.npu_dynamic_quant(
+            hidden_states=hidden_states,
+            dynamic_scale=None,
+            act_quant_type=torch.float8_e4m3fn,
+            use_mxfp_quant=True,
+        )
+    else:
+        if hidden_states.dtype != torch.float8_e4m3fn:
+            raise RuntimeError(
+                "Window global MXFP FFN requires FP16/BF16 or FP8 E4M3FN "
+                f"input, got {hidden_states.dtype}"
+            )
+        if dynamic_scale is None:
+            raise RuntimeError("Window MXFP8 input requires dynamic_scale")
+        expected_scale_shape = (
+            hidden_states.shape[0],
+            (hidden_states.shape[1] + 31) // 32,
+        )
+        if tuple(dynamic_scale.shape) != expected_scale_shape:
+            raise RuntimeError(
+                "Window MXFP8 scale has unexpected shape: "
+                f"got={tuple(dynamic_scale.shape)} "
+                f"expected={expected_scale_shape}"
+            )
+        if dynamic_scale.dtype not in (torch.float8_e8m0fnu, torch.uint8):
+            raise RuntimeError(
+                "Window MXFP8 scale requires E8M0 or its uint8 byte view, "
+                f"got {dynamic_scale.dtype}"
+            )
+        quantized_states = hidden_states
+        input_scale = dynamic_scale
     if weights.is_routed:
         activated_states, activated_scale, _ = (
             DeviceOperator.npu_grouped_matmul_swiglu_quant(
