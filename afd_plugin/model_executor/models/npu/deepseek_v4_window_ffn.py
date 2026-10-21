@@ -307,7 +307,9 @@ def compute_window_global_mxfp_ffn(
                 f"got {dynamic_scale.dtype}"
             )
         quantized_states = hidden_states
-        input_scale = dynamic_scale
+        input_scale = DeviceOperator.maybe_normalize_mxfp_scale_layout(
+            dynamic_scale
+        )
     if weights.is_routed:
         activated_states, activated_scale, _ = (
             DeviceOperator.npu_grouped_matmul_swiglu_quant(
