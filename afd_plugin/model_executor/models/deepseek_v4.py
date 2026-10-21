@@ -1309,6 +1309,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         self,
         hidden_states: torch.Tensor,
         group_list: torch.Tensor,
+        dynamic_scale: torch.Tensor | None,
         actual_token_num: torch.Tensor,
     ) -> torch.Tensor:
         """Compute every ready Window layer without host-side layer parsing."""
@@ -1336,8 +1337,10 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         return compute_window_global_mxfp_ffn(
             hidden_states=hidden_states,
             compact_group_list=group_list,
+            dynamic_scale=dynamic_scale,
             actual_token_num=actual_token_num,
             weights=self._window_global_mxfp_weights,
+            output_dtype=self.vllm_config.model_config.dtype,
         )
 
     def initialize_window_global_mxfp_weights(self) -> None:
@@ -1434,11 +1437,13 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
         self,
         hidden_states: torch.Tensor,
         group_list: torch.Tensor,
+        dynamic_scale: torch.Tensor | None,
         actual_token_num: torch.Tensor,
     ) -> torch.Tensor:
         return self.model.compute_window_global_ffn_output(
             hidden_states,
             group_list,
+            dynamic_scale,
             actual_token_num,
         )
 
