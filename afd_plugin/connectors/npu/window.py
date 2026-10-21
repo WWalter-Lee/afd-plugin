@@ -40,6 +40,9 @@ from afd_plugin.distributed import (
 logger = init_logger(__name__)
 
 _COMM_CONTEXT_WINDOW_ALIGNMENT = 2 * 1024 * 1024
+_URMA_FLAG_SLOT_BYTES = 32
+_URMA_ADDRESS_ENTRY_BYTES = 16
+_URMA_AIV_RESERVE_COUNT = 1024
 
 
 def _record_npu_stream(tensor: torch.Tensor, stream: Any) -> None:
@@ -138,6 +141,7 @@ def _align_up(value: int, alignment: int = 512) -> int:
 def _window_sizes(
     *,
     attention_size: int,
+    world_size: int,
     micro_batch_num: int,
     micro_batch_size: int,
     selected_expert_num: int,
@@ -197,6 +201,44 @@ def _window_sizes(
         ffn_window_info_bytes + ffn_window_data_bytes,
         _COMM_CONTEXT_WINDOW_ALIGNMENT,
     )
+
+    # New A2F stores persistent send staging and flags after its data region.
+    send_slots = micro_batch_size * selected_expert_num
+    attention_window_bytes = max(
+        attention_window_bytes,
+        _align_up(
+            ffn_window_info_bytes
+            + _align_up(ffn_window_data_bytes)
+            + _align_up(
+                send_slots * _align_up(a2f_token_bytes, _URMA_FLAG_SLOT_BYTES),
+            )
+            + (send_slots + 1) * _URMA_FLAG_SLOT_BYTES,
+            _COMM_CONTEXT_WINDOW_ALIGNMENT,
+        ),
+    )
+
+    # New F2A appends flag sources, address tables, and count rows.
+    token_slots = micro_batch_num * send_slots
+    max_worker_num = world_size - 1
+    f2a_recv_bytes = _align_up(
+        4 * (send_slots + 2) * micro_batch_num * max_worker_num,
+    ) + _align_up(f2a_token_bytes * token_slots * max_worker_num)
+    ffn_window_bytes = max(
+        ffn_window_bytes,
+        _align_up(
+            _align_up(
+                f2a_recv_bytes
+                + _URMA_AIV_RESERVE_COUNT * _URMA_FLAG_SLOT_BYTES,
+            )
+            + world_size
+            * _align_up(
+                world_size * token_slots * _URMA_ADDRESS_ENTRY_BYTES,
+            )
+            + (_URMA_AIV_RESERVE_COUNT + 1) * _align_up(world_size * 4),
+            _COMM_CONTEXT_WINDOW_ALIGNMENT,
+        ),
+    )
+
     return (
         attention_window_bytes,
         ffn_window_bytes,
@@ -343,6 +385,7 @@ class WindowAFDConnector(AFDConnectorBase):
             f2a_token_size,
         ) = _window_sizes(
             attention_size=self.attn_size,
+            world_size=self.world_size,
             micro_batch_num=self.extra_info.micro_batch_num,
             micro_batch_size=self.micro_batch_size,
             selected_expert_num=self.selected_expert_num,
