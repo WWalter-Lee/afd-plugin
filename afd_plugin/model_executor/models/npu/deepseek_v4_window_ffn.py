@@ -221,46 +221,12 @@ def compute_window_global_mxfp_ffn(
             "Window global MXFP FFN requires FP16/BF16 output, "
             f"got {output_dtype}"
         )
-    if compact_group_list.ndim != 2 or compact_group_list.shape[1] != 2:
-        raise RuntimeError(
-            "Window global FFN requires a type-2 group list with shape [G, 2]"
-        )
     group_num = int(weights.w1.shape[0])
-
-    # Batching writes positive compact rows, one zero sentinel, and may leave a
-    # stale suffix in its fixed output. Build the dense type-0 list entirely
-    # on NPU; the zero sentinel makes every following row invalid.
-    expert_ids = compact_group_list[:, 0]
-    token_counts = compact_group_list[:, 1]
-    running_counts = torch.cumsum(torch.clamp_min(token_counts, 0), dim=0)
-    row_is_valid = (
-        (token_counts > 0)
-        & (expert_ids >= 0)
-        & (expert_ids < group_num)
-        & (running_counts <= actual_token_num.reshape(()))
-    )
-    valid_prefix = torch.cumsum((~row_is_valid).to(torch.int32), dim=0) == 0
-    safe_expert_ids = torch.where(valid_prefix, expert_ids, 0).to(torch.long)
-    safe_token_counts = torch.where(
-        valid_prefix,
-        token_counts,
-        torch.zeros_like(token_counts),
-    )
-    expert_counts = torch.zeros(
-        (group_num,),
-        dtype=token_counts.dtype,
-        device=token_counts.device,
-    )
-    expert_counts.scatter_add_(0, safe_expert_ids, safe_token_counts)
-    # A routed FFN rank may receive no token in this transaction. Give GMM a
-    # single disposable row so kernels that reject an all-zero group list can
-    # still run; the final actual-token mask removes that row before F2A.
-    empty_transaction = (actual_token_num.reshape(()) == 0).to(token_counts.dtype)
-    expert_counts = expert_counts + torch.nn.functional.pad(
-        empty_transaction.reshape(1),
-        (0, group_num - 1),
-    )
-    cumulative_group_list = torch.cumsum(expert_counts, dim=0)
+    if tuple(compact_group_list.shape) != (group_num, 2):
+        raise RuntimeError(
+            "Window global FFN requires a type-2 group list with shape "
+            f"{(group_num, 2)}, got {tuple(compact_group_list.shape)}"
+        )
 
     import torch_npu
     from vllm_ascend.device.device_op import DeviceOperator
@@ -311,19 +277,35 @@ def compute_window_global_mxfp_ffn(
             dynamic_scale
         )
     if weights.is_routed:
+        gate_up_states = DeviceOperator.npu_grouped_matmul_gmm2(
+            hidden_states=quantized_states,
+            weight=weights.w1,
+            weight_scale=weights.w1_scale,
+            per_token_scale=input_scale,
+            group_list=compact_group_list,
+            group_list_type=2,
+            input_dtype=torch.bfloat16,
+            act_quant_type=torch.float8_e4m3fn,
+            weight_quant_type=weight_quant_type,
+            scale_type=FLOAT8_E8M0FNU_DTYPE,
+            per_token_scale_type=FLOAT8_E8M0FNU_DTYPE,
+            use_bf16=True,
+            use_mxfp_quant=True,
+            fallback_output_dtype=torch.bfloat16,
+            mxfp_quant_dtype=mxfp_quant_dtype,
+        )
         activated_states, activated_scale, _ = (
-            DeviceOperator.npu_grouped_matmul_swiglu_quant(
-                x=quantized_states,
-                weight=weights.w1,
-                group_list=cumulative_group_list,
-                weight_scale=weights.w1_scale,
-                x_scale=input_scale,
-                use_mxfp_quant=True,
-                act_quant_type=torch.float8_e4m3fn,
-                weight_quant_type=weight_quant_type,
-                swiglu_limit=weights.swiglu_limit,
-                mxfp_quant_dtype=mxfp_quant_dtype,
+            torch.ops._C_ascend.npu_swiglu_group_quant(
+                gate_up_states,
+                topk_weight=None,
+                group_index=None,
+                dst_type=torch.float8_e4m3fn,
+                quant_mode=2,
+                clamp_value=weights.swiglu_limit,
             )
+        )
+        activated_scale = DeviceOperator.maybe_normalize_mxfp_scale_layout(
+            activated_scale
         )
     else:
         # Preserve the native shared-MLP quantization boundaries:
@@ -334,8 +316,8 @@ def compute_window_global_mxfp_ffn(
             weight=weights.w1,
             weight_scale=weights.w1_scale,
             per_token_scale=input_scale,
-            group_list=cumulative_group_list,
-            group_list_type=0,
+            group_list=compact_group_list,
+            group_list_type=2,
             input_dtype=input_dtype,
             act_quant_type=torch.float8_e4m3fn,
             weight_quant_type=weight_quant_type,
@@ -367,8 +349,8 @@ def compute_window_global_mxfp_ffn(
         weight=weights.w2,
         weight_scale=weights.w2_scale,
         per_token_scale=activated_scale,
-        group_list=cumulative_group_list,
-        group_list_type=0,
+        group_list=compact_group_list,
+        group_list_type=2,
         input_dtype=input_dtype,
         act_quant_type=torch.float8_e4m3fn,
         weight_quant_type=weight_quant_type,
