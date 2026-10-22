@@ -29,7 +29,7 @@ _DEFAULT_WAIT_STEPS: Final[int] = 2
 _DEFAULT_WARMUP_STEPS: Final[int] = 1
 _DEFAULT_REPEAT: Final[int] = 1
 _DEFAULT_SKIP_FIRST_STEPS: Final[int] = 1500
-_DEFAULT_PROFILE_RANKS: Final[frozenset[int]] = frozenset({0})
+_DEFAULT_PROFILE_RANKS: Final[frozenset[int] | None] = None
 _VLLM_TORCH_PROFILER_DIR_ENV: Final[str] = "VLLM_TORCH_PROFILER_DIR"
 
 
@@ -92,8 +92,8 @@ def create_afd_npu_profiler(
 
     experimental_config = torch_npu.profiler._ExperimentalConfig(
         export_type=torch_npu.profiler.ExportType.Text,
-        profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
-        aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
     )
     logger.info(
         "AFD NPU %s profiler enabled for role rank %d. Traces will be saved "
@@ -134,6 +134,7 @@ def step_afd_npu_profiler(profiler: AFDNPUProfiler | None) -> None:
 
 def stop_afd_npu_profiler(profiler: AFDNPUProfiler | None) -> None:
     if profiler is not None:
+        profiler.step()
         profiler.stop()
 
 
