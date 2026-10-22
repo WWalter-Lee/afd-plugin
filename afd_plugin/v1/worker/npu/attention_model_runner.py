@@ -372,11 +372,11 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         scheduler_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        step_afd_npu_profiler(self.prof)
         # ### PATCH START: AFD live execution scope
         self._afd_live_execution = True
         try:
             result = super().execute_model(scheduler_output, intermediate_tensors)
+            step_afd_npu_profiler(self.prof)
         finally:
             self._afd_live_execution = False
         # ### PATCH END: AFD live execution scope

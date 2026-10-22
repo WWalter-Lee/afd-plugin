@@ -256,11 +256,11 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 "AFD connector",
             )
         if getattr(self.connector, "is_window_connector", False):
-            step_afd_npu_profiler(self.prof)
             self._window_ffn_forward()
+            step_afd_npu_profiler(self.prof)
             return None
-        step_afd_npu_profiler(self.prof)
         self._ffn_forward_connector_driven()
+        step_afd_npu_profiler(self.prof)
         return None
 
     def _window_ffn_forward(self) -> None:
@@ -469,7 +469,6 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         input_ids_by_stage: dict[int, torch.Tensor] | None = None,
         connector_state_prepared: bool = False,
     ) -> None:
-        step_afd_npu_profiler(self.prof)
         if dp_metadata_list is None:
             raise RuntimeError("AFD NPU FFN is connector-driven")
         if not connector_state_prepared:
@@ -506,8 +505,10 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             )
             graph_info["graph"].replay()
             if not self._recv_mtp_phase_ready():
+                step_afd_npu_profiler(self.prof)
                 return None
             self._execute_mtp_after_target(dp_metadata_list)
+            step_afd_npu_profiler(self.prof)
             return None
 
         self._ffn_forward(
@@ -516,8 +517,10 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             update_connector_state=False,
         )
         if not self._recv_mtp_phase_ready():
+            step_afd_npu_profiler(self.prof)
             return None
         self._execute_mtp_after_target(dp_metadata_list)
+        step_afd_npu_profiler(self.prof)
         return None
 
     def _execute_mtp_after_target(
