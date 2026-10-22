@@ -30,6 +30,7 @@ from afd_plugin.compat.npu.profiler import (
 )
 from afd_plugin.config import AFDConfig, parse_afd_config
 from afd_plugin.connectors import (
+    AFDA2FTransferPayload,
     AFDConnectorFactory,
     AFDControlPayload,
     AFDDPMetadata,
@@ -63,10 +64,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# A5 Window Batching and F2A can deadlock when they wait concurrently on
-# different streams.  Keep the implementation available for later core
-# partitioning, but run the FFN Window transaction on one stream for now.
-_WINDOW_FFN_MULTISTREAM_ENABLED = False
+_WINDOW_FFN_PIPELINE_DEPTH = 3
+_WINDOW_FFN_COMM_VECTOR_DIVISOR = 4
+_WINDOW_FFN_VECTORS_PER_CUBE = 2
 
 
 class AFDNPUFFNModelRunner(NPUModelRunner):
@@ -99,12 +99,21 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             getattr(self.connector, "is_window_connector", False)
             and self.ffn_stream_overlap_enabled
         )
+        # Fix the mode at startup so Graph capture and replay use the same pipeline.
+        self.window_ffn_multistream_enabled = (
+            self.window_ffn_stream_overlap_enabled
+            and self.afd_config.window_ffn_multistream_enabled
+        )
+        logger.info(
+            "Window FFN multistream: enabled=%s", self.window_ffn_multistream_enabled
+        )
         self.ffn_recv_stream = None
         self.ffn_compute_stream = None
         self.ffn_send_stream = None
         self.ffn_recv_events: dict[tuple[int, int], Any] = {}
         self.ffn_compute_events: dict[tuple[int, int], Any] = {}
         self.ffn_send_events: dict[tuple[int, int], Any] = {}
+        self.window_ffn_batch_events: list[Any] = []
         self.window_ffn_compute_events: list[Any] = []
         self.window_ffn_send_events: list[Any] = []
         self.window_ffn_round_index = 0
@@ -125,12 +134,14 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self.mtp_ffn_model: torch.nn.Module | None = None
 
     def _initialize_ffn_stream_pipeline(self, device: torch.device) -> None:
-        """Create U2 FFN streams/events shared by eager and Graph."""
+        """Create FFN streams/events shared by eager and Graph."""
         self.ffn_recv_stream = torch.npu.Stream(device=device)
         self.ffn_compute_stream = torch.npu.Stream(device=device)
         self.ffn_send_stream = torch.npu.Stream(device=device)
         if self.window_ffn_stream_overlap_enabled:
-            slot_num = int(self.vllm_config.parallel_config.num_ubatches)
+            # Local in-flight transactions are independent of protocol U2 slots.
+            slot_num = _WINDOW_FFN_PIPELINE_DEPTH
+            self.window_ffn_batch_events = [torch.npu.Event() for _ in range(slot_num)]
             self.window_ffn_compute_events = [
                 torch.npu.Event() for _ in range(slot_num)
             ]
@@ -296,16 +307,18 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
 
     def _window_ffn_forward_async(self) -> None:
         """Batch ready Attention sessions and compute their active layers."""
-        if (
-            not _WINDOW_FFN_MULTISTREAM_ENABLED
-            or not self.window_ffn_stream_overlap_enabled
-        ):
-            if self.use_aclgraph:
-                self._run_window_ffn_graph()
-            else:
-                self._run_window_ffn_transaction()
-            return
+        if self.use_aclgraph:
+            self._run_window_ffn_graph()
+        elif self.window_ffn_multistream_enabled:
+            self._run_window_ffn_multistream_transaction()
+        else:
+            self._run_window_ffn_transaction()
 
+    def _run_window_ffn_multistream_transaction(
+        self,
+    ) -> tuple[AFDA2FTransferPayload, torch.Tensor]:
+        """Submit one round across Batching, expert compute, and F2A streams."""
+        assert self.ffn_compute_stream is not None
         assert self.ffn_send_stream is not None
         slot_num = len(self.window_ffn_compute_events)
         if slot_num == 0:
@@ -315,37 +328,96 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         # This is a local event-ring slot, not the micro_batch_id selected by
         # FFNWorkerBatching.
         slot = round_index % slot_num
+        batch_event = self.window_ffn_batch_events[slot]
         compute_event = self.window_ffn_compute_events[slot]
         send_event = self.window_ffn_send_events[slot]
 
-        # Match the reference execution model: Batching, metadata conversion,
-        # and FFN compute are serial on the caller's current stream.  Only F2A
-        # uses a side stream, so this path needs no host synchronization.
-        compute_stream = torch.npu.current_stream()
-        if round_index >= slot_num:
-            send_event.wait(compute_stream)
-        payload = self.connector.recv_attn_output(
-            ubatch_idx=0,
-            max_num_tokens=self.max_num_tokens,
+        # Batching stays on the caller/capture stream, which forks compute and
+        # send through events. Reserve Vector capacity for all three stages.
+        batch_stream = torch.npu.current_stream()
+        batch_vector_num = torch.npu.get_stream_limit(batch_stream)["vector_core_num"]
+        compute_limits = torch.npu.get_stream_limit(self.ffn_compute_stream)
+        compute_cube_num = compute_limits["cube_core_num"]
+        compute_vector_num = compute_limits["vector_core_num"]
+        send_vector_num = torch.npu.get_stream_limit(self.ffn_send_stream)[
+            "vector_core_num"
+        ]
+        vector_num = min(batch_vector_num, compute_vector_num, send_vector_num)
+        batching_vectors = f2a_vectors = vector_num // _WINDOW_FFN_COMM_VECTOR_DIVISOR
+        compute_vectors = vector_num - batching_vectors - f2a_vectors
+        # Quantized GMM requires Cube:Vector = 1:2, including reduced budgets.
+        compute_cubes = min(
+            compute_cube_num, compute_vectors // _WINDOW_FFN_VECTORS_PER_CUBE
         )
-        full_output = self._compute_window_async_batch(payload)
-        compute_event.record(compute_stream)
+        compute_vectors = compute_cubes * _WINDOW_FFN_VECTORS_PER_CUBE
+        if batching_vectors < 1 or compute_cubes < 1:
+            raise RuntimeError(
+                "Insufficient Cube/Vector cores for Window FFN multistream"
+            )
+        if round_index >= slot_num:
+            send_event.wait(batch_stream)
+        torch.npu.set_stream_limit(batch_stream, vector_num=batching_vectors)
+        try:
+            payload = self.connector.recv_attn_output(
+                ubatch_idx=0,
+                max_num_tokens=self.max_num_tokens,
+            )
+        finally:
+            torch.npu.set_stream_limit(batch_stream, vector_num=batch_vector_num)
+        batch_event.record(batch_stream)
+
+        with torch.npu.stream(self.ffn_compute_stream):
+            batch_event.wait(self.ffn_compute_stream)
+            _record_window_payload_stream(payload, self.ffn_compute_stream)
+            torch.npu.set_stream_limit(
+                self.ffn_compute_stream,
+                cube_num=compute_cubes,
+                vector_num=compute_vectors,
+            )
+            try:
+                full_output = self._compute_window_async_batch(payload)
+            finally:
+                torch.npu.set_stream_limit(
+                    self.ffn_compute_stream,
+                    cube_num=compute_cube_num,
+                    vector_num=compute_vector_num,
+                )
+            compute_event.record(self.ffn_compute_stream)
 
         with torch.npu.stream(self.ffn_send_stream):
             compute_event.wait(self.ffn_send_stream)
             _record_window_payload_stream(payload, self.ffn_send_stream)
             _record_npu_stream(full_output, self.ffn_send_stream)
-            self.connector.send_ffn_output(
-                full_output,
-                payload.context,
-                ubatch_idx=0,
-            )
+            torch.npu.set_stream_limit(self.ffn_send_stream, vector_num=f2a_vectors)
+            try:
+                self.connector.send_ffn_output(
+                    full_output,
+                    payload.context,
+                    ubatch_idx=0,
+                )
+            finally:
+                torch.npu.set_stream_limit(
+                    self.ffn_send_stream, vector_num=send_vector_num
+                )
             send_event.record(self.ffn_send_stream)
+        return payload, full_output
 
     def _run_window_ffn_transaction(
         self,
-    ) -> tuple[AFDA2FTransferPayload, torch.Tensor]:
-        """Run one complete single-stream Window FFN transaction."""
+    ) -> list[tuple[AFDA2FTransferPayload, torch.Tensor]]:
+        """Run a serial transaction or one closed multistream pipeline."""
+        if self.window_ffn_multistream_enabled:
+            # Replay closes all sends before reusing this pipeline's buffers.
+            # Reset slots so capture never waits on an event from eager warmup.
+            self.window_ffn_round_index = 0
+            retained = [self._run_window_ffn_multistream_transaction()]
+            for _ in self.window_ffn_compute_events[1:]:
+                retained.append(self._run_window_ffn_multistream_transaction())
+            # The last send depends on all compute work; this joins both side
+            # streams back to the capture stream before buffer reuse/replay.
+            torch.npu.current_stream().wait_stream(self.ffn_send_stream)
+            return retained
+
         payload = self.connector.recv_attn_output(
             ubatch_idx=0,
             max_num_tokens=self.max_num_tokens,
@@ -356,10 +428,10 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             payload.context,
             ubatch_idx=0,
         )
-        return payload, full_output
+        return [(payload, full_output)]
 
     def _run_window_ffn_graph(self) -> None:
-        """Warm, capture, or replay one complete Window FFN transaction."""
+        """Warm, capture, or replay a complete Window FFN pipeline."""
         graph_info = self._window_ffn_acl_graph
         if graph_info is not None:
             graph_info["graph"].replay()
@@ -371,7 +443,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             return
 
         graph = torch.npu.NPUGraph()
-        retained: tuple[AFDA2FTransferPayload, torch.Tensor] | None = None
+        retained: list[tuple[AFDA2FTransferPayload, torch.Tensor]] | None = None
         set_cudagraph_capturing_enabled(True)
         try:
             with graph_capture(device=self.device):
@@ -380,7 +452,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         finally:
             set_cudagraph_capturing_enabled(False)
 
-        if retained is None:
+        if not retained:
             raise RuntimeError("Window FFN ACLGraph capture produced no outputs")
         # Keep every graph-owned output alive. Batching produces the routing
         # tensors consumed by global FFN compute and F2A inside this graph.
@@ -388,7 +460,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             "graph": graph,
             "retained": retained,
         }
-        logger.info("Captured complete Window FFN ACLGraph")
+        logger.info("Captured Window FFN ACLGraph: transactions=%d", len(retained))
 
     def _compute_window_async_batch(
         self,

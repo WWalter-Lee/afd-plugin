@@ -66,6 +66,8 @@ class AFDConfig:
     num_ffn_ranks: int = 1
     # Whether Attention computes MoE gate outputs before sending to FFN.
     compute_gate_on_attention: bool = False
+    # Enable the Window FFN three-stream pipeline and automatic core limits.
+    window_ffn_multistream_enabled: bool = False
 
     @property
     def afd_connector(self) -> str:
@@ -97,6 +99,7 @@ class AFDConfig:
         factors: list[str | bool | int] = [
             self.connector,
             self.async_dp,
+            self.window_ffn_multistream_enabled,
             self.role,
             self.num_attention_ranks,
             self.num_ffn_ranks,
@@ -156,6 +159,12 @@ def _normalize_mapping(
         normalized["compute_gate_on_attention"] = _coerce_bool(
             normalized["compute_gate_on_attention"],
             field_name="compute_gate_on_attention",
+        )
+
+    if "window_ffn_multistream_enabled" in normalized:
+        normalized["window_ffn_multistream_enabled"] = _coerce_bool(
+            normalized["window_ffn_multistream_enabled"],
+            field_name="window_ffn_multistream_enabled",
         )
 
     return normalized, connector_extra_config or {}
