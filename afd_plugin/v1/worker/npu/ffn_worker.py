@@ -156,7 +156,7 @@ class AFDNPUFFNWorker(NPUWorker):
         while not event.is_set():
             if self.model_runner.connector.control_plane is None:
                 self.model_runner.execute_connector_driven_step()
-                if not self.model_runner.window_ffn_stream_overlap_enabled:
+                if not self.model_runner.window_ffn_multistream_enabled:
                     torch.npu.synchronize()
                 continue
 
