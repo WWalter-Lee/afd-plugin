@@ -327,21 +327,18 @@ def compute_window_global_mxfp_ffn(
             fallback_output_dtype=input_dtype,
             mxfp_quant_dtype=mxfp_quant_dtype,
         )
-        if weights.swiglu_limit > 0:
-            gate, up = gate_up_states.chunk(2, dim=-1)
-            gate = torch.clamp(gate, max=weights.swiglu_limit)
-            up = torch.clamp(
-                up,
-                min=-weights.swiglu_limit,
-                max=weights.swiglu_limit,
+        activated_states, activated_scale, _ = (
+            torch.ops._C_ascend.npu_swiglu_group_quant(
+                gate_up_states,
+                topk_weight=None,
+                group_index=None,
+                dst_type=torch.float8_e4m3fn,
+                quant_mode=2,
+                clamp_value=weights.swiglu_limit,
             )
-            gate_up_states = torch.cat((gate, up), dim=-1)
-        activated_states = torch_npu.npu_swiglu(gate_up_states)
-        activated_states, activated_scale = DeviceOperator.npu_dynamic_quant(
-            hidden_states=activated_states,
-            dynamic_scale=None,
-            act_quant_type=torch.float8_e4m3fn,
-            use_mxfp_quant=True,
+        )
+        activated_scale = DeviceOperator.maybe_normalize_mxfp_scale_layout(
+            activated_scale
         )
     output = DeviceOperator.npu_grouped_matmul_gmm2(
         hidden_states=activated_states,
