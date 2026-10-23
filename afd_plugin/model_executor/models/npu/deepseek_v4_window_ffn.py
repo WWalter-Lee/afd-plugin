@@ -201,7 +201,6 @@ def compute_window_global_mxfp_ffn(
     hidden_states: torch.Tensor,
     compact_group_list: torch.Tensor,
     dynamic_scale: torch.Tensor | None,
-    actual_token_num: torch.Tensor,
     weights: WindowGlobalMXFPWeights,
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
@@ -363,10 +362,7 @@ def compute_window_global_mxfp_ffn(
     )
     if weights.is_routed:
         output = output * weights.routed_scaling_factor
-    valid_rows = torch.arange(
-        output.shape[0], device=output.device
-    ) < actual_token_num.reshape(())
-    return torch.where(valid_rows.unsqueeze(-1), output, torch.zeros_like(output))
+    return output
 
 
 __all__ = [
