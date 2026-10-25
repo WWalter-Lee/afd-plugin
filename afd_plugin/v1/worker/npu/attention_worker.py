@@ -65,6 +65,14 @@ class AFDNPUAttentionWorker(NPUWorker):
             self.device,
         )
 
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+        """Control the plugin-owned profiler from vLLM's profile endpoint."""
+        del profile_prefix
+        if is_start:
+            self.model_runner.start_afd_profiler()
+        else:
+            self.model_runner.stop_afd_profiler()
+
     # Online idle DP ranks still need the MTP phase handshake, but startup
     # capture must not advertise a live draft phase to the FFN worker.
     def execute_dummy_batch(self) -> None:

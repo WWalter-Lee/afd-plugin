@@ -158,7 +158,8 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self.graph_pool = (
             current_platform.get_global_graph_pool() if self.use_aclgraph else None
         )
-        self.prof = create_afd_npu_profiler("ffn", role_rank=rank)
+        self._profiler_rank = rank
+        self.prof = None
         self._is_shutdown = False
         self._ffn_input_ids_cache: dict[int, torch.Tensor] = {}
         self.mtp_ffn_model: torch.nn.Module | None = None
@@ -194,6 +195,17 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
 
     def initialize_afd_connector(self) -> None:
         self.connector.init_afd_connector()
+
+    def start_afd_profiler(self) -> None:
+        """Start the FFN profiler after the connector service is ready."""
+        if self.prof is None:
+            self.prof = create_afd_npu_profiler(
+                "ffn", role_rank=self._profiler_rank
+            )
+
+    def stop_afd_profiler(self) -> None:
+        stop_afd_npu_profiler(self.prof)
+        self.prof = None
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return {}
@@ -1293,7 +1305,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
     def shutdown(self) -> None:
         if self._is_shutdown:
             return
-        stop_afd_npu_profiler(self.prof)
+        self.stop_afd_profiler()
         if self.connector.is_initialized:
             self.connector.close()
         super().shutdown()

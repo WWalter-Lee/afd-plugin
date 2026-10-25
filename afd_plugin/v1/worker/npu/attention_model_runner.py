@@ -275,11 +275,23 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             | None
         ) = None
         self._afd_logged_metadata_stage_counts: set[tuple[int, bool, bool]] = set()
-        self.prof = create_afd_npu_profiler("attention", role_rank=rank)
+        self._profiler_rank = rank
+        self.prof = None
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
         return parse_afd_config(vllm_config, expected_role="attention")
+
+    def start_afd_profiler(self) -> None:
+        """Start the Attention profiler on an explicit profile request."""
+        if self.prof is None:
+            self.prof = create_afd_npu_profiler(
+                "attention", role_rank=self._profiler_rank
+            )
+
+    def stop_afd_profiler(self) -> None:
+        stop_afd_npu_profiler(self.prof)
+        self.prof = None
 
     def _uses_fixed_window_u2(self) -> bool:
         return bool(
@@ -2518,7 +2530,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         return result
 
     def shutdown(self) -> None:
-        stop_afd_npu_profiler(self.prof)
+        self.stop_afd_profiler()
         control_plane = self.connector.control_plane
         if control_plane is not None:
             try:

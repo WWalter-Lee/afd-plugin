@@ -110,6 +110,14 @@ class AFDNPUFFNWorker(NPUWorker):
             "execute_model() is not supported.",
         )
 
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+        """Control the plugin-owned profiler from vLLM's profile endpoint."""
+        del profile_prefix
+        if is_start:
+            self.model_runner.start_afd_profiler()
+        else:
+            self.model_runner.stop_afd_profiler()
+
     def start_ffn_server_loop(self) -> None:
         if self._ffn_thread is not None and self._ffn_thread.is_alive():
             self.raise_ffn_loop_error_if_any()
