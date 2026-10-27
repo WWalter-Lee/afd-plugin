@@ -107,6 +107,7 @@ from afd_plugin.v1.worker.npu.npu_ubatch_wrapper import AscendUBatchWrapper
 from afd_plugin.v1.worker.npu.ubatch_utils import (
     check_enable_ubatch,
     create_request_boundary_ubatch_slices,
+    create_ubatch_slices,
     maybe_create_ubatch_slices,
     pad_out_ubatch_slices,
     split_attn_metadata,
@@ -542,12 +543,30 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
         )
-        ubatch_slices = _normalize_metadata_ubatch_slices(
-            ubatch_slices,
-            num_tokens_padded,
-            num_reqs_padded,
-            pad_token_capacity=self._uses_fixed_window_u2(),
-        )
+        if (
+            self._uses_fixed_window_u2()
+            and ubatch_slices is not None
+            and num_tokens_padded is not None
+            and num_reqs_padded is not None
+            and num_tokens_padded != num_tokens
+        ):
+            # Window U2 must derive both token and request slices from the
+            # final padded query layout. Extending only the old token slice can
+            # leave its request slice pointing past the last live request.
+            padded_query_lens = np.diff(
+                self.query_start_loc.np[: num_reqs_padded + 1]
+            ).astype(np.int32, copy=False)
+            ubatch_slices = create_ubatch_slices(
+                padded_query_lens,
+                [num_tokens_padded // 2],
+            )
+        else:
+            ubatch_slices = _normalize_metadata_ubatch_slices(
+                ubatch_slices,
+                num_tokens_padded,
+                num_reqs_padded,
+                pad_token_capacity=self._uses_fixed_window_u2(),
+            )
         # MTP target verification schedules the target token and its draft
         # token as one request.  Splitting those two tokens across stages
         # changes the quantized/sparse-attention kernel shape and can change
