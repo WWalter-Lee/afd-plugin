@@ -40,6 +40,7 @@ from afd_plugin.distributed import (
 logger = init_logger(__name__)
 
 _COMM_CONTEXT_WINDOW_ALIGNMENT = 2 * 1024 * 1024
+_ENABLE_ATTENTION_MULTISTREAM = False
 
 
 def _record_npu_stream(tensor: torch.Tensor, stream: Any) -> None:
@@ -286,7 +287,9 @@ class WindowAFDConnector(AFDConnectorBase):
         self.expert_num = self.routed_expert_num + shared_expert_num
         self.micro_batch_num = self.extra_info.micro_batch_num
         self.stream_overlap_enabled = bool(
-            self.async_mode and self.micro_batch_num > 1
+            self.async_mode
+            and self.micro_batch_num > 1
+            and _ENABLE_ATTENTION_MULTISTREAM
         )
         # M is an independent Window slot dimension, not a divisor of BS.
         # Keep the operator's per-slot capacity equal to scheduler capacity.
@@ -454,6 +457,7 @@ class WindowAFDConnector(AFDConnectorBase):
                 f"attn_size={self.attn_size} "
                 f"ffn_size={self.ffn_size} "
                 f"micro_batch_num={self.extra_info.micro_batch_num} "
+                f"attention_multistream={self.stream_overlap_enabled} "
                 f"micro_batch_size={self.micro_batch_size} "
                 f"selected_expert_num={self.selected_expert_num} "
                 f"expert_num={self.expert_num} "
