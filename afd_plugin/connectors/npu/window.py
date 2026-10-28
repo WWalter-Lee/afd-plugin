@@ -562,7 +562,7 @@ class WindowAFDConnector(AFDConnectorBase):
         )
 
     def _attention_stream_pipeline_active(self) -> bool:
-        """Return whether the eager U2 stream pipeline owns this forward."""
+        """Return whether the U2 communication-stream pipeline owns this forward."""
         if (
             torch.compiler.is_compiling()
             or not self.attention_stream_pipeline_ready
@@ -572,7 +572,10 @@ class WindowAFDConnector(AFDConnectorBase):
             forward_context = get_forward_context()
         except AssertionError:
             return False
-        if bool(getattr(forward_context, "afd_graph_ubatching", False)):
+        if (
+            self.afd_config.window_attention_graph_compute_stream_enabled
+            and bool(getattr(forward_context, "afd_graph_ubatching", False))
+        ):
             return False
         return bool(
             getattr(forward_context, "dbo_enabled", False)
@@ -597,7 +600,8 @@ class WindowAFDConnector(AFDConnectorBase):
         if torch.compiler.is_compiling():
             return False
         if not (
-            self.stream_overlap_enabled
+            self.afd_config.window_attention_graph_compute_stream_enabled
+            and self.stream_overlap_enabled
             and self.afd_config.role == "attention"
             and self.attention_graph_compute_stream is not None
             and self.attention_pipeline_events

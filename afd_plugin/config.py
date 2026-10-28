@@ -66,6 +66,8 @@ class AFDConfig:
     num_ffn_ranks: int = 1
     # Whether Attention computes MoE gate outputs before sending to FFN.
     compute_gate_on_attention: bool = False
+    # Run Window Graph Attention compute on a side stream.
+    window_attention_graph_compute_stream_enabled: bool = False
     # Enable the Window FFN two-stream pipeline and operator core limits.
     window_ffn_multistream_enabled: bool = True
 
@@ -100,6 +102,7 @@ class AFDConfig:
             self.connector,
             self.async_dp,
             self.role,
+            self.window_attention_graph_compute_stream_enabled,
             self.window_ffn_multistream_enabled,
             self.num_attention_ranks,
             self.num_ffn_ranks,
@@ -159,6 +162,12 @@ def _normalize_mapping(
         normalized["compute_gate_on_attention"] = _coerce_bool(
             normalized["compute_gate_on_attention"],
             field_name="compute_gate_on_attention",
+        )
+
+    if "window_attention_graph_compute_stream_enabled" in normalized:
+        normalized["window_attention_graph_compute_stream_enabled"] = _coerce_bool(
+            normalized["window_attention_graph_compute_stream_enabled"],
+            field_name="window_attention_graph_compute_stream_enabled",
         )
 
     if "window_ffn_multistream_enabled" in normalized:
