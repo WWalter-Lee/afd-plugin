@@ -1468,6 +1468,27 @@ class WindowAFDConnector(AFDConnectorBase):
             f"{_debug_comm_buffer_state(self.comm_buffer)}",
             flush=True,
         )
+        is_last_f2a = (
+            int(context.metadata.layer_idx) == self.num_layers - 1
+            and int(context.metadata.stage_idx) == self.micro_batch_num - 1
+        )
+        if is_last_f2a:
+            print(f"[WIN-F2A-FINAL-FLUSH] begin call={call}", flush=True)
+            cot.ffn_to_attention(
+                self.comm_buffer,
+                routed_output,
+                state.session_ids,
+                state.micro_batch_ids,
+                state.token_ids,
+                state.expert_offsets,
+                torch.zeros_like(actual_token_num),
+                attn_rank_table=self.attn_rank_table,
+            )
+            print(
+                f"[WIN-F2A-FINAL-FLUSH] end call={call} "
+                f"{_debug_comm_buffer_state(self.comm_buffer)}",
+                flush=True,
+            )
         logger.debug(
             "Window F2A sent stage=%d actual_tokens=%s",
             context.metadata.stage_idx,
