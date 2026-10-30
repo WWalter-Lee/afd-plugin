@@ -47,6 +47,24 @@ def _record_npu_stream(tensor: torch.Tensor, stream: Any) -> None:
         tensor.record_stream(stream)
 
 
+def _debug_comm_buffer_state(buffer: Any) -> str:
+    """Return host-only async completion state without synchronizing the NPU."""
+    issued = getattr(buffer, "_next_round_id", None)
+    keepalive = getattr(buffer, "_keepalive", None)
+    status_table = getattr(buffer, "_status_table", None)
+    if issued is None or not isinstance(keepalive, dict) or status_table is None:
+        return "issued=NA done=NA keep=NA lag=NA"
+    try:
+        done = int(status_table.completed_round())
+    except Exception as exc:
+        return (
+            f"issued={issued} done=ERR:{type(exc).__name__} "
+            f"keep={len(keepalive)} lag=NA"
+        )
+    lag = int(issued) - (done + 1)
+    return f"issued={issued} done={done} keep={len(keepalive)} lag={lag}"
+
+
 @dataclass(frozen=True, slots=True)
 class WindowAttentionPipelineEvents:
     """One Attention layer/stage's compute, A2F, and Combine events."""
@@ -906,7 +924,8 @@ class WindowAFDConnector(AFDConnectorBase):
             )
             print(
                 f"[WIN-A2F] end call={call} "
-                f"layer={model_layer_idx} mb={stage_idx}",
+                f"layer={model_layer_idx} mb={stage_idx} "
+                f"{_debug_comm_buffer_state(self.comm_buffer)}",
                 flush=True,
             )
 
@@ -1380,7 +1399,11 @@ class WindowAFDConnector(AFDConnectorBase):
             actual_token_num,
             attn_rank_table=self.attn_rank_table,
         )
-        print(f"[WIN-F2A] end call={call}", flush=True)
+        print(
+            f"[WIN-F2A] end call={call} "
+            f"{_debug_comm_buffer_state(self.comm_buffer)}",
+            flush=True,
+        )
         logger.debug(
             "Window F2A sent stage=%d actual_tokens=%s",
             context.metadata.stage_idx,
