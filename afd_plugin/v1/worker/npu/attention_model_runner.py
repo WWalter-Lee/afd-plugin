@@ -386,6 +386,10 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         step_afd_npu_profiler(self.prof)
+        step = getattr(self, "_debug_execute_step", 0)
+        self._debug_execute_step = step + 1
+        self._debug_active_execute_step = step
+        print(f"[WIN-EXEC] begin step={step}", flush=True)
         # ### PATCH START: AFD live execution scope
         self._afd_live_execution = True
         try:
@@ -393,6 +397,8 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         finally:
             self._afd_live_execution = False
         # ### PATCH END: AFD live execution scope
+        print(f"[WIN-EXEC] end step={step}", flush=True)
+        self._debug_active_execute_step = None
         return result
 
     # Upstream source: vllm-ascend commit 80d8c194f,
@@ -492,10 +498,15 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             False,
         )
         forward_context.afd_input_ids_pretransferred = pretransfer_input_ids
+        debug_step = getattr(self, "_debug_active_execute_step", None)
+        if debug_step is not None:
+            print(f"[WIN-MODEL] begin step={debug_step}", flush=True)
         try:
             hidden_states = run_model()
         finally:
             forward_context.afd_input_ids_pretransferred = previous_pretransfer
+        if debug_step is not None:
+            print(f"[WIN-MODEL] end step={debug_step}", flush=True)
         # ### PATCH END: DSV4 graph-safe IDs side channel
         if not self.enable_enpu and not wrapper_owns_full_graph_update:
             self._update_full_graph_params_if_needed(
