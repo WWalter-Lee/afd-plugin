@@ -1404,6 +1404,28 @@ class WindowAFDConnector(AFDConnectorBase):
             f"{_debug_comm_buffer_state(self.comm_buffer)}",
             flush=True,
         )
+        # Debug-only drain probe: launch an empty round through the public
+        # wrapper so its round ids and keepalive state stay aligned with the
+        # kernel.  The new F2A implementation drains the preceding round at
+        # the beginning of the next launch; zero actual tokens produce no
+        # additional remote data or flag writes.
+        zero_actual_token_num = torch.zeros_like(actual_token_num)
+        print(f"[WIN-F2A-DRAIN] begin call={call}", flush=True)
+        cot.ffn_to_attention(
+            self.comm_buffer,
+            routed_output,
+            state.session_ids,
+            state.micro_batch_ids,
+            state.token_ids,
+            state.expert_offsets,
+            zero_actual_token_num,
+            attn_rank_table=self.attn_rank_table,
+        )
+        print(
+            f"[WIN-F2A-DRAIN] end call={call} "
+            f"{_debug_comm_buffer_state(self.comm_buffer)}",
+            flush=True,
+        )
         logger.debug(
             "Window F2A sent stage=%d actual_tokens=%s",
             context.metadata.stage_idx,
