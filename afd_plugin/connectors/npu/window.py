@@ -308,9 +308,12 @@ class WindowAFDConnector(AFDConnectorBase):
         self.selected_expert_num = routed_topk + shared_expert_num
         self.expert_num = self.routed_expert_num + shared_expert_num
         self.micro_batch_num = self.extra_info.micro_batch_num
-        self.stream_overlap_enabled = bool(
-            self.async_mode and self.micro_batch_num > 1
-        )
+        # Debug-only fully serialized baseline for the PR 14650 async Window
+        # operators.  Keep the two logical micro-batches, but launch A2F and
+        # Combine on the caller stream so one buffer never switches between
+        # the default stream and the side communication streams.  Re-enable
+        # overlap incrementally after this baseline is proven stable.
+        self.stream_overlap_enabled = False
         # M is an independent Window slot dimension, not a divisor of BS.
         # Keep the operator's per-slot capacity equal to scheduler capacity.
         self.micro_batch_size = int(
