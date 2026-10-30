@@ -956,6 +956,10 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
                 reset_pipeline()
             raise
 
+        print("[WIN-TAIL-SYNC] begin", flush=True)
+        torch.npu.synchronize()
+        print("[WIN-TAIL-SYNC] end", flush=True)
+
         if not native.get_pp_group().is_last_rank:
             return [
                 native.IntermediateTensors({"hidden_states": hidden_states})
