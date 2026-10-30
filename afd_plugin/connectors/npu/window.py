@@ -1068,6 +1068,22 @@ class WindowAFDConnector(AFDConnectorBase):
                 f"layer={key[1]} mb={key[0]}",
                 flush=True,
             )
+            is_last_combine = (
+                key[1] == self.num_layers - 1
+                and key[0] == self.micro_batch_num - 1
+            )
+            if is_last_combine:
+                print(
+                    f"[WIN-COMB-DEVICE] begin call={call} "
+                    f"layer={key[1]} mb={key[0]}",
+                    flush=True,
+                )
+                torch.npu.current_stream().synchronize()
+                print(
+                    f"[WIN-COMB-DEVICE] end call={call} "
+                    f"layer={key[1]} mb={key[0]}",
+                    flush=True,
+                )
             return output[: ref_tensor.shape[0]].reshape_as(ref_tensor)
 
         graph_pipeline_active = self.attention_graph_compute_pipeline_active()

@@ -386,6 +386,9 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         step_afd_npu_profiler(self.prof)
+        step = getattr(self, "_debug_decode_step", 0)
+        self._debug_decode_step = step + 1
+        print(f"[WIN-STEP] execute-begin step={step}", flush=True)
         # ### PATCH START: AFD live execution scope
         self._afd_live_execution = True
         try:
@@ -393,6 +396,15 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         finally:
             self._afd_live_execution = False
         # ### PATCH END: AFD live execution scope
+        print(f"[WIN-STEP] execute-end step={step}", flush=True)
+        return result
+
+    def sample_tokens(self, grammar_output: Any):
+        sample = getattr(self, "_debug_sample_step", 0)
+        self._debug_sample_step = sample + 1
+        print(f"[WIN-STEP] sample-begin sample={sample}", flush=True)
+        result = super().sample_tokens(grammar_output)
+        print(f"[WIN-STEP] sample-end sample={sample}", flush=True)
         return result
 
     # Upstream source: vllm-ascend commit 80d8c194f,
