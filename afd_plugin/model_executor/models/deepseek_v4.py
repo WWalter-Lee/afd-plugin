@@ -1049,9 +1049,21 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
 
         for stage_idx, forward_context in enumerate(stage_contexts):
             with override_forward_context(forward_context):
+                print(
+                    f"[WIN-FINAL] wait-begin stage={stage_idx}",
+                    flush=True,
+                )
                 wait_for_receive(
                     stage_idx=stage_idx,
                     tensor=hidden_ubatches[stage_idx],
+                )
+                print(
+                    f"[WIN-FINAL] wait-end stage={stage_idx}",
+                    flush=True,
+                )
+                print(
+                    f"[WIN-FINAL] complete-begin stage={stage_idx}",
+                    flush=True,
                 )
                 self._complete_pending_stage(
                     stage_idx,
@@ -1061,6 +1073,10 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
                     aux_hidden_ubatches,
                     dspark_hidden_ubatches,
                     final=True,
+                )
+                print(
+                    f"[WIN-FINAL] complete-end stage={stage_idx}",
+                    flush=True,
                 )
 
     def _forward_ubatches_graph_compute_pipeline(
