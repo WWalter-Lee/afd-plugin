@@ -8,6 +8,7 @@ path.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -1018,28 +1019,33 @@ class WindowAFDConnector(AFDConnectorBase):
             )
             flag_offset = key[0] * token_slots_per_stage
             flag_count = token_slots_per_stage
-            print(
-                f"[WIN-FLAG] begin call={call} "
-                f"attn={self.role_rank} layer={key[1]} mb={key[0]}",
-                flush=True,
-            )
             all_flags = self.window_tensor[
                 : self.micro_batch_num * token_slots_per_stage * 4
             ].view(torch.int32)
             stage_flags = all_flags[flag_offset : flag_offset + flag_count]
-            stage_flags_cpu = stage_flags.cpu().tolist()
-            ready = [
-                (slot, value)
-                for slot, value in enumerate(stage_flags_cpu)
-                if value != 0
-            ]
-            print(
-                f"[WIN-FLAG] end call={call} "
-                f"attn={self.role_rank} layer={key[1]} mb={key[0]} "
-                f"ready={len(ready)}/{flag_count} "
-                f"first={ready[:32]}",
-                flush=True,
-            )
+            poll_started = time.monotonic()
+            poll_count = 0
+            while True:
+                poll_count += 1
+                stage_flags_cpu = stage_flags.cpu().tolist()
+                missing = [
+                    (slot, value)
+                    for slot, value in enumerate(stage_flags_cpu)
+                    if value != 1
+                ]
+                elapsed_ms = (time.monotonic() - poll_started) * 1000.0
+                if not missing or elapsed_ms >= 1000.0:
+                    status = "ready" if not missing else "timeout"
+                    print(
+                        f"[WIN-FLAG-POLL] {status} call={call} "
+                        f"attn={self.role_rank} layer={key[1]} mb={key[0]} "
+                        f"ready={flag_count - len(missing)}/{flag_count} "
+                        f"wait_ms={elapsed_ms:.3f} polls={poll_count} "
+                        f"missing={missing[:32]}",
+                        flush=True,
+                    )
+                    break
+                time.sleep(0.001)
             print(
                 f"[WIN-COMB] begin call={call} "
                 f"layer={key[1]} mb={key[0]}",
@@ -1468,27 +1474,6 @@ class WindowAFDConnector(AFDConnectorBase):
             f"{_debug_comm_buffer_state(self.comm_buffer)}",
             flush=True,
         )
-        is_last_f2a = (
-            int(context.metadata.layer_idx) == self.num_layers - 1
-            and int(context.metadata.stage_idx) == self.micro_batch_num - 1
-        )
-        if is_last_f2a:
-            print(f"[WIN-F2A-FINAL-FLUSH] begin call={call}", flush=True)
-            cot.ffn_to_attention(
-                self.comm_buffer,
-                routed_output,
-                state.session_ids,
-                state.micro_batch_ids,
-                state.token_ids,
-                state.expert_offsets,
-                torch.zeros_like(actual_token_num),
-                attn_rank_table=self.attn_rank_table,
-            )
-            print(
-                f"[WIN-F2A-FINAL-FLUSH] end call={call} "
-                f"{_debug_comm_buffer_state(self.comm_buffer)}",
-                flush=True,
-            )
         logger.debug(
             "Window F2A sent stage=%d actual_tokens=%s",
             context.metadata.stage_idx,
