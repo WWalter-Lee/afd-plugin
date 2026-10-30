@@ -401,6 +401,14 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         self._debug_active_execute_step = None
         return result
 
+    def sample_tokens(self, grammar_output: Any):
+        step = getattr(self, "_debug_sample_step", 0)
+        self._debug_sample_step = step + 1
+        print(f"[WIN-SAMPLE] begin step={step}", flush=True)
+        result = super().sample_tokens(grammar_output)
+        print(f"[WIN-SAMPLE] end step={step}", flush=True)
+        return result
+
     # Upstream source: vllm-ascend commit 80d8c194f,
     # NPUModelRunner._model_forward.
     # Patch reason: the upstream forward path does not install AFD stage metadata

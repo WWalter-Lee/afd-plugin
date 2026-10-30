@@ -40,7 +40,6 @@ from afd_plugin.distributed import (
 logger = init_logger(__name__)
 
 _COMM_CONTEXT_WINDOW_ALIGNMENT = 2 * 1024 * 1024
-_DEBUG_F2A_FLUSH = False
 
 
 def _record_npu_stream(tensor: torch.Tensor, stream: Any) -> None:
@@ -1405,25 +1404,6 @@ class WindowAFDConnector(AFDConnectorBase):
             f"{_debug_comm_buffer_state(self.comm_buffer)}",
             flush=True,
         )
-        if _DEBUG_F2A_FLUSH:
-            zero_actual_token_num = torch.zeros_like(actual_token_num)
-            print(f"[WIN-F2A-FLUSH] begin call={call}", flush=True)
-            torch.ops.cann_ops_transformer.npu_ffn_to_attention(
-                self.comm_buffer.context,
-                routed_output,
-                state.session_ids,
-                state.micro_batch_ids,
-                state.token_ids,
-                state.expert_offsets,
-                zero_actual_token_num,
-                self.comm_buffer.group_name,
-                self.comm_buffer.ep_world_size,
-                self.comm_buffer.token_info_table_shape,
-                self.comm_buffer.token_data_shape,
-                self.comm_buffer.ccl_buffer_size,
-                attn_rank_table=self.attn_rank_table,
-            )
-            print(f"[WIN-F2A-FLUSH] end call={call}", flush=True)
         logger.debug(
             "Window F2A sent stage=%d actual_tokens=%s",
             context.metadata.stage_idx,
