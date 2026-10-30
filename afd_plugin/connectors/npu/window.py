@@ -66,6 +66,66 @@ def _debug_comm_buffer_state(buffer: Any) -> str:
     return f"issued={issued} done={done} keep={len(keepalive)} lag={lag}"
 
 
+def _debug_wait_comm_round(
+    buffer: Any,
+    *,
+    op: str,
+    call: int,
+    layer_idx: int,
+    stage_idx: int,
+    timeout_s: float = 5.0,
+) -> None:
+    """Wait for the async communication round submitted by one Window op.
+
+    NPU stream synchronization only waits for the operator kernel.  The
+    Window wrapper tracks remote communication completion separately, so use
+    that status here to distinguish kernel completion from remote WQE
+    completion.  This intentionally serializes communication for debugging.
+    """
+    issued = getattr(buffer, "_next_round_id", None)
+    status_table = getattr(buffer, "_status_table", None)
+    if issued is None or status_table is None:
+        print(
+            f"[WIN-COMM-WAIT] unavailable op={op} call={call} "
+            f"layer={layer_idx} mb={stage_idx}",
+            flush=True,
+        )
+        return
+
+    target = int(issued) - 1
+    started = time.monotonic()
+    while True:
+        try:
+            done = int(status_table.completed_round())
+        except Exception as exc:
+            print(
+                f"[WIN-COMM-WAIT] error op={op} call={call} "
+                f"layer={layer_idx} mb={stage_idx} target={target} "
+                f"error={type(exc).__name__}:{exc}",
+                flush=True,
+            )
+            return
+
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+        if done >= target:
+            print(
+                f"[WIN-COMM-WAIT] done op={op} call={call} "
+                f"layer={layer_idx} mb={stage_idx} target={target} "
+                f"completed={done} wait_ms={elapsed_ms:.3f}",
+                flush=True,
+            )
+            return
+        if elapsed_ms >= timeout_s * 1000.0:
+            print(
+                f"[WIN-COMM-WAIT] timeout op={op} call={call} "
+                f"layer={layer_idx} mb={stage_idx} target={target} "
+                f"completed={done} wait_ms={elapsed_ms:.3f}",
+                flush=True,
+            )
+            return
+        time.sleep(0.001)
+
+
 @dataclass(frozen=True, slots=True)
 class WindowAttentionPipelineEvents:
     """One Attention layer/stage's compute, A2F, and Combine events."""
@@ -923,6 +983,13 @@ class WindowAFDConnector(AFDConnectorBase):
                 ffn_start_rank_id=0,
                 active_mask=active_mask,
             )
+            _debug_wait_comm_round(
+                self.comm_buffer,
+                op="A2F",
+                call=call,
+                layer_idx=model_layer_idx,
+                stage_idx=stage_idx,
+            )
             print(
                 f"[WIN-A2F] end call={call} "
                 f"layer={model_layer_idx} mb={stage_idx} "
@@ -1484,6 +1551,13 @@ class WindowAFDConnector(AFDConnectorBase):
             state.expert_offsets,
             actual_token_num,
             attn_rank_table=self.attn_rank_table,
+        )
+        _debug_wait_comm_round(
+            self.comm_buffer,
+            op="F2A",
+            call=call,
+            layer_idx=context.metadata.layer_idx,
+            stage_idx=context.metadata.stage_idx,
         )
         print(
             f"[WIN-F2A] end call={call} "
