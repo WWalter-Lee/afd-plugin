@@ -274,6 +274,10 @@ class WindowAFDConnector(AFDConnectorBase):
         self.attention_layer_ids: torch.Tensor | None = None
         self.attention_sync_layer_id: torch.Tensor | None = None
         self._initialized = False
+        self._debug_a2f_call = 0
+        self._debug_batch_call = 0
+        self._debug_f2a_call = 0
+        self._debug_combine_call = 0
 
         hf_config = vllm_config.model_config.hf_config
         self.num_layers = int(hf_config.num_hidden_layers)
@@ -878,6 +882,13 @@ class WindowAFDConnector(AFDConnectorBase):
         )
 
         def enqueue_a2f() -> None:
+            call = self._debug_a2f_call
+            self._debug_a2f_call += 1
+            print(
+                f"[WIN-A2F] begin call={call} "
+                f"layer={model_layer_idx} mb={stage_idx}",
+                flush=True,
+            )
             cot.attention_to_ffn(
                 self.comm_buffer,
                 x,
@@ -892,6 +903,11 @@ class WindowAFDConnector(AFDConnectorBase):
                 sync_flag=1 if self.async_mode else 0,
                 ffn_start_rank_id=0,
                 active_mask=active_mask,
+            )
+            print(
+                f"[WIN-A2F] end call={call} "
+                f"layer={model_layer_idx} mb={stage_idx}",
+                flush=True,
             )
 
         if self.attention_graph_compute_pipeline_active():
@@ -974,6 +990,13 @@ class WindowAFDConnector(AFDConnectorBase):
             raise RuntimeError(f"Window F2A has no pending transfer for {key}")
 
         def enqueue_combine(layer_id: torch.Tensor) -> torch.Tensor:
+            call = self._debug_combine_call
+            self._debug_combine_call += 1
+            print(
+                f"[WIN-COMB] begin call={call} "
+                f"layer={key[1]} mb={key[0]}",
+                flush=True,
+            )
             output, _ = torch_npu.npu_attention_worker_combine(
                 self.schedule_context,
                 context.states.expert_scales,
@@ -985,6 +1008,11 @@ class WindowAFDConnector(AFDConnectorBase):
                 # dtype as the Attention continuation/residual, as P2P does.
                 token_dtype=self._token_dtype_for_tensor(ref_tensor),
                 need_schedule=1,
+            )
+            print(
+                f"[WIN-COMB] end call={call} "
+                f"layer={key[1]} mb={key[0]}",
+                flush=True,
             )
             return output[: ref_tensor.shape[0]].reshape_as(ref_tensor)
 
@@ -1086,6 +1114,9 @@ class WindowAFDConnector(AFDConnectorBase):
                 "Window batching expert count exceeds the operator limit: "
                 f"expert_num={batching_expert_num}"
             )
+        call = self._debug_batch_call
+        self._debug_batch_call += 1
+        print(f"[WIN-BATCH] begin call={call}", flush=True)
         if self.async_mode:
             outputs = cot.ffn_worker_batching(
                 self.schedule_context,
@@ -1109,6 +1140,7 @@ class WindowAFDConnector(AFDConnectorBase):
                 need_schedule=1,
                 layer_num=0,
             )
+        print(f"[WIN-BATCH] end call={call}", flush=True)
         (
             hidden_states,
             group_list,
@@ -1335,6 +1367,9 @@ class WindowAFDConnector(AFDConnectorBase):
                 f"{[tuple(value.shape) for value in metadata]}"
             )
 
+        call = self._debug_f2a_call
+        self._debug_f2a_call += 1
+        print(f"[WIN-F2A] begin call={call}", flush=True)
         cot.ffn_to_attention(
             self.comm_buffer,
             routed_output,
@@ -1345,6 +1380,7 @@ class WindowAFDConnector(AFDConnectorBase):
             actual_token_num,
             attn_rank_table=self.attn_rank_table,
         )
+        print(f"[WIN-F2A] end call={call}", flush=True)
         logger.debug(
             "Window F2A sent stage=%d actual_tokens=%s",
             context.metadata.stage_idx,
