@@ -6,7 +6,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from vllm.v1.outputs import AsyncModelRunnerOutput
 from vllm.v1.worker.workspace import init_workspace_manager
 from vllm_ascend.worker.worker import NPUWorker
 
@@ -27,22 +26,6 @@ from afd_plugin.validation import (
     NPU_ATTENTION_WORKER_FQCN,
     assert_compatible_afd_stack,
 )
-
-
-class _DebugAsyncModelRunnerOutput(AsyncModelRunnerOutput):
-    def __init__(
-        self,
-        output: AsyncModelRunnerOutput,
-        step: int,
-    ) -> None:
-        self._output = output
-        self._step = step
-
-    def get_output(self):
-        print(f"[WIN-ASYNC-OUTPUT] begin step={self._step}", flush=True)
-        result = self._output.get_output()
-        print(f"[WIN-ASYNC-OUTPUT] end step={self._step}", flush=True)
-        return result
 
 
 class AFDNPUAttentionWorker(NPUWorker):
@@ -89,20 +72,6 @@ class AFDNPUAttentionWorker(NPUWorker):
             self.model_runner.start_afd_profiler()
         else:
             self.model_runner.stop_afd_profiler()
-
-    def sample_tokens(self, grammar_output: Any):
-        step = getattr(self, "_debug_worker_sample_step", 0)
-        self._debug_worker_sample_step = step + 1
-        print(f"[WIN-WORKER-SAMPLE] begin step={step}", flush=True)
-        output = super().sample_tokens(grammar_output)
-        print(
-            f"[WIN-WORKER-SAMPLE] end step={step} "
-            f"type={type(output).__name__}",
-            flush=True,
-        )
-        if isinstance(output, AsyncModelRunnerOutput):
-            return _DebugAsyncModelRunnerOutput(output, step)
-        return output
 
     # Online idle DP ranks still need the MTP phase handshake, but startup
     # capture must not advertise a live draft phase to the FFN worker.

@@ -1011,6 +1011,35 @@ class WindowAFDConnector(AFDConnectorBase):
         def enqueue_combine(layer_id: torch.Tensor) -> torch.Tensor:
             call = self._debug_combine_call
             self._debug_combine_call += 1
+            if self.window_tensor is None:
+                raise RuntimeError("Window flag snapshot requires window_tensor")
+            token_slots_per_stage = (
+                self.micro_batch_size * self.selected_expert_num
+            )
+            flag_offset = key[0] * token_slots_per_stage
+            flag_count = token_slots_per_stage
+            print(
+                f"[WIN-FLAG] begin call={call} "
+                f"attn={self.role_rank} layer={key[1]} mb={key[0]}",
+                flush=True,
+            )
+            all_flags = self.window_tensor[
+                : self.micro_batch_num * token_slots_per_stage * 4
+            ].view(torch.int32)
+            stage_flags = all_flags[flag_offset : flag_offset + flag_count]
+            stage_flags_cpu = stage_flags.cpu().tolist()
+            ready = [
+                (slot, value)
+                for slot, value in enumerate(stage_flags_cpu)
+                if value != 0
+            ]
+            print(
+                f"[WIN-FLAG] end call={call} "
+                f"attn={self.role_rank} layer={key[1]} mb={key[0]} "
+                f"ready={len(ready)}/{flag_count} "
+                f"first={ready[:32]}",
+                flush=True,
+            )
             print(
                 f"[WIN-COMB] begin call={call} "
                 f"layer={key[1]} mb={key[0]}",
@@ -1388,6 +1417,41 @@ class WindowAFDConnector(AFDConnectorBase):
 
         call = self._debug_f2a_call
         self._debug_f2a_call += 1
+        print(f"[WIN-F2A-META] begin call={call}", flush=True)
+        actual_num = int(actual_token_num.item())
+        metadata_cpu = torch.stack(metadata, dim=1)[:actual_num].cpu().tolist()
+        slots_by_attention: dict[int, list[int]] = {}
+        invalid = 0
+        for session_id, micro_batch_id, token_id, expert_offset in metadata_cpu:
+            is_valid = (
+                0 <= session_id < self.attn_size
+                and 0 <= micro_batch_id < self.micro_batch_num
+                and 0 <= token_id < self.micro_batch_size
+                and 0 <= expert_offset < self.selected_expert_num
+            )
+            if not is_valid:
+                invalid += 1
+                continue
+            token_slot = (
+                (micro_batch_id * self.micro_batch_size + token_id)
+                * self.selected_expert_num
+                + expert_offset
+            )
+            slots_by_attention.setdefault(session_id, []).append(token_slot)
+        summaries = []
+        duplicate_count = 0
+        for session_id in sorted(slots_by_attention):
+            slots = slots_by_attention[session_id]
+            duplicate_count += len(slots) - len(set(slots))
+            summaries.append(
+                f"attn={session_id}:count={len(slots)}:slots={slots[:32]}"
+            )
+        print(
+            f"[WIN-F2A-META] end call={call} actual={actual_num} "
+            f"invalid={invalid} duplicates={duplicate_count} "
+            + " ".join(summaries),
+            flush=True,
+        )
         print(f"[WIN-F2A] begin call={call}", flush=True)
         cot.ffn_to_attention(
             self.comm_buffer,
@@ -1401,28 +1465,6 @@ class WindowAFDConnector(AFDConnectorBase):
         )
         print(
             f"[WIN-F2A] end call={call} "
-            f"{_debug_comm_buffer_state(self.comm_buffer)}",
-            flush=True,
-        )
-        # Debug-only drain probe: launch an empty round through the public
-        # wrapper so its round ids and keepalive state stay aligned with the
-        # kernel.  The new F2A implementation drains the preceding round at
-        # the beginning of the next launch; zero actual tokens produce no
-        # additional remote data or flag writes.
-        zero_actual_token_num = torch.zeros_like(actual_token_num)
-        print(f"[WIN-F2A-DRAIN] begin call={call}", flush=True)
-        cot.ffn_to_attention(
-            self.comm_buffer,
-            routed_output,
-            state.session_ids,
-            state.micro_batch_ids,
-            state.token_ids,
-            state.expert_offsets,
-            zero_actual_token_num,
-            attn_rank_table=self.attn_rank_table,
-        )
-        print(
-            f"[WIN-F2A-DRAIN] end call={call} "
             f"{_debug_comm_buffer_state(self.comm_buffer)}",
             flush=True,
         )
