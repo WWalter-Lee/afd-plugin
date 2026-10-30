@@ -926,6 +926,12 @@ class WindowAFDConnector(AFDConnectorBase):
                 ffn_start_rank_id=0,
                 active_mask=active_mask,
             )
+            # Debug-only serialized baseline for PR 14650: retire the current
+            # A2F kernel and its in-flight Window writes before FFN Batching is
+            # allowed to consume the layer notification.  If the intermittent
+            # 6/7 F2A metadata count disappears, the current-round A2F remote
+            # completion/visibility contract is the failing boundary.
+            torch.npu.synchronize()
             print(
                 f"[WIN-A2F] end call={call} "
                 f"layer={model_layer_idx} mb={stage_idx} "
