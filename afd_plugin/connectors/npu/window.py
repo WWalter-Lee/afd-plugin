@@ -66,57 +66,6 @@ def _debug_comm_buffer_state(buffer: Any) -> str:
     return f"issued={issued} done={done} keep={len(keepalive)} lag={lag}"
 
 
-def _debug_check_comm_round(
-    buffer: Any,
-    *,
-    op: str,
-    previous: tuple[int, int, int, int] | None,
-) -> None:
-    """Check the previous async round immediately before submitting another."""
-    if previous is None:
-        return
-    target, call, layer_idx, stage_idx = previous
-    issued = getattr(buffer, "_next_round_id", None)
-    status_table = getattr(buffer, "_status_table", None)
-    if issued is None or status_table is None:
-        print(
-            f"[WIN-COMM-CHECK] unavailable op={op} call={call} "
-            f"layer={layer_idx} mb={stage_idx}",
-            flush=True,
-        )
-        return
-    try:
-        done = int(status_table.completed_round())
-    except Exception as exc:
-        print(
-            f"[WIN-COMM-CHECK] error op={op} call={call} "
-            f"layer={layer_idx} mb={stage_idx} target={target} "
-            f"error={type(exc).__name__}:{exc}",
-            flush=True,
-        )
-        return
-    status = "done" if done >= target else "pending"
-    print(
-        f"[WIN-COMM-CHECK] {status} op={op} call={call} "
-        f"layer={layer_idx} mb={stage_idx} target={target} "
-        f"completed={done} next_issued={issued}",
-        flush=True,
-    )
-
-
-def _debug_capture_comm_round(
-    buffer: Any,
-    *,
-    call: int,
-    layer_idx: int,
-    stage_idx: int,
-) -> tuple[int, int, int, int] | None:
-    issued = getattr(buffer, "_next_round_id", None)
-    if issued is None:
-        return None
-    return (int(issued) - 1, call, layer_idx, stage_idx)
-
-
 @dataclass(frozen=True, slots=True)
 class WindowAttentionPipelineEvents:
     """One Attention layer/stage's compute, A2F, and Combine events."""
@@ -348,8 +297,6 @@ class WindowAFDConnector(AFDConnectorBase):
         self._debug_batch_call = 0
         self._debug_f2a_call = 0
         self._debug_combine_call = 0
-        self._debug_previous_a2f_round: tuple[int, int, int, int] | None = None
-        self._debug_previous_f2a_round: tuple[int, int, int, int] | None = None
 
         hf_config = vllm_config.model_config.hf_config
         self.num_layers = int(hf_config.num_hidden_layers)
@@ -956,11 +903,6 @@ class WindowAFDConnector(AFDConnectorBase):
         def enqueue_a2f() -> None:
             call = self._debug_a2f_call
             self._debug_a2f_call += 1
-            _debug_check_comm_round(
-                self.comm_buffer,
-                op="A2F",
-                previous=self._debug_previous_a2f_round,
-            )
             print(
                 f"[WIN-A2F] begin call={call} "
                 f"layer={model_layer_idx} mb={stage_idx}",
@@ -980,12 +922,6 @@ class WindowAFDConnector(AFDConnectorBase):
                 sync_flag=1 if self.async_mode else 0,
                 ffn_start_rank_id=0,
                 active_mask=active_mask,
-            )
-            self._debug_previous_a2f_round = _debug_capture_comm_round(
-                self.comm_buffer,
-                call=call,
-                layer_idx=model_layer_idx,
-                stage_idx=stage_idx,
             )
             print(
                 f"[WIN-A2F] end call={call} "
@@ -1215,8 +1151,12 @@ class WindowAFDConnector(AFDConnectorBase):
                 "Window Attention stage received an unexpected tensor: "
                 f"stage={stage_idx}"
             )
+        # Debug-only serialization: make the previous Combine, including its
+        # token-flag clear, finish before the same micro-batch stage can reach
+        # the next A2F ClearAttnActiveFlags.  If missing flags disappear, the
+        # normal cross-stream event chain permits premature Window reuse.
+        dependency.event.synchronize()
         compute_stream = torch.npu.current_stream()
-        dependency.event.wait(compute_stream)
         _record_npu_stream(tensor, compute_stream)
 
     def reset_attention_pipeline_state(self) -> None:
@@ -1503,11 +1443,6 @@ class WindowAFDConnector(AFDConnectorBase):
 
         call = self._debug_f2a_call
         self._debug_f2a_call += 1
-        _debug_check_comm_round(
-            self.comm_buffer,
-            op="F2A",
-            previous=self._debug_previous_f2a_round,
-        )
         print(f"[WIN-F2A-META] begin call={call}", flush=True)
         actual_num = int(actual_token_num.item())
         metadata_cpu = torch.stack(metadata, dim=1)[:actual_num].cpu().tolist()
@@ -1553,12 +1488,6 @@ class WindowAFDConnector(AFDConnectorBase):
             state.expert_offsets,
             actual_token_num,
             attn_rank_table=self.attn_rank_table,
-        )
-        self._debug_previous_f2a_round = _debug_capture_comm_round(
-            self.comm_buffer,
-            call=call,
-            layer_idx=context.metadata.layer_idx,
-            stage_idx=context.metadata.stage_idx,
         )
         print(
             f"[WIN-F2A] end call={call} "
