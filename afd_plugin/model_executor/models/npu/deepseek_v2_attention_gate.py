@@ -136,10 +136,6 @@ def compute_gate_topk(
             norm_type=2,
             out_flag=False,
         )
-        if renormalize:
-            topk_weights = topk_weights / topk_weights.sum(
-                dim=-1, keepdim=True
-            ).clamp_min(1e-20)
     else:
         topk_weights, topk_ids = afd_connector.select_experts(
             hidden_states=hidden_states,

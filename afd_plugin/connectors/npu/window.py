@@ -273,6 +273,7 @@ class WindowAFDConnector(AFDConnectorBase):
         self.attention_micro_batch_ids: torch.Tensor | None = None
         self.attention_layer_ids: torch.Tensor | None = None
         self.attention_sync_layer_id: torch.Tensor | None = None
+        self.attention_active_masks: torch.Tensor | None = None
         self._initialized = False
 
         hf_config = vllm_config.model_config.hf_config
@@ -475,6 +476,7 @@ class WindowAFDConnector(AFDConnectorBase):
         self.attention_micro_batch_ids = None
         self.attention_layer_ids = None
         self.attention_sync_layer_id = None
+        self.attention_active_masks = None
         self.a2f_send_stream = None
         self.f2a_recv_stream = None
         self.attention_graph_compute_stream = None
@@ -530,6 +532,19 @@ class WindowAFDConnector(AFDConnectorBase):
             1,
             dtype=torch.int32,
             device=device,
+        )
+        token_indices = torch.arange(
+            self.micro_batch_size,
+            dtype=torch.int32,
+            device=device,
+        )
+        batch_sizes = torch.arange(
+            self.micro_batch_size + 1,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.attention_active_masks = (
+            token_indices.unsqueeze(0) < batch_sizes.unsqueeze(1)
         )
 
     def _initialize_attention_stream_pipeline(self) -> None:
@@ -825,30 +840,28 @@ class WindowAFDConnector(AFDConnectorBase):
                 f"got {expert_scales.shape[1]}, expected {routed_topk}",
             )
         # Window buffers keep the configured capacity shape, while active_mask
-        # marks only the rows belonging to this request as valid.
-        x = hidden_states.new_zeros(
+        # marks only the rows belonging to this request as valid. A2F consumes
+        # the valid prefix only, so the fixed-capacity tail need not be zeroed.
+        x = hidden_states.new_empty(
             (1, self.micro_batch_size, self.hidden_size),
         )
         x[0, :batch_size].copy_(
             hidden_states.reshape(batch_size, self.hidden_size),
         )
-        padded_expert_ids = torch.zeros(
+        padded_expert_ids = torch.empty(
             (1, self.micro_batch_size, routed_topk),
             dtype=torch.int32,
             device=hidden_states.device,
         )
         padded_expert_ids[0, :batch_size].copy_(expert_ids)
-        active_mask = torch.zeros(
-            (1, self.micro_batch_size),
-            dtype=torch.bool,
-            device=hidden_states.device,
-        )
-        active_mask[0, :batch_size] = True
+        assert self.attention_active_masks is not None
+        active_mask = self.attention_active_masks[batch_size : batch_size + 1]
         # The Window token/data buffers use the configured capacity as the
         # stride between microbatch slots. Keep the combine input at that
         # capacity and snapshot the current scales; the operator uses its
-        # first dimension for both tiling and the microbatch offset.
-        combine_scales = expert_scales.new_zeros(
+        # first dimension for both tiling and the microbatch offset. Combine
+        # results for the inactive tail are discarded below.
+        combine_scales = expert_scales.new_empty(
             (self.micro_batch_size, routed_topk),
         )
         combine_scales[:batch_size].copy_(expert_scales)
