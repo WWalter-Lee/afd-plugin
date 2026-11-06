@@ -204,7 +204,10 @@ class AFDNPUFFNWorker(NPUWorker):
                     torch.npu.synchronize()
                 continue
             control_plane = self.model_runner.connector.control_plane
-            assert control_plane is not None
+            if control_plane is None:
+                self.model_runner.execute_connector_driven_step()
+                torch.npu.synchronize()
+                continue
             payload = control_plane.recv_dp_metadata_list()
             dp_metadata_list = payload.dp_metadata_list
             is_attn_graph_capturing = payload.is_graph_capturing

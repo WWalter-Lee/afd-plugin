@@ -19,6 +19,10 @@ if TYPE_CHECKING:
 
 AFD_ADDITIONAL_CONFIG_KEY: Final[str] = "afd"
 AFD_ASYNC_CONNECTOR: Final[str] = "CAMAsyncAFDConnector"
+WINDOW_CONNECTOR: Final[str] = "WindowAFDConnector"
+AFD_ASYNC_DP_CONNECTORS: Final[frozenset[str]] = frozenset(
+    {AFD_ASYNC_CONNECTOR, WINDOW_CONNECTOR}
+)
 CAMP2P_CONNECTOR: Final[str] = "CAMP2pAFDConnector"
 DEEPEP_M2N_CONNECTOR: Final[str] = "DeepEPM2NAFDConnector"
 DEEPEP_M2N_CONNECTORS: Final[tuple[str, ...]] = (DEEPEP_M2N_CONNECTOR,)
@@ -30,6 +34,7 @@ SUPPORTED_AFD_CONNECTORS: Final[tuple[str, ...]] = (
     DEEPEP_M2N_CONNECTOR,
     CAMP2P_CONNECTOR,
     AFD_ASYNC_CONNECTOR,
+    WINDOW_CONNECTOR,
 )
 
 _ALIASES: Final[dict[str, str]] = {
@@ -108,6 +113,7 @@ class AFDConfig:
             self.role,
             self.num_attention_ranks,
             self.num_ffn_ranks,
+            self.compute_gate_on_attention,
         ]
         extra = (
             json.dumps(self.connector_extra_config, sort_keys=True)
@@ -307,7 +313,7 @@ def is_afd_async_dp(vllm_config: VllmConfig) -> bool:
     return (
         config is not None
         and config.async_dp
-        and config.connector == AFD_ASYNC_CONNECTOR
+        and config.connector in AFD_ASYNC_DP_CONNECTORS
     )
 
 
@@ -331,9 +337,10 @@ def validate_afd_config(
             "AFD connector must be one of "
             f"{SUPPORTED_AFD_CONNECTORS!r}, got {config.connector!r}",
         )
-    if config.async_dp and config.connector != AFD_ASYNC_CONNECTOR:
+    if config.async_dp and config.connector not in AFD_ASYNC_DP_CONNECTORS:
         raise ValueError(
-            "AFD async mode requires connector='CAMAsyncAFDConnector'",
+            "AFD async mode requires connector='CAMAsyncAFDConnector' "
+            "or connector='WindowAFDConnector'",
         )
     if config.connector == "P2pNcclAFDConnector":
         from afd_plugin.distributed import validate_p2p_topology
@@ -356,12 +363,14 @@ def validate_afd_config(
 __all__ = [
     "AFDConfig",
     "AFD_ASYNC_CONNECTOR",
+    "AFD_ASYNC_DP_CONNECTORS",
     "afd_config_from_mapping",
     "AFD_ADDITIONAL_CONFIG_KEY",
     "AFDRole",
     "CAMP2P_CONNECTOR",
     "SUPPORTED_AFD_CONNECTORS",
     "SUPPORTED_AFD_ROLES",
+    "WINDOW_CONNECTOR",
     "connector_extra_config_from_mapping",
     "connector_extra_config_from_source",
     "has_afd_config",

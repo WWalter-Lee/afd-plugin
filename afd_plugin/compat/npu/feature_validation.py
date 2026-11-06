@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
     CAMP2P_CONNECTOR,
+    WINDOW_CONNECTOR,
     AFDConfig,
     is_afd_async_dp,
     parse_afd_config,
@@ -51,6 +52,14 @@ def fail_if_unsupported_npu_afd_features(
 
     if is_dsv4:
         _fail_if_unsupported_dsv4_connector(afd_config)
+
+    if afd_config.connector == WINDOW_CONNECTOR:
+        _fail_if_unsupported_window_u1_features(
+            vllm_config,
+            afd_config,
+            extra_info,
+        )
+        return
 
     if afd_config.connector == AFD_ASYNC_CONNECTOR:
         _fail_if_unsupported_npu_afd_async_features(
@@ -118,7 +127,56 @@ def _is_dsv4_target(vllm_config: VllmConfig) -> bool:
     if getattr(hf_config, "model_type", None) == "deepseek_v4":
         return True
     architectures = getattr(hf_config, "architectures", ()) or ()
-    return any("DeepseekV4" in str(architecture) for architecture in architectures)
+    return any(
+        "DeepseekV4" in str(architecture)
+        and "DeepseekV41" not in str(architecture)
+        for architecture in architectures
+    )
+
+
+def _is_dsv41_target(vllm_config: VllmConfig) -> bool:
+    hf_config = vllm_config.model_config.hf_config
+    if getattr(hf_config, "model_type", None) == "deepseek_v41":
+        return True
+    architectures = getattr(hf_config, "architectures", ()) or ()
+    return any("DeepseekV41" in str(name) for name in architectures)
+
+
+def _fail_if_unsupported_window_u1_features(
+    vllm_config: VllmConfig,
+    afd_config: AFDConfig,
+    extra_info: ConnectorExtraInfo,
+) -> None:
+    """Keep the first v0.30 Window milestone to eager, single-stage U1."""
+
+    from afd_plugin.connectors.npu.window import WindowAFDExtraInfo
+
+    if not _is_dsv41_target(vllm_config):
+        raise RuntimeError("Initial WindowAFDConnector support requires DSV4.1")
+    if not isinstance(extra_info, WindowAFDExtraInfo):
+        raise TypeError("WindowAFDConnector requires WindowAFDExtraInfo")
+    if not afd_config.async_dp or not afd_config.compute_gate_on_attention:
+        raise RuntimeError(
+            "Window eager U1 requires async=true and "
+            "compute_gate_on_attention=true"
+        )
+    if extra_info.micro_batch_num != 1:
+        raise RuntimeError("Initial DSV4.1 Window support requires micro_batch_num=1")
+    parallel = vllm_config.parallel_config
+    if parallel.enable_dbo or parallel.use_ubatching:
+        raise RuntimeError("Initial DSV4.1 Window support does not enable DBO/U2")
+    if not vllm_config.model_config.enforce_eager:
+        raise RuntimeError("Initial DSV4.1 Window support requires enforce_eager")
+    if vllm_config.speculative_config is not None:
+        raise RuntimeError("Initial DSV4.1 Window support does not enable DSpark/MTP")
+    if parallel.use_sequence_parallel_moe:
+        raise RuntimeError("Initial DSV4.1 Window support does not enable MoE SP")
+    if parallel.enable_eplb:
+        raise RuntimeError("Window AFD does not support EPLB")
+    if vllm_config.additional_config.get("mix_placement", False):
+        raise RuntimeError("Window AFD requires mix_placement=false")
+    if int(vllm_config.model_config.hf_config.n_shared_experts) != 1:
+        raise RuntimeError("Window AFD requires exactly one shared expert")
 
 
 def _fail_if_unsupported_dsv4_async_features(
@@ -151,10 +209,15 @@ def _fail_if_unsupported_dsv4_connector(afd_config: AFDConfig) -> None:
     CAMP2P moves them over the A2E ids channel with the gate left on FFN.
     """
 
-    if afd_config.connector not in (AFD_ASYNC_CONNECTOR, CAMP2P_CONNECTOR):
+    if afd_config.connector not in (
+        AFD_ASYNC_CONNECTOR,
+        CAMP2P_CONNECTOR,
+        WINDOW_CONNECTOR,
+    ):
         raise RuntimeError(
-            "DSV4 NPU AFD supports only CAMAsyncAFDConnector and "
-            f"CAMP2pAFDConnector; got {afd_config.connector!r}",
+            "DSV4 NPU AFD supports only CAMAsyncAFDConnector, "
+            "CAMP2pAFDConnector, or WindowAFDConnector; got "
+            f"{afd_config.connector!r}",
         )
 
 

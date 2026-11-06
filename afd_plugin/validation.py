@@ -13,6 +13,7 @@ from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
     CAMP2P_CONNECTOR,
     DEEPEP_M2N_CONNECTORS,
+    WINDOW_CONNECTOR,
     AFDConfig,
     parse_afd_config,
 )
@@ -208,12 +209,18 @@ def validate_npu_model_runner_v2_config(
                     "on Attention"
                 )
             requested_ffn_mode(vllm_config)
+    elif afd_config.connector == WINDOW_CONNECTOR:
+        if not afd_config.async_dp or not afd_config.compute_gate_on_attention:
+            raise RuntimeError(
+                "AFD NPU ModelRunnerV2 Window requires async DP and "
+                "compute_gate_on_attention=true",
+            )
     elif (
         afd_config.connector != CAMP2P_CONNECTOR or afd_config.compute_gate_on_attention
     ):
         raise RuntimeError(
             "AFD NPU ModelRunnerV2 requires synchronous CAMP2pAFDConnector "
-            "with compute_gate_on_attention=false, or Async CAM",
+            "with compute_gate_on_attention=false, Async CAM, or Window",
         )
 
     parallel = vllm_config.parallel_config

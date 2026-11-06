@@ -131,6 +131,18 @@ class AFDNPUFFNModelRunner:
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
         self.model_memory_usage = profiler.consumed_memory
+        if getattr(self.connector, "is_window_connector", False):
+            initializer = getattr(
+                self.model,
+                "initialize_window_global_mxfp_weights",
+                None,
+            )
+            if initializer is None:
+                raise RuntimeError(
+                    "Window AFD model must expose "
+                    "initialize_window_global_mxfp_weights()"
+                )
+            initializer()
 
     def get_model(self) -> torch.nn.Module:
         if self.model is None:
@@ -154,6 +166,42 @@ class AFDNPUFFNModelRunner:
 
     def profile_run(self) -> None:
         return None
+
+    def execute_connector_driven_step(self) -> None:
+        """Run one transport-driven FFN transaction without a control plane."""
+
+        if self.connector.control_plane is not None:
+            raise RuntimeError(
+                "execute_connector_driven_step requires a connector-driven backend"
+            )
+        if not getattr(self.connector, "is_window_connector", False):
+            raise RuntimeError("Unsupported connector-driven NPU FFN backend")
+        step_afd_npu_profiler(self.prof)
+        self._window_ffn_forward_u1()
+
+    def _window_ffn_forward_u1(self) -> None:
+        """Run one eager, single-microbatch asynchronous Window transaction."""
+
+        assert self.model is not None
+        payload = self.connector.recv_attn_output(
+            ubatch_idx=0,
+            max_num_tokens=self.max_num_tokens,
+        )
+        states = payload.context.states
+        group_list = getattr(states, "group_list", None)
+        dynamic_scale = getattr(states, "dynamic_scale", None)
+        if group_list is None:
+            raise RuntimeError("Window batching returned no global group list")
+        rank_output = self.model.compute_window_global_ffn_output(
+            hidden_states=payload.hidden_states,
+            group_list=group_list,
+            dynamic_scale=dynamic_scale,
+        )
+        self.connector.send_ffn_output(
+            rank_output,
+            payload.context,
+            ubatch_idx=0,
+        )
 
     def execute_ffn_step(
         self,
