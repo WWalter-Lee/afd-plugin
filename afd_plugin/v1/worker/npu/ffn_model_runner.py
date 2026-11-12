@@ -183,28 +183,36 @@ class AFDNPUFFNModelRunner:
         """Run one eager asynchronous Window transaction."""
 
         assert self.model is not None
+        txn = int(getattr(self, "_window_debug_txn", 0))
+        self._window_debug_txn = txn + 1
         # FFNWorkerBatching selects all ready Window records and returns their
         # device-side micro_batch_ids. The scalar below is only host metadata;
         # F2A routing uses the operator-produced IDs kept in the payload state.
+        print(f"[U2][F] txn={txn} batching_begin", flush=True)
         payload = self.connector.recv_attn_output(
             ubatch_idx=0,
             max_num_tokens=self.max_num_tokens,
         )
+        print(f"[U2][F] txn={txn} batching_end", flush=True)
         states = payload.context.states
         group_list = getattr(states, "group_list", None)
         dynamic_scale = getattr(states, "dynamic_scale", None)
         if group_list is None:
             raise RuntimeError("Window batching returned no global group list")
+        print(f"[U2][F] txn={txn} gmm_begin", flush=True)
         rank_output = self.model.compute_window_global_ffn_output(
             hidden_states=payload.hidden_states,
             group_list=group_list,
             dynamic_scale=dynamic_scale,
         )
+        print(f"[U2][F] txn={txn} gmm_end", flush=True)
+        print(f"[U2][F] txn={txn} f2a_begin", flush=True)
         self.connector.send_ffn_output(
             rank_output,
             payload.context,
             ubatch_idx=0,
         )
+        print(f"[U2][F] txn={txn} f2a_end", flush=True)
 
     def execute_ffn_step(
         self,

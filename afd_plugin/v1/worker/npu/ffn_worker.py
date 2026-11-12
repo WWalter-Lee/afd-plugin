@@ -206,7 +206,10 @@ class AFDNPUFFNWorker(NPUWorker):
             control_plane = self.model_runner.connector.control_plane
             if control_plane is None:
                 self.model_runner.execute_connector_driven_step()
+                txn = int(getattr(self.model_runner, "_window_debug_txn", 1)) - 1
+                print(f"[U2][F] txn={txn} sync_begin", flush=True)
                 torch.npu.synchronize()
+                print(f"[U2][F] txn={txn} sync_end", flush=True)
                 continue
             payload = control_plane.recv_dp_metadata_list()
             dp_metadata_list = payload.dp_metadata_list

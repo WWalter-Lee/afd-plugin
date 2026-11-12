@@ -3,6 +3,7 @@
 """Ascend inputs, contexts and MLA updates for native MRV2 microbatching."""
 
 import threading
+import traceback
 from collections.abc import Callable
 from contextlib import ExitStack, nullcontext
 from copy import copy
@@ -319,7 +320,17 @@ class NPUUBatchRunner(UBatchRunner):
                 else nullcontext(),
                 use_workspace_lane(0),
             ):
-                return model(**inputs)
+                try:
+                    return model(**inputs)
+                except BaseException:
+                    context = get_forward_context()
+                    print(
+                        "[U2][A] child_forward_failed "
+                        f"stage={getattr(context, 'ubatch_idx', -1)}",
+                        flush=True,
+                    )
+                    traceback.print_exc()
+                    raise
 
         # Native prepare, threads, handoff and merge remain upstream. Restore the
         # parent context even if a child fails before native begin returns finish.

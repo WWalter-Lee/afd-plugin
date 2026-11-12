@@ -242,11 +242,19 @@ class AFDDeepseekV41RemoteMoE(RemoteFFNProxy):
                 seq_len=int(hidden_states.shape[0]),
             )
         )
+        print(
+            f"[U2][A] stage={stage_idx} layer={self.layer_idx} a2f_begin",
+            flush=True,
+        )
         afd_metadata.connector.send_attn_output(
             hidden_states,
             context,
             expert_ids=topk_ids,
             expert_scales=topk_weights,
+        )
+        print(
+            f"[U2][A] stage={stage_idx} layer={self.layer_idx} a2f_end",
+            flush=True,
         )
         # Native DBO starts stage 0 first.  Yield after A2F so stage 1 can
         # publish the same layer before Window batching/Combine waits for it.
@@ -254,10 +262,18 @@ class AFDDeepseekV41RemoteMoE(RemoteFFNProxy):
             hidden_states,
             role="attention",
         )
+        print(
+            f"[U2][A] stage={stage_idx} layer={self.layer_idx} combine_begin",
+            flush=True,
+        )
         hidden_states = afd_metadata.connector.recv_ffn_output(
             ref_tensor=hidden_states,
             ubatch_idx=stage_idx,
             layer_idx=self.layer_idx,
+        )
+        print(
+            f"[U2][A] stage={stage_idx} layer={self.layer_idx} combine_end",
+            flush=True,
         )
         return hidden_states
 
