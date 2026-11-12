@@ -19,6 +19,7 @@ from afd_plugin.connectors import (
 from afd_plugin.distributed import build_window_expert_layout, resolve_role_rank
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
 from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
+from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 try:
     from vllm_ascend.models.deepseek_v41 import model as native
@@ -242,10 +243,23 @@ class AFDDeepseekV41RemoteMoE(RemoteFFNProxy):
             expert_ids=topk_ids,
             expert_scales=topk_weights,
         )
-        return afd_metadata.connector.recv_ffn_output(
+        # Native DBO starts stage 0 first.  Yield after A2F so stage 1 can
+        # publish the same layer before Window batching/Combine waits for it.
+        hidden_states = maybe_apply_dbo_yield(
+            hidden_states,
+            role="attention",
+        )
+        hidden_states = afd_metadata.connector.recv_ffn_output(
             ref_tensor=hidden_states,
             ubatch_idx=afd_metadata.stage_idx,
             layer_idx=self.layer_idx,
+        )
+        # Keep both DBO stages advancing layer by layer.  Without this second
+        # handoff, one stage can enter the next layer while its peer is still
+        # completing the current Window transaction.
+        return maybe_apply_dbo_yield(
+            hidden_states,
+            role="attention",
         )
 
 
