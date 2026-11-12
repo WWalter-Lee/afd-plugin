@@ -20,7 +20,10 @@ import vllm.engine.arg_utils as arg_utils_module
 from afd_plugin.compat.vllm import (
     is_target_vllm_compatible as _is_target_vllm_compatible,
 )
-from afd_plugin.config import parse_optional_afd_config
+from afd_plugin.config import (
+    WINDOW_CONNECTOR,
+    parse_optional_afd_config,
+)
 from afd_plugin.validation import (
     afd_worker_qualname_for_platform_default,
 )
@@ -32,9 +35,11 @@ if TYPE_CHECKING:
 
 _ORIGINAL_CREATE_ENGINE_CONFIG_ATTR = "_afd_plugin_original_create_engine_config"
 _ORIGINAL_VLLM_CONFIG_POST_INIT_ATTR = "_afd_plugin_original_vllm_config_post_init"
+_ORIGINAL_DBO_UNSUPPORTED_ATTR = "_afd_plugin_original_dbo_unsupported_features"
 _AFD_TEMP_BACKEND = "deepep_low_latency"
 _original_create_engine_config: Callable[..., Any] | None = None
 _original_vllm_config_post_init: Callable[..., Any] | None = None
+_original_dbo_unsupported_features: Callable[..., list[str]] | None = None
 
 
 # Patch reason: vLLM validates native ubatching against DeepEP backends and
@@ -157,6 +162,36 @@ def __post_init__(self):
     return result
 
 
+def _get_dbo_unsupported_features(self) -> list[str]:
+    """Keep native DBO checks, except the text-only DSV4.1 Window wrapper."""
+
+    assert _original_dbo_unsupported_features is not None
+    unsupported = _original_dbo_unsupported_features(self)
+    if not _is_text_only_dsv41_window_u2(self):
+        return unsupported
+    return [
+        reason
+        for reason in unsupported
+        if reason != "dual batch overlap with multimodal models"
+    ]
+
+
+def _is_text_only_dsv41_window_u2(vllm_config: VllmConfig) -> bool:
+    afd_config = parse_optional_afd_config(vllm_config)
+    model_config = vllm_config.model_config
+    return bool(
+        afd_config is not None
+        and afd_config.connector == WINDOW_CONNECTOR
+        and afd_config.is_attention_server
+        and vllm_config.parallel_config.use_ubatching
+        and model_config is not None
+        and model_config.architecture == "DeepseekV41ForCausalLM"
+        and model_config.multimodal_config is not None
+        and model_config.multimodal_config.language_model_only
+        and not getattr(model_config.hf_text_config, "engram_layer_ids", None)
+    )
+
+
 def _apply_afd_npu_config_patches(config: EngineArgs | VllmConfig) -> bool:
     if parse_optional_afd_config(config.additional_config) is None:
         return False
@@ -246,6 +281,12 @@ if _is_target_vllm_compatible():
             _ORIGINAL_VLLM_CONFIG_POST_INIT_ATTR,
             config_module.VllmConfig.__post_init__,
         )
+    if not hasattr(config_module, _ORIGINAL_DBO_UNSUPPORTED_ATTR):
+        setattr(
+            config_module,
+            _ORIGINAL_DBO_UNSUPPORTED_ATTR,
+            config_module.VllmConfig._get_dbo_unsupported_features,
+        )
 
     _original_create_engine_config = getattr(
         arg_utils_module,
@@ -255,9 +296,16 @@ if _is_target_vllm_compatible():
         config_module,
         _ORIGINAL_VLLM_CONFIG_POST_INIT_ATTR,
     )
+    _original_dbo_unsupported_features = getattr(
+        config_module,
+        _ORIGINAL_DBO_UNSUPPORTED_ATTR,
+    )
 
     arg_utils_module.EngineArgs.create_engine_config = create_engine_config
     config_module.VllmConfig.__post_init__ = __post_init__
+    config_module.VllmConfig._get_dbo_unsupported_features = (
+        _get_dbo_unsupported_features
+    )
     arg_utils_module.logger.debug("AFD config validation patch applied")
 
 

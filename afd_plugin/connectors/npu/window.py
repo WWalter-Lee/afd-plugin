@@ -57,7 +57,7 @@ class WindowAFDTransferState(AFDTransferState):
 
 @dataclass(frozen=True, slots=True)
 class WindowAFDExtraInfo(ConnectorExtraInfo):
-    """Options for the first asynchronous eager-U1 Window protocol."""
+    """Options for the asynchronous eager Window protocol."""
 
     micro_batch_num: int = 1
     quant_mode: int = 4
@@ -266,22 +266,29 @@ class WindowAFDConnector(AFDConnectorBase):
                 "WindowAFDConnector requires compute_gate_on_attention=true "
                 "for the ref-style Attention-to-FFN route",
             )
-        if self.micro_batch_num != 1:
+        if self.micro_batch_num not in (1, 2):
             raise ValueError(
-                "DSV4.1 Window eager U1 requires micro_batch_num=1, "
+                "DSV4.1 Window eager execution requires micro_batch_num=1 or 2, "
                 f"got {self.micro_batch_num}",
             )
         parallel_config = self.vllm_config.parallel_config
-        runtime_micro_batch_num = (
-            int(parallel_config.num_ubatches)
-            if parallel_config.enable_dbo and parallel_config.use_ubatching
-            else 1
-        )
-        if self.micro_batch_num != runtime_micro_batch_num:
+        if self.afd_config.is_attention_server:
+            runtime_micro_batch_num = (
+                int(parallel_config.num_ubatches)
+                if parallel_config.use_ubatching
+                else 1
+            )
+            if self.micro_batch_num != runtime_micro_batch_num:
+                raise ValueError(
+                    "Window Attention micro_batch_num must match the vLLM "
+                    "ubatching mode: "
+                    f"window={self.micro_batch_num} "
+                    f"runtime={runtime_micro_batch_num}"
+                )
+        elif parallel_config.use_ubatching:
             raise ValueError(
-                "Window micro_batch_num must match the vLLM DBO mode: "
-                f"window={self.micro_batch_num} "
-                f"runtime={runtime_micro_batch_num}"
+                "Window FFN must not enable vLLM model-forward ubatching; "
+                "micro_batch_num configures transport slots on this role"
             )
         if self.micro_batch_size > 512:
             raise ValueError(
