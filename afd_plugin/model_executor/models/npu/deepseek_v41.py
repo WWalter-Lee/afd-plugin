@@ -9,6 +9,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import ReplicatedLinear
 
 from afd_plugin.config import parse_afd_config
@@ -230,10 +231,14 @@ class AFDDeepseekV41RemoteMoE(RemoteFFNProxy):
         afd_metadata = get_afd_metadata_from_forward_context()
         if afd_metadata is None:
             raise RuntimeError("DSV4.1 Window routing requires AFD metadata")
+        forward_context = get_forward_context()
+        stage_idx = int(
+            getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx)
+        )
         context = AFDTransferContext(
             metadata=AFDTransferMetadata.create_attention_metadata(
                 layer_idx=self.layer_idx,
-                stage_idx=afd_metadata.stage_idx,
+                stage_idx=stage_idx,
                 seq_len=int(hidden_states.shape[0]),
             )
         )
@@ -251,16 +256,10 @@ class AFDDeepseekV41RemoteMoE(RemoteFFNProxy):
         )
         hidden_states = afd_metadata.connector.recv_ffn_output(
             ref_tensor=hidden_states,
-            ubatch_idx=afd_metadata.stage_idx,
+            ubatch_idx=stage_idx,
             layer_idx=self.layer_idx,
         )
-        # Keep both DBO stages advancing layer by layer.  Without this second
-        # handoff, one stage can enter the next layer while its peer is still
-        # completing the current Window transaction.
-        return maybe_apply_dbo_yield(
-            hidden_states,
-            role="attention",
-        )
+        return hidden_states
 
 
 class AFDDeepseekV41DecoderLayer(native.DeepseekV41DecoderLayer):
