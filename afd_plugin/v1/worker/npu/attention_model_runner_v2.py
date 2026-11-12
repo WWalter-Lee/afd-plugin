@@ -324,7 +324,46 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         # ### PATCH START: create the native NPU ubatch adapter.
         with use_npu_ubatch_factory(self):
             super().initialize_kv_cache(kv_cache_config, kv_cache_allocation_context)
+        if self.ubatch_runner is not None:
+            # Native MRV2 prepares only its own Attention builders. U2 owns an
+            # independent builder per stage, so initialize their V4.1 source
+            # RoPE after KV/cache registration has completed as well.
+            self.ubatch_runner.prepare_v41_source_rope()
         # ### PATCH END: create the native NPU ubatch adapter.
+
+    def _uses_fixed_window_u2(self) -> bool:
+        return bool(
+            getattr(self.connector, "is_window_connector", False)
+            and int(getattr(self.connector, "micro_batch_num", 1)) == 2
+        )
+
+    def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc):
+        """Prepare the padded second child required by fixed Window U2."""
+        input_batch = super().prepare_inputs(
+            scheduler_output,
+            batch_req_state,
+            batch_desc,
+        )
+        if not self._uses_fixed_window_u2() or batch_desc.num_ubatches != 2:
+            return input_batch
+
+        num_tokens = int(input_batch.num_tokens)
+        num_tokens_padded = int(input_batch.num_tokens_after_padding)
+        if num_tokens_padded <= num_tokens:
+            return input_batch
+
+        # Native MRV2 represents the dummy child as zero real query tokens over
+        # one padded model token.  Make that token deterministic and keep its
+        # Attention state empty, equivalent to DSV4's fixed-U2 dummy padding.
+        padding = slice(num_tokens, num_tokens_padded)
+        input_batch.input_ids[padding].copy_(
+            input_batch.input_ids[:1].expand(num_tokens_padded - num_tokens)
+        )
+        input_batch.positions[padding].fill_(127)
+        input_batch.is_padding[:num_tokens].fill_(False)
+        input_batch.is_padding[padding].fill_(True)
+        input_batch.seq_lens[input_batch.num_reqs :].zero_()
+        return input_batch
 
     # Patch reason: vLLM v0.30.0 prepares FULL graph inputs before each warmup
     # and formal capture forward, outside torch.cuda.graph, but does not expose
@@ -452,7 +491,11 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                 and self.afd_config.num_attention_ranks > self.afd_config.num_ffn_ranks
                 else nullcontext(),
                 replay_scope,
-                use_async_cam_dbo_dispatch()
+                use_async_cam_dbo_dispatch(
+                    force_window_u2=(
+                        self._uses_fixed_window_u2() and not dummy_run
+                    )
+                )
                 if self.afd_config.async_dp and self.ubatch_runner is not None
                 else nullcontext(),
                 _use_afd_ubatch_preparation(self),

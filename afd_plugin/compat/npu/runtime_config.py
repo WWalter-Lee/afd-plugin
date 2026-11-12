@@ -7,7 +7,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from afd_plugin.config import (
-    AFD_ASYNC_CONNECTOR,
+    WINDOW_CONNECTOR,
     is_afd_async_dp,
     parse_afd_config,
 )
@@ -22,22 +22,20 @@ DEEPSEEK_V2_MODEL_TYPES = frozenset(
 
 
 def configure_async_cam_dbo(vllm_config: VllmConfig) -> None:
-    """Normalize native ubatching to DBO on every Attention DP size."""
+    """Normalize native ubatching for async AFD Attention connectors."""
     afd_config = parse_afd_config(vllm_config)
     parallel = vllm_config.parallel_config
-    if (
-        afd_config.connector != AFD_ASYNC_CONNECTOR
-        or not afd_config.is_attention_server
-    ):
+    if not is_afd_async_dp(vllm_config) or not afd_config.is_attention_server:
         return
     if not parallel.use_ubatching:
         return
 
     parallel.enable_dbo = True
-    # Normalizing ubatching happens after ParallelConfig validation.
-    # Repeat its native threshold guard so no empty child can be selected.
+    # Dynamic DBO connectors still rely on thresholds to avoid an empty child.
+    # Window U2 is a fixed two-slot protocol and pads that child explicitly.
     if (
-        min(
+        afd_config.connector != WINDOW_CONNECTOR
+        and min(
             parallel.dbo_decode_token_threshold,
             parallel.dbo_prefill_token_threshold,
         )

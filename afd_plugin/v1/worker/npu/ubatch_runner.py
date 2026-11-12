@@ -114,6 +114,17 @@ class NPUUBatchRunner(UBatchRunner):
                         )
                 self.stage_attn_groups.append(groups)
 
+    def prepare_v41_source_rope(self) -> None:
+        """Prepare DSV4.1 source RoPE on each microbatch-local builder."""
+        from vllm_ascend.attention.dsa_v41 import AscendDSAV41MetadataBuilder
+
+        for groups in self.stage_attn_groups:
+            for cache_group in groups:
+                for group in cache_group:
+                    for builder in group.metadata_builders:
+                        if isinstance(builder, AscendDSAV41MetadataBuilder):
+                            builder.prepare_source_rope()
+
     # Ascend 8d4409d6 asserts ubatch_idx == 0 and always selects builder zero.
     # Feed its existing builder function an independent group per native child;
     # no request/KV slicing or MRV1 state is reproduced here. Preserve native

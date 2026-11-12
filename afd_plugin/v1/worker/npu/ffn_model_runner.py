@@ -177,12 +177,15 @@ class AFDNPUFFNModelRunner:
         if not getattr(self.connector, "is_window_connector", False):
             raise RuntimeError("Unsupported connector-driven NPU FFN backend")
         step_afd_npu_profiler(self.prof)
-        self._window_ffn_forward_u1()
+        self._window_ffn_forward_async()
 
-    def _window_ffn_forward_u1(self) -> None:
-        """Run one eager, single-microbatch asynchronous Window transaction."""
+    def _window_ffn_forward_async(self) -> None:
+        """Run one eager asynchronous Window transaction."""
 
         assert self.model is not None
+        # FFNWorkerBatching selects all ready Window records and returns their
+        # device-side micro_batch_ids. The scalar below is only host metadata;
+        # F2A routing uses the operator-produced IDs kept in the payload state.
         payload = self.connector.recv_attn_output(
             ubatch_idx=0,
             max_num_tokens=self.max_num_tokens,

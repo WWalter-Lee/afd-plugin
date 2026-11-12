@@ -54,7 +54,7 @@ def fail_if_unsupported_npu_afd_features(
         _fail_if_unsupported_dsv4_connector(afd_config)
 
     if afd_config.connector == WINDOW_CONNECTOR:
-        _fail_if_unsupported_window_u1_features(
+        _fail_if_unsupported_window_features(
             vllm_config,
             afd_config,
             extra_info,
@@ -142,12 +142,12 @@ def _is_dsv41_target(vllm_config: VllmConfig) -> bool:
     return any("DeepseekV41" in str(name) for name in architectures)
 
 
-def _fail_if_unsupported_window_u1_features(
+def _fail_if_unsupported_window_features(
     vllm_config: VllmConfig,
     afd_config: AFDConfig,
     extra_info: ConnectorExtraInfo,
 ) -> None:
-    """Keep the first v0.30 Window milestone to eager, single-stage U1."""
+    """Validate the eager DSV4.1 Window U1 and functional U2 paths."""
 
     from afd_plugin.connectors.npu.window import WindowAFDExtraInfo
 
@@ -157,20 +157,47 @@ def _fail_if_unsupported_window_u1_features(
         raise TypeError("WindowAFDConnector requires WindowAFDExtraInfo")
     if not afd_config.async_dp or not afd_config.compute_gate_on_attention:
         raise RuntimeError(
-            "Window eager U1 requires async=true and "
+            "Window eager execution requires async=true and "
             "compute_gate_on_attention=true"
         )
-    if extra_info.micro_batch_num != 1:
-        raise RuntimeError("Initial DSV4.1 Window support requires micro_batch_num=1")
+    micro_batch_num = int(extra_info.micro_batch_num)
+    if micro_batch_num not in (1, 2):
+        raise RuntimeError("DSV4.1 Window supports micro_batch_num=1 or 2")
     parallel = vllm_config.parallel_config
-    if parallel.enable_dbo or parallel.use_ubatching:
-        raise RuntimeError("Initial DSV4.1 Window support does not enable DBO/U2")
+    uses_ubatching = bool(parallel.use_ubatching)
+    if micro_batch_num == 1 and uses_ubatching:
+        raise RuntimeError("Window U1 must not enable DBO/ubatching")
+    if micro_batch_num == 2:
+        engram_layer_ids = (
+            getattr(vllm_config.model_config.hf_config, "engram_layer_ids", ()) or ()
+        )
+        if engram_layer_ids:
+            raise RuntimeError(
+                "DSV4.1 Window U2 does not support Engram yet; "
+                "clear engram_layer_ids with the model override"
+            )
+        if afd_config.is_attention_server:
+            multimodal_config = vllm_config.model_config.multimodal_config
+            if multimodal_config is None or not multimodal_config.language_model_only:
+                raise RuntimeError(
+                    "DSV4.1 Window Attention U2 requires --language-model-only"
+                )
+            if not uses_ubatching or int(parallel.num_ubatches) != 2:
+                raise RuntimeError(
+                    "Window Attention U2 requires vLLM DBO with exactly two "
+                    "ubatches"
+                )
+        elif uses_ubatching:
+            raise RuntimeError(
+                "Window FFN uses two transport slots but must not enable the "
+                "vLLM model-forward UBatchRunner"
+            )
     if not vllm_config.model_config.enforce_eager:
-        raise RuntimeError("Initial DSV4.1 Window support requires enforce_eager")
+        raise RuntimeError("DSV4.1 Window U1/U2 requires enforce_eager")
     if vllm_config.speculative_config is not None:
-        raise RuntimeError("Initial DSV4.1 Window support does not enable DSpark/MTP")
+        raise RuntimeError("DSV4.1 Window U1/U2 does not enable DSpark/MTP")
     if parallel.use_sequence_parallel_moe:
-        raise RuntimeError("Initial DSV4.1 Window support does not enable MoE SP")
+        raise RuntimeError("DSV4.1 Window U1/U2 does not enable MoE SP")
     if parallel.enable_eplb:
         raise RuntimeError("Window AFD does not support EPLB")
     if vllm_config.additional_config.get("mix_placement", False):

@@ -152,8 +152,8 @@ def use_npu_ubatch_factory(runner: "AFDNPUAttentionModelRunnerV2") -> Iterator[N
 
 
 @contextmanager
-def use_async_cam_dbo_dispatch() -> Iterator[None]:
-    """Extend native threshold selection to Async CAM Attention DP=1."""
+def use_async_cam_dbo_dispatch(*, force_window_u2: bool = False) -> Iterator[None]:
+    """Extend native DBO dispatch and keep Window U2 structurally fixed."""
     original_dispatch = model_runner.dispatch_cg_and_sync_dp
 
     # Patch reason: native dispatch returns early at DP=1 before DBO selection.
@@ -192,8 +192,22 @@ def use_async_cam_dbo_dispatch() -> Iterator[None]:
             uniform_decode=uniform_decode,
             dp_sync=dp_sync,
         )
-        # ### PATCH START: native DBO eligibility without a DP handshake.
-        if (
+        # ### PATCH START: fixed Window U2 or native DBO eligibility.
+        if force_window_u2:
+            if parallel_config is None or get_num_ubatches(parallel_config) != 2:
+                raise RuntimeError("Window U2 requires exactly two microbatches")
+            # Window allocates two transport slots and cannot dynamically fall
+            # back to U1.  Match the verified DSV4 path: a one-token decode is
+            # padded to a second model token/request slot so both children run.
+            desc = replace(
+                desc,
+                num_tokens=max(int(desc.num_tokens), int(num_tokens), 2),
+                num_reqs=max(int(desc.num_reqs or num_reqs), 2)
+                if num_tokens < 2
+                else desc.num_reqs,
+                num_ubatches=2,
+            )
+        elif (
             dp_size == 1
             and allow_ubatching
             and parallel_config is not None
@@ -201,7 +215,7 @@ def use_async_cam_dbo_dispatch() -> Iterator[None]:
             and num_tokens >= get_num_ubatches(parallel_config)
         ):
             desc = replace(desc, num_ubatches=get_num_ubatches(parallel_config))
-        # ### PATCH END: native DBO eligibility without a DP handshake.
+        # ### PATCH END: fixed Window U2 or native DBO eligibility.
         return desc, sync
 
     model_runner.dispatch_cg_and_sync_dp = dispatch_cg_and_sync_dp

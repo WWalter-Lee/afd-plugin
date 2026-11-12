@@ -9,7 +9,9 @@ from typing import Any
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm_ascend.ascend_forward_context import get_mrv2_in_profile_run
 
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors import (
@@ -19,6 +21,7 @@ from afd_plugin.connectors import (
 from afd_plugin.distributed import build_window_expert_layout, resolve_role_rank
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
 from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
+from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 try:
     from vllm_ascend.models.deepseek_v41 import model as native
@@ -166,7 +169,7 @@ class AFDDeepseekV41RemoteMoE(RemoteFFNProxy):
         if is_draft_layer:
             raise ValueError("DSV4.1 Window AFD does not support draft layers yet")
         if parallel_config.use_sequence_parallel_moe:
-            raise ValueError("DSV4.1 Window eager U1 does not support MoE SP yet")
+            raise ValueError("DSV4.1 Window eager execution does not support MoE SP")
         self.top_k = int(config.num_experts_per_tok)
         self.renormalize = bool(config.norm_topk_prob)
         self.scoring_func = getattr(config, "scoring_func", "softmax")
@@ -215,7 +218,7 @@ class AFDDeepseekV41RemoteMoE(RemoteFFNProxy):
         already_sequence_parallel: bool = False,
     ) -> torch.Tensor:
         if already_sequence_parallel:
-            raise RuntimeError("DSV4.1 Window eager U1 does not support MoE SP")
+            raise RuntimeError("DSV4.1 Window eager execution does not support MoE SP")
         from afd_plugin.model_executor.models.npu.deepseek_v4_attention_gate import (
             compute_attention_gate_topk,
         )
@@ -229,10 +232,24 @@ class AFDDeepseekV41RemoteMoE(RemoteFFNProxy):
         afd_metadata = get_afd_metadata_from_forward_context()
         if afd_metadata is None:
             raise RuntimeError("DSV4.1 Window routing requires AFD metadata")
+        forward_context = get_forward_context()
+        # Startup profiling is a local Attention dummy forward.  vLLM disables
+        # ubatching for this run, so a Window configured with two transport
+        # stages has no matching stage-1 request on FFN.  Keep the local Gate in
+        # the memory profile, but do not launch unmatched A2F/F2A communication.
+        # This mirrors the verified DSV4 async profiling path.
+        if (
+            get_mrv2_in_profile_run()
+            and int(getattr(afd_metadata.connector, "micro_batch_num", 1)) == 2
+        ):
+            return torch.zeros_like(hidden_states)
+        stage_idx = int(
+            getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx)
+        )
         context = AFDTransferContext(
             metadata=AFDTransferMetadata.create_attention_metadata(
                 layer_idx=self.layer_idx,
-                stage_idx=afd_metadata.stage_idx,
+                stage_idx=stage_idx,
                 seq_len=int(hidden_states.shape[0]),
             )
         )
@@ -242,11 +259,18 @@ class AFDDeepseekV41RemoteMoE(RemoteFFNProxy):
             expert_ids=topk_ids,
             expert_scales=topk_weights,
         )
-        return afd_metadata.connector.recv_ffn_output(
+        # Native DBO starts stage 0 first.  Yield after A2F so stage 1 can
+        # publish the same layer before Window batching/Combine waits for it.
+        hidden_states = maybe_apply_dbo_yield(
+            hidden_states,
+            role="attention",
+        )
+        hidden_states = afd_metadata.connector.recv_ffn_output(
             ref_tensor=hidden_states,
-            ubatch_idx=afd_metadata.stage_idx,
+            ubatch_idx=stage_idx,
             layer_idx=self.layer_idx,
         )
+        return hidden_states
 
 
 class AFDDeepseekV41DecoderLayer(native.DeepseekV41DecoderLayer):
