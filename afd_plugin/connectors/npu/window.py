@@ -19,6 +19,7 @@ import torch
 import torch.distributed as dist
 import torch_npu
 from torch.distributed.distributed_c10d import ProcessGroup
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 
 from afd_plugin.config import AFDConfig
@@ -39,6 +40,20 @@ from afd_plugin.distributed import (
 logger = init_logger(__name__)
 
 _COMM_CONTEXT_WINDOW_ALIGNMENT = 2 * 1024 * 1024
+
+
+def _record_npu_stream(tensor: torch.Tensor, stream: Any) -> None:
+    if tensor.device.type == "npu":
+        tensor.record_stream(stream)
+
+
+@dataclass(frozen=True, slots=True)
+class WindowAttentionPipelineEvents:
+    """Events for one Attention layer and one Window microbatch."""
+
+    compute_done: Any
+    send_done: Any
+    recv_done: Any
 
 
 @dataclass(slots=True)
@@ -231,6 +246,11 @@ class WindowAFDConnector(AFDConnectorBase):
         self.attn_rank_table: torch.Tensor | None = None
         self.local_expert_num = 0
         self._pending_transfers: dict[tuple[int, int], AFDTransferContext] = {}
+        self.a2f_send_stream = None
+        self.f2a_recv_stream = None
+        self.attention_pipeline_events: dict[
+            tuple[int, int], WindowAttentionPipelineEvents
+        ] = {}
         self.attention_session_id: torch.Tensor | None = None
         self.attention_micro_batch_ids: torch.Tensor | None = None
         self.attention_layer_ids: torch.Tensor | None = None
@@ -248,6 +268,9 @@ class WindowAFDConnector(AFDConnectorBase):
         self.selected_expert_num = routed_topk + shared_expert_num
         self.expert_num = self.routed_expert_num + shared_expert_num
         self.micro_batch_num = self.extra_info.micro_batch_num
+        self.stream_overlap_enabled = bool(
+            self.async_mode and self.micro_batch_num > 1
+        )
         # M is an independent Window slot dimension, not a divisor of BS.
         # Keep the operator's per-slot capacity equal to scheduler capacity.
         self.micro_batch_size = int(
@@ -404,6 +427,8 @@ class WindowAFDConnector(AFDConnectorBase):
             self._build_rank_tables()
             if self.afd_config.role == "attention":
                 self._initialize_attention_operator_metadata()
+                if self.stream_overlap_enabled:
+                    self._initialize_attention_stream_pipeline()
             ffn_kind = ""
             if self.afd_config.role == "ffn":
                 ffn_kind = build_window_expert_layout(
@@ -434,6 +459,9 @@ class WindowAFDConnector(AFDConnectorBase):
 
     def close(self) -> None:
         self._pending_transfers.clear()
+        self.attention_pipeline_events.clear()
+        self.a2f_send_stream = None
+        self.f2a_recv_stream = None
         self.attention_session_id = None
         self.attention_micro_batch_ids = None
         self.attention_layer_ids = None
@@ -499,6 +527,55 @@ class WindowAFDConnector(AFDConnectorBase):
         self.attention_active_masks = (
             token_indices.unsqueeze(0) < batch_sizes.unsqueeze(1)
         )
+
+    def _initialize_attention_stream_pipeline(self) -> None:
+        """Create eager U2 A2F/Combine streams and per-stage events."""
+        device = torch.device("npu", self.local_rank)
+        self.a2f_send_stream = torch.npu.Stream(device=device)
+        self.f2a_recv_stream = torch.npu.Stream(device=device)
+        self.attention_pipeline_events = {
+            (layer_idx, stage_idx): WindowAttentionPipelineEvents(
+                compute_done=torch.npu.Event(),
+                send_done=torch.npu.Event(),
+                recv_done=torch.npu.Event(),
+            )
+            for layer_idx in range(self.num_layers)
+            for stage_idx in range(self.micro_batch_num)
+        }
+
+    def _attention_stream_pipeline_active(self) -> bool:
+        """Return whether this forward uses the eager Window U2 pipeline."""
+        if torch.compiler.is_compiling():
+            return False
+        if not (
+            self.stream_overlap_enabled
+            and self.afd_config.role == "attention"
+            and self.a2f_send_stream is not None
+            and self.f2a_recv_stream is not None
+            and self.attention_pipeline_events
+        ):
+            return False
+        try:
+            forward_context = get_forward_context()
+        except AssertionError:
+            return False
+        return bool(
+            getattr(forward_context, "dbo_enabled", False)
+            and int(getattr(forward_context, "num_ubatches", 1)) > 1
+        )
+
+    def _attention_events(
+        self,
+        layer_idx: int,
+        stage_idx: int,
+    ) -> WindowAttentionPipelineEvents:
+        try:
+            return self.attention_pipeline_events[(layer_idx, stage_idx)]
+        except KeyError as exc:
+            raise RuntimeError(
+                "Window Attention pipeline event is not initialized: "
+                f"layer={layer_idx} stage={stage_idx}"
+            ) from exc
 
     def _build_rank_tables(self) -> None:
         """Build a balanced routed table plus one shared-first FFN rank."""
@@ -711,7 +788,26 @@ class WindowAFDConnector(AFDConnectorBase):
                 active_mask=active_mask,
             )
 
-        enqueue_a2f()
+        if self._attention_stream_pipeline_active():
+            events = self._attention_events(model_layer_idx, stage_idx)
+            compute_stream = torch.npu.current_stream()
+            events.compute_done.record(compute_stream)
+            assert self.a2f_send_stream is not None
+            with torch.npu.stream(self.a2f_send_stream):
+                events.compute_done.wait(self.a2f_send_stream)
+                for tensor in (
+                    x,
+                    session_id,
+                    micro_batch_id,
+                    layer_id,
+                    padded_expert_ids,
+                    active_mask,
+                ):
+                    _record_npu_stream(tensor, self.a2f_send_stream)
+                enqueue_a2f()
+                events.send_done.record(self.a2f_send_stream)
+        else:
+            enqueue_a2f()
         logger.debug(
             "Window A2F sent layer=%d stage=%d batch=%d topk=%d",
             context.metadata.layer_idx,
@@ -754,9 +850,29 @@ class WindowAFDConnector(AFDConnectorBase):
             )
             return output[: ref_tensor.shape[0]].reshape_as(ref_tensor)
 
+        if not self._attention_stream_pipeline_active():
+            assert self.attention_layer_ids is not None
+            layer_id = self.attention_layer_ids[key[1] : key[1] + 1]
+            return enqueue_combine(layer_id)
+
+        events = self._attention_events(key[1], key[0])
+        assert self.f2a_recv_stream is not None
         assert self.attention_layer_ids is not None
         layer_id = self.attention_layer_ids[key[1] : key[1] + 1]
-        return enqueue_combine(layer_id)
+        with torch.npu.stream(self.f2a_recv_stream):
+            events.send_done.wait(self.f2a_recv_stream)
+            _record_npu_stream(context.states.expert_scales, self.f2a_recv_stream)
+            output = enqueue_combine(layer_id)
+            _record_npu_stream(output, self.f2a_recv_stream)
+            events.recv_done.record(self.f2a_recv_stream)
+
+        # DSV4 defers this dependency to its custom layer-major continuation.
+        # Native DSV4.1 consumes RemoteMoE's return immediately in hc_post, so
+        # join the same dependency back to the caller's compute stream here.
+        compute_stream = torch.npu.current_stream()
+        events.recv_done.wait(compute_stream)
+        _record_npu_stream(output, compute_stream)
+        return output
 
     def recv_attn_output(
         self,

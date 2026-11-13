@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -52,6 +54,37 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_WINDOW_FFN_PIPELINE_DEPTH = 3
+_WINDOW_BATCHING_AIC_NUM = 32
+_WINDOW_BATCHING_AIV_NUM = 16
+_WINDOW_F2A_AIC_NUM = 32
+_WINDOW_F2A_AIV_NUM = 48
+
+
+@contextmanager
+def _limit_window_ffn_operator_cores(
+    stream: Any,
+    *,
+    aic_num: int,
+    aiv_num: int,
+) -> Iterator[None]:
+    """Temporarily limit one eager Window communication operator."""
+    original_limits = torch.npu.get_stream_limit(stream)
+    torch.npu.set_stream_limit(stream, cube_num=aic_num, vector_num=aiv_num)
+    try:
+        yield
+    finally:
+        torch.npu.set_stream_limit(
+            stream,
+            cube_num=original_limits["cube_core_num"],
+            vector_num=original_limits["vector_core_num"],
+        )
+
+
+def _record_npu_stream(tensor: torch.Tensor, stream: Any) -> None:
+    if tensor.device.type == "npu":
+        tensor.record_stream(stream)
+
 
 class AFDNPUFFNModelRunner:
     """Synchronous CAMP2P FFN runner, independent of MRV1."""
@@ -87,6 +120,29 @@ class AFDNPUFFNModelRunner:
         self.connector = connector
         self.num_layers = int(self.model_config.hf_config.num_hidden_layers)
         self.use_aclgraph = _use_npu_aclgraph(vllm_config)
+        self.window_ffn_multistream_enabled = bool(
+            getattr(self.connector, "is_window_connector", False)
+            and getattr(self.connector, "stream_overlap_enabled", False)
+            and self.afd_config.window_ffn_multistream_enabled
+            and not self.use_aclgraph
+        )
+        self.ffn_send_stream = None
+        self.window_ffn_compute_events: list[Any] = []
+        self.window_ffn_send_events: list[Any] = []
+        self.window_ffn_round_index = 0
+        if self.window_ffn_multistream_enabled:
+            self.ffn_send_stream = torch.npu.Stream(device=device)
+            self.window_ffn_compute_events = [
+                torch.npu.Event() for _ in range(_WINDOW_FFN_PIPELINE_DEPTH)
+            ]
+            self.window_ffn_send_events = [
+                torch.npu.Event() for _ in range(_WINDOW_FFN_PIPELINE_DEPTH)
+            ]
+        if getattr(self.connector, "is_window_connector", False):
+            logger.info(
+                "Window FFN two-stream pipeline: enabled=%s",
+                self.window_ffn_multistream_enabled,
+            )
         self._acl_graphs: dict[tuple, dict[str, Any]] = {}
         self.graph_pool = (
             current_platform.get_global_graph_pool() if self.use_aclgraph else None
@@ -179,32 +235,81 @@ class AFDNPUFFNModelRunner:
         step_afd_npu_profiler(self.prof)
         self._window_ffn_forward_async()
 
-    def _window_ffn_forward_async(self) -> None:
-        """Run one eager asynchronous Window transaction."""
-
+    def _compute_window_async_batch(
+        self,
+        payload: Any,
+    ) -> torch.Tensor:
         assert self.model is not None
-        # FFNWorkerBatching selects all ready Window records and returns their
-        # device-side micro_batch_ids. The scalar below is only host metadata;
-        # F2A routing uses the operator-produced IDs kept in the payload state.
-        payload = self.connector.recv_attn_output(
-            ubatch_idx=0,
-            max_num_tokens=self.max_num_tokens,
-        )
         states = payload.context.states
         group_list = getattr(states, "group_list", None)
         dynamic_scale = getattr(states, "dynamic_scale", None)
         if group_list is None:
             raise RuntimeError("Window batching returned no global group list")
-        rank_output = self.model.compute_window_global_ffn_output(
+        return self.model.compute_window_global_ffn_output(
             hidden_states=payload.hidden_states,
             group_list=group_list,
             dynamic_scale=dynamic_scale,
         )
+
+    def _window_ffn_forward_async(self) -> None:
+        """Run one eager asynchronous Window transaction."""
+        if self.window_ffn_multistream_enabled:
+            self._run_window_ffn_multistream_transaction()
+            return
+
+        payload = self.connector.recv_attn_output(
+            ubatch_idx=0,
+            max_num_tokens=self.max_num_tokens,
+        )
+        rank_output = self._compute_window_async_batch(payload)
         self.connector.send_ffn_output(
             rank_output,
             payload.context,
             ubatch_idx=0,
         )
+
+    def _run_window_ffn_multistream_transaction(self) -> None:
+        """Run Batching/GMM on the main stream and F2A on a side stream."""
+        assert self.ffn_send_stream is not None
+        slot_num = len(self.window_ffn_compute_events)
+        if slot_num == 0:
+            raise RuntimeError("Window FFN stream events are not initialized")
+        round_index = self.window_ffn_round_index
+        self.window_ffn_round_index = round_index + 1
+        slot = round_index % slot_num
+        compute_event = self.window_ffn_compute_events[slot]
+        send_event = self.window_ffn_send_events[slot]
+
+        compute_stream = torch.npu.current_stream()
+        if round_index >= slot_num:
+            send_event.wait(compute_stream)
+        with _limit_window_ffn_operator_cores(
+            compute_stream,
+            aic_num=_WINDOW_BATCHING_AIC_NUM,
+            aiv_num=_WINDOW_BATCHING_AIV_NUM,
+        ):
+            payload = self.connector.recv_attn_output(
+                ubatch_idx=0,
+                max_num_tokens=self.max_num_tokens,
+            )
+        rank_output = self._compute_window_async_batch(payload)
+        compute_event.record(compute_stream)
+
+        with torch.npu.stream(self.ffn_send_stream):
+            compute_event.wait(self.ffn_send_stream)
+            _record_window_payload_stream(payload, self.ffn_send_stream)
+            _record_npu_stream(rank_output, self.ffn_send_stream)
+            with _limit_window_ffn_operator_cores(
+                self.ffn_send_stream,
+                aic_num=_WINDOW_F2A_AIC_NUM,
+                aiv_num=_WINDOW_F2A_AIV_NUM,
+            ):
+                self.connector.send_ffn_output(
+                    rank_output,
+                    payload.context,
+                    ubatch_idx=0,
+                )
+            send_event.record(self.ffn_send_stream)
 
     def execute_ffn_step(
         self,
@@ -669,6 +774,27 @@ def _to_dp_level_token_counts(
     # Take the first TP slot of each DP group (all TP slots are identical).
     indices = [dp_idx * tp_size for dp_idx in range(dp_size)]
     return num_tokens_across_dp[indices].contiguous()
+
+
+def _record_window_payload_stream(payload: Any, stream: Any) -> None:
+    """Keep Window batching tensors alive while F2A consumes them."""
+    from afd_plugin.connectors.npu.window import WindowAFDTransferState
+
+    _record_npu_stream(payload.hidden_states, stream)
+    states = payload.context.states
+    if not isinstance(states, WindowAFDTransferState):
+        return
+    for tensor in (
+        states.group_list,
+        states.dynamic_scale,
+        states.session_ids,
+        states.micro_batch_ids,
+        states.token_ids,
+        states.expert_offsets,
+        states.actual_token_num,
+    ):
+        if isinstance(tensor, torch.Tensor):
+            _record_npu_stream(tensor, stream)
 
 
 def _use_npu_aclgraph(vllm_config: VllmConfig) -> bool:

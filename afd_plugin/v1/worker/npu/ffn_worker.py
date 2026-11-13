@@ -206,7 +206,8 @@ class AFDNPUFFNWorker(NPUWorker):
             control_plane = self.model_runner.connector.control_plane
             if control_plane is None:
                 self.model_runner.execute_connector_driven_step()
-                torch.npu.synchronize()
+                if not self.model_runner.window_ffn_multistream_enabled:
+                    torch.npu.synchronize()
                 continue
             payload = control_plane.recv_dp_metadata_list()
             dp_metadata_list = payload.dp_metadata_list

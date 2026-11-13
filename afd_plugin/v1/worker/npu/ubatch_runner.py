@@ -301,6 +301,8 @@ class NPUUBatchRunner(UBatchRunner):
             # assignments run during tracing and cannot initialize each native
             # child: without this, stage 1 silently selects stage 0's group.
             context.ubatch_idx = stage_idx
+            context.num_ubatches = len(ubatch_slices)
+            context.dbo_enabled = True
             mask = context.additional_kwargs.get("mc2_mask")
             if mask is not None:
                 context.additional_kwargs["mc2_mask"] = mask.clone()
