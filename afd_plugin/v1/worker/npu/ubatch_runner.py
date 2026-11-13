@@ -91,6 +91,7 @@ class NPUUBatchRunner(UBatchRunner):
             and not hasattr(hf_config, "index_topk")
             and not hasattr(hf_config, "compress_ratios")
         )
+        self._uses_dsa_graph_buffers = hasattr(hf_config, "compress_ratios")
         self._stage_block_tables: list[tuple[torch.Tensor, ...] | None] = [
             None for _ in range(self.num_ubatches)
         ]
@@ -386,7 +387,20 @@ class NPUUBatchRunner(UBatchRunner):
     def run_fullgraph(
         self, manager: ModelAclGraphManager, desc: BatchExecutionDescriptor
     ) -> Any:
-        """Replay the native graph and update the two captured MLA stages."""
+        """Replay the native graph with backend-specific U2 metadata handling."""
+        if self._uses_dsa_graph_buffers:
+            # DSV4.1 DSA owns graph-stable metadata buffers per stage and its
+            # update_graph_params() is intentionally a no-op.  The Ascend
+            # single-batch manager cannot be used here because it reads one
+            # model_state.attn_metadata, while U2 carries two stage contexts.
+            # Match the verified DSV4 DSA U2 path: replay the captured graph
+            # directly after live preparation has refreshed those buffers.
+            device_metadata = getattr(self.model_state, "device_metadata", None)
+            try:
+                return ModelCudaGraphManager.run_fullgraph(manager, desc)
+            finally:
+                if device_metadata is not None:
+                    device_metadata.finish_replay()
         if not self._uses_mla_graph_params:
             return ModelAclGraphManager.run_fullgraph(manager, desc)
         prepared = self._prepared_state

@@ -54,6 +54,27 @@ from afd_plugin.v1.worker.attention_model_runner_v2 import (
 )
 from afd_plugin.validation import validate_npu_model_runner_v2_config
 
+
+def _normalize_window_u2_capture_descs(
+    capture_descs: list[v2_cudagraph_utils.BatchExecutionDescriptor],
+) -> list[v2_cudagraph_utils.BatchExecutionDescriptor]:
+    """Keep Window graph capture structurally U2, including one-token decode."""
+    normalized: list[v2_cudagraph_utils.BatchExecutionDescriptor] = []
+    for desc in capture_descs:
+        fixed = replace(
+            desc,
+            num_tokens=max(int(desc.num_tokens), 2),
+            num_reqs=(
+                max(int(desc.num_reqs or 1), 2)
+                if int(desc.num_tokens) < 2
+                else desc.num_reqs
+            ),
+            num_ubatches=2,
+        )
+        if fixed not in normalized:
+            normalized.append(fixed)
+    return normalized
+
 if TYPE_CHECKING:
     from afd_plugin.v1.worker.npu.ubatch_runner import NPUUBatchRunner
 
@@ -383,10 +404,12 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
     def capture_model(self, *, profile_only: bool = False) -> int:
         # ### PATCH START: publish AFD FULL graph warmup/capture control.
         manager = self.cudagraph_manager
+        capture_descs = manager._capture_descs.get(CUDAGraphMode.FULL, [])
+        if self._uses_fixed_window_u2():
+            capture_descs = _normalize_window_u2_capture_descs(capture_descs)
+            manager._capture_descs[CUDAGraphMode.FULL] = capture_descs
         # Native graph-memory profiling captures only this descriptor prefix.
-        capture_descs = manager._capture_descs.get(CUDAGraphMode.FULL, [])[
-            : manager._max_full_descs_to_capture
-        ]
+        capture_descs = capture_descs[: manager._max_full_descs_to_capture]
         if not capture_descs:
             raise RuntimeError(
                 "AFD NPU ModelRunnerV2 ACL graph expected at least one FULL "

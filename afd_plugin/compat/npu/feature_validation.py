@@ -147,7 +147,7 @@ def _fail_if_unsupported_window_features(
     afd_config: AFDConfig,
     extra_info: ConnectorExtraInfo,
 ) -> None:
-    """Validate the eager DSV4.1 Window U1 and functional U2 paths."""
+    """Validate the DSV4.1 Window U1 and U2 eager/graph paths."""
 
     from afd_plugin.connectors.npu.window import WindowAFDExtraInfo
 
@@ -157,7 +157,7 @@ def _fail_if_unsupported_window_features(
         raise TypeError("WindowAFDConnector requires WindowAFDExtraInfo")
     if not afd_config.async_dp or not afd_config.compute_gate_on_attention:
         raise RuntimeError(
-            "Window eager execution requires async=true and "
+            "Window execution requires async=true and "
             "compute_gate_on_attention=true"
         )
     micro_batch_num = int(extra_info.micro_batch_num)
@@ -193,7 +193,11 @@ def _fail_if_unsupported_window_features(
                 "vLLM model-forward UBatchRunner"
             )
     if not vllm_config.model_config.enforce_eager:
-        raise RuntimeError("DSV4.1 Window U1/U2 requires enforce_eager")
+        graph_mode = vllm_config.compilation_config.cudagraph_mode.name
+        if graph_mode != "FULL_DECODE_ONLY":
+            raise RuntimeError(
+                "DSV4.1 Window graph execution requires FULL_DECODE_ONLY"
+            )
     if vllm_config.speculative_config is not None:
         raise RuntimeError("DSV4.1 Window U1/U2 does not enable DSpark/MTP")
     if parallel.use_sequence_parallel_moe:

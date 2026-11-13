@@ -14,6 +14,7 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import DPMetadata
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm_ascend.worker.model_runner_v1 import graph_capture
 
 from afd_plugin.compat.npu import (
     ascend_forward_context,
@@ -65,10 +66,16 @@ _WINDOW_F2A_AIV_NUM = 48
 def _limit_window_ffn_operator_cores(
     stream: Any,
     *,
+    graph_capturing: bool,
     aic_num: int,
     aiv_num: int,
 ) -> Iterator[None]:
-    """Temporarily limit one eager Window communication operator."""
+    """Limit one Window communication operator in eager or graph capture."""
+    if graph_capturing:
+        with torch.npu.npugraph_ex.scope.limit_core_num(aic_num, aiv_num):
+            yield
+        return
+
     original_limits = torch.npu.get_stream_limit(stream)
     torch.npu.set_stream_limit(stream, cube_num=aic_num, vector_num=aiv_num)
     try:
@@ -124,7 +131,6 @@ class AFDNPUFFNModelRunner:
             getattr(self.connector, "is_window_connector", False)
             and getattr(self.connector, "stream_overlap_enabled", False)
             and self.afd_config.window_ffn_multistream_enabled
-            and not self.use_aclgraph
         )
         self.ffn_send_stream = None
         self.window_ffn_compute_events: list[Any] = []
@@ -144,6 +150,8 @@ class AFDNPUFFNModelRunner:
                 self.window_ffn_multistream_enabled,
             )
         self._acl_graphs: dict[tuple, dict[str, Any]] = {}
+        self._window_ffn_acl_graph: dict[str, Any] | None = None
+        self._window_ffn_graph_warmed_up = False
         self.graph_pool = (
             current_platform.get_global_graph_pool() if self.use_aclgraph else None
         )
@@ -252,23 +260,21 @@ class AFDNPUFFNModelRunner:
         )
 
     def _window_ffn_forward_async(self) -> None:
-        """Run one eager asynchronous Window transaction."""
+        """Run one asynchronous Window transaction or graph replay."""
+        if self.use_aclgraph:
+            self._run_window_ffn_graph()
+            return
         if self.window_ffn_multistream_enabled:
-            self._run_window_ffn_multistream_transaction()
+            self._run_window_ffn_multistream_transaction(graph_capturing=False)
             return
 
-        payload = self.connector.recv_attn_output(
-            ubatch_idx=0,
-            max_num_tokens=self.max_num_tokens,
-        )
-        rank_output = self._compute_window_async_batch(payload)
-        self.connector.send_ffn_output(
-            rank_output,
-            payload.context,
-            ubatch_idx=0,
-        )
+        self._run_window_ffn_transaction(graph_capturing=False)
 
-    def _run_window_ffn_multistream_transaction(self) -> None:
+    def _run_window_ffn_multistream_transaction(
+        self,
+        *,
+        graph_capturing: bool,
+    ) -> tuple[Any, torch.Tensor]:
         """Run Batching/GMM on the main stream and F2A on a side stream."""
         assert self.ffn_send_stream is not None
         slot_num = len(self.window_ffn_compute_events)
@@ -285,6 +291,7 @@ class AFDNPUFFNModelRunner:
             send_event.wait(compute_stream)
         with _limit_window_ffn_operator_cores(
             compute_stream,
+            graph_capturing=graph_capturing,
             aic_num=_WINDOW_BATCHING_AIC_NUM,
             aiv_num=_WINDOW_BATCHING_AIV_NUM,
         ):
@@ -301,6 +308,7 @@ class AFDNPUFFNModelRunner:
             _record_npu_stream(rank_output, self.ffn_send_stream)
             with _limit_window_ffn_operator_cores(
                 self.ffn_send_stream,
+                graph_capturing=graph_capturing,
                 aic_num=_WINDOW_F2A_AIC_NUM,
                 aiv_num=_WINDOW_F2A_AIV_NUM,
             ):
@@ -310,6 +318,71 @@ class AFDNPUFFNModelRunner:
                     ubatch_idx=0,
                 )
             send_event.record(self.ffn_send_stream)
+        return payload, rank_output
+
+    def _run_window_ffn_transaction(
+        self,
+        *,
+        graph_capturing: bool,
+    ) -> list[tuple[Any, torch.Tensor]]:
+        """Run a serial transaction or one closed two-stream pipeline."""
+        if self.window_ffn_multistream_enabled:
+            self.window_ffn_round_index = 0
+            retained = [
+                self._run_window_ffn_multistream_transaction(
+                    graph_capturing=graph_capturing,
+                )
+                for _ in range(_WINDOW_FFN_PIPELINE_DEPTH)
+            ]
+            assert self.ffn_send_stream is not None
+            torch.npu.current_stream().wait_stream(self.ffn_send_stream)
+            return retained
+
+        payload = self.connector.recv_attn_output(
+            ubatch_idx=0,
+            max_num_tokens=self.max_num_tokens,
+        )
+        rank_output = self._compute_window_async_batch(payload)
+        self.connector.send_ffn_output(
+            rank_output,
+            payload.context,
+            ubatch_idx=0,
+        )
+        return [(payload, rank_output)]
+
+    def _run_window_ffn_graph(self) -> None:
+        """Warm, capture, or replay one complete Window FFN pipeline."""
+        graph_info = self._window_ffn_acl_graph
+        if graph_info is not None:
+            graph_info["graph"].replay()
+            return
+
+        if not self._window_ffn_graph_warmed_up:
+            self._run_window_ffn_transaction(graph_capturing=False)
+            self._window_ffn_graph_warmed_up = True
+            return
+
+        graph = torch.npu.NPUGraph()
+        retained: list[tuple[Any, torch.Tensor]] | None = None
+        set_cudagraph_capturing_enabled(True)
+        try:
+            with (
+                graph_capture(device=self.device),
+                torch.npu.graph(graph, pool=self.graph_pool),
+            ):
+                retained = self._run_window_ffn_transaction(
+                    graph_capturing=True,
+                )
+        finally:
+            set_cudagraph_capturing_enabled(False)
+
+        if not retained:
+            raise RuntimeError("Window FFN ACLGraph capture produced no outputs")
+        self._window_ffn_acl_graph = {
+            "graph": graph,
+            "retained": retained,
+        }
+        logger.info("Captured Window FFN ACLGraph: transactions=%d", len(retained))
 
     def execute_ffn_step(
         self,
@@ -622,6 +695,9 @@ class AFDNPUFFNModelRunner:
         for graph_info in self._acl_graphs.values():
             graph_info["graph"].reset()
         self._acl_graphs.clear()
+        if self._window_ffn_acl_graph is not None:
+            self._window_ffn_acl_graph["graph"].reset()
+            self._window_ffn_acl_graph = None
         self.graph_pool = None
         free_before_shutdown(self.vllm_config)
         self.model = None
