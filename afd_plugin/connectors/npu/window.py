@@ -43,7 +43,7 @@ _COMM_CONTEXT_WINDOW_ALIGNMENT = 2 * 1024 * 1024
 
 # Temporary profiling switch: serialize Window Combine with Attention compute
 # to measure AIV contention from the normal receive-stream overlap.
-_WINDOW_ATTENTION_COMBINE_ON_COMPUTE_STREAM = False
+_WINDOW_ATTENTION_COMBINE_ON_COMPUTE_STREAM = True
 
 
 def _record_npu_stream(tensor: torch.Tensor, stream: Any) -> None:
