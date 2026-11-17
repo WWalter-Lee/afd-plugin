@@ -928,6 +928,34 @@ def test_async_dbo_dispatch_preserves_thresholds_and_falls_back_locally(
     assert native_v2.dispatch_cg_and_sync_dp is native
 
 
+@pytest.mark.parametrize("raise_in_context", [False, True])
+def test_single_token_u2_uses_padding_request_and_restores_planner(raise_in_context):
+    batch = SimpleNamespace(
+        num_tokens=1,
+        num_tokens_after_padding=2,
+        num_reqs=1,
+        num_reqs_after_padding=2,
+        num_scheduled_tokens=np.array([1], dtype=np.int32),
+    )
+    native_plan = ubatch_utils.create_ubatch_slices
+    native_slices = native_plan(batch, 2)
+    outcome = (
+        pytest.raises(RuntimeError, match="test unwind")
+        if raise_in_context
+        else nullcontext()
+    )
+    with outcome, patches.use_npu_input_batch_slicing():
+        slices = ubatch_utils.create_ubatch_slices(batch, 2)
+        assert [stage.request_slice for stage in slices] == [slice(0, 1), slice(1, 2)]
+        assert [stage.token_slice for stage in slices] == [
+            stage.token_slice for stage in native_slices
+        ]
+        if raise_in_context:
+            raise RuntimeError("test unwind")
+    assert ubatch_utils.create_ubatch_slices is native_plan
+    assert ubatch_utils.create_ubatch_slices(batch, 2) == native_slices
+
+
 def test_async_native_children_keep_request_prefix_and_parent_padding(monkeypatch):
 
     monkeypatch.setattr(

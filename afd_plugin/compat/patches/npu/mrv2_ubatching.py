@@ -29,6 +29,7 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlice,
+    UBatchSlices,
     check_ubatch_thresholds,
     get_num_ubatches,
 )
@@ -257,6 +258,32 @@ def use_async_cam_child_dp_metadata() -> Iterator[None]:
 @contextmanager
 def use_npu_input_batch_slicing() -> Iterator[None]:
     original_slice = ubatch_utils._slice_input_batch
+    original_create_slices = ubatch_utils.create_ubatch_slices
+
+    # Patch reason: a one-token U2 batch needs a padding-only second request.
+    # Patch functionality: retain native token boundaries and redirect stage 1
+    # to the padding request. Delegate other shapes to the upstream planner.
+    # Delegation keeps native planning intact outside this narrow correction;
+    # remove when upstream handles this padding-only stage.
+    # Signature matches vLLM v0.30.0 gpu.ubatch_utils.create_ubatch_slices.
+    def create_ubatch_slices(
+        input_batch: InputBatch, num_ubatches: int
+    ) -> UBatchSlices:
+        slices = original_create_slices(input_batch, num_ubatches)
+        # ### PATCH START: select the padding-only U2 request.
+        if (
+            num_ubatches == 2
+            and input_batch.num_tokens == 1
+            and input_batch.num_tokens_after_padding == 2
+            and input_batch.num_reqs == 1
+            and input_batch.num_reqs_after_padding == 2
+        ):
+            slices[1] = UBatchSlice(
+                request_slice=slice(1, 2),
+                token_slice=slices[1].token_slice,
+            )
+        # ### PATCH END: select the padding-only U2 request.
+        return slices
 
     # Native replace() retains the Ascend subtype but leaves seq_lens_np whole.
     # Delegation preserves native query/sequence truncation. Apply exactly its
@@ -296,10 +323,12 @@ def use_npu_input_batch_slicing() -> Iterator[None]:
         # ### PATCH END: extend native slicing with Ascend host lengths.
 
     ubatch_utils._slice_input_batch = _slice_input_batch
+    ubatch_utils.create_ubatch_slices = create_ubatch_slices
     try:
         yield
     finally:
         ubatch_utils._slice_input_batch = original_slice
+        ubatch_utils.create_ubatch_slices = original_create_slices
 
 
 @contextmanager

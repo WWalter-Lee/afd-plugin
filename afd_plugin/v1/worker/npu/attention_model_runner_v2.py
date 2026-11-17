@@ -139,10 +139,11 @@ def _use_afd_fullgraph_replay_hook(
             runner._is_warmup = False
             runner._afd_is_graph_capturing = False
             runner._afd_is_graph_replaying = True
-            runner.send_dp_metadata(
-                runner.build_capture_dp_metadata(padded_tokens),
-                None,
-            )
+            if runner.connector.control_plane is not None:
+                runner.send_dp_metadata(
+                    runner.build_capture_dp_metadata(padded_tokens),
+                    None,
+                )
             result = original_run_fullgraph(desc)
         finally:
             runner._afd_is_graph_replaying = previous_is_graph_replaying
