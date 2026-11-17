@@ -41,6 +41,10 @@ logger = init_logger(__name__)
 
 _COMM_CONTEXT_WINDOW_ALIGNMENT = 2 * 1024 * 1024
 
+# Temporary profiling switch: serialize Window Combine with Attention compute
+# to measure AIV contention from the normal receive-stream overlap.
+_WINDOW_ATTENTION_COMBINE_ON_COMPUTE_STREAM = False
+
 
 def _record_npu_stream(tensor: torch.Tensor, stream: Any) -> None:
     if tensor.device.type == "npu":
@@ -1012,15 +1016,20 @@ class WindowAFDConnector(AFDConnectorBase):
         assert self.f2a_recv_stream is not None
         assert self.attention_layer_ids is not None
         layer_id = self.attention_layer_ids[key[1] : key[1] + 1]
-        with torch.npu.stream(self.f2a_recv_stream):
-            events.send_done.wait(self.f2a_recv_stream)
+        combine_stream = (
+            torch.npu.current_stream()
+            if _WINDOW_ATTENTION_COMBINE_ON_COMPUTE_STREAM
+            else self.f2a_recv_stream
+        )
+        with torch.npu.stream(combine_stream):
+            events.send_done.wait(combine_stream)
             _record_npu_stream(
                 context.states.expert_scales,
-                self.f2a_recv_stream,
+                combine_stream,
             )
             output = enqueue_combine(layer_id)
-            _record_npu_stream(output, self.f2a_recv_stream)
-            events.recv_done.record(self.f2a_recv_stream)
+            _record_npu_stream(output, combine_stream)
+            events.recv_done.record(combine_stream)
         if key[0] in self.attention_receive_dependencies:
             raise RuntimeError(
                 "Window Attention stage already has a deferred Combine result: "
