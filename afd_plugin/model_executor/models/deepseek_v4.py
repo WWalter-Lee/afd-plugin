@@ -940,10 +940,9 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
                     dspark_hidden_ubatches=dspark_hidden_ubatches,
                 )
             else:
-                self._forward_ubatches_eager_pipeline(
+                self._forward_ubatches_interleaved_pipeline(
                     ubatch_metadata=ubatch_metadata,
                     stage_contexts=stage_contexts,
-                    connector=connector,
                     wait_for_receive=wait_for_receive,
                     hidden_ubatches=hidden_ubatches,
                     pending_layers=pending_layers,
@@ -1000,12 +999,11 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
                 )
         return outputs
 
-    def _forward_ubatches_eager_pipeline(
+    def _forward_ubatches_interleaved_pipeline(
         self,
         *,
         ubatch_metadata: list[Any],
         stage_contexts: list[Any],
-        connector: Any,
         wait_for_receive: Any,
         hidden_ubatches: list[torch.Tensor],
         pending_layers: list[AFDDeepseekV4DecoderLayer | None],
@@ -1015,40 +1013,46 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         aux_hidden_ubatches: list[list[torch.Tensor]],
         dspark_hidden_ubatches: list[list[torch.Tensor]],
     ) -> None:
-        del connector
+        """Interleave two Attention stages across remote FFN layer boundaries."""
         llama_4_scaling = None
-        for layer_offset, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer)
-        ):
-            for stage_idx, (item, forward_context) in enumerate(
-                zip(ubatch_metadata, stage_contexts, strict=True)
-            ):
-                with override_forward_context(forward_context):
-                    if layer_offset > 0:
-                        wait_for_receive(
-                            stage_idx=stage_idx,
-                            tensor=hidden_ubatches[stage_idx],
-                        )
-                        self._complete_pending_stage(
-                            stage_idx,
-                            hidden_ubatches,
-                            pending_layers,
-                            pending_continuations,
-                            aux_hidden_ubatches,
-                            dspark_hidden_ubatches,
-                        )
-                    hidden_states, continuation = layer.forward_attention_to_remote_ffn(
+        layers = list(islice(self.layers, self.start_layer, self.end_layer))
+        pending_transfers: list[AFDRemoteFFNTransfer | None] = [None, None]
+
+        def launch_attention_and_a2f(
+            layer: AFDDeepseekV4DecoderLayer,
+            stage_idx: int,
+        ) -> None:
+            item = ubatch_metadata[stage_idx]
+            with override_forward_context(stage_contexts[stage_idx]):
+                hidden_states, continuation = (
+                    layer.forward_attention_to_remote_ffn_input(
                         item.positions,
                         hidden_ubatches[stage_idx],
                         None,
                         llama_4_scaling,
                     )
-                    hidden_ubatches[stage_idx] = hidden_states
-                    pending_layers[stage_idx] = layer
-                    pending_continuations[stage_idx] = continuation
+                )
+                pending_transfers[stage_idx] = layer.dispatch_remote_ffn(
+                    hidden_states
+                )
+                hidden_ubatches[stage_idx] = hidden_states
+                pending_layers[stage_idx] = layer
+                pending_continuations[stage_idx] = continuation
 
-        for stage_idx, forward_context in enumerate(stage_contexts):
-            with override_forward_context(forward_context):
+        def launch_combine(stage_idx: int) -> None:
+            layer = pending_layers[stage_idx]
+            transfer = pending_transfers[stage_idx]
+            if layer is None or transfer is None:
+                raise RuntimeError(
+                    "DSV4 interleaved stage has no pending A2F transfer: "
+                    f"stage={stage_idx}"
+                )
+            with override_forward_context(stage_contexts[stage_idx]):
+                hidden_ubatches[stage_idx] = layer.receive_remote_ffn(transfer)
+            pending_transfers[stage_idx] = None
+
+        def complete_combine(stage_idx: int, *, final: bool = False) -> None:
+            with override_forward_context(stage_contexts[stage_idx]):
                 wait_for_receive(
                     stage_idx=stage_idx,
                     tensor=hidden_ubatches[stage_idx],
@@ -1060,8 +1064,29 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
                     pending_continuations,
                     aux_hidden_ubatches,
                     dspark_hidden_ubatches,
-                    final=True,
+                    final=final,
                 )
+            pending_layers[stage_idx] = None
+            pending_continuations[stage_idx] = None
+
+        first_layer = layers[0]
+        launch_attention_and_a2f(first_layer, 0)
+        launch_attention_and_a2f(first_layer, 1)
+        launch_combine(0)
+
+        for layer in layers[1:]:
+            complete_combine(0)
+            launch_attention_and_a2f(layer, 0)
+
+            launch_combine(1)
+            complete_combine(1)
+            launch_attention_and_a2f(layer, 1)
+
+            launch_combine(0)
+
+        complete_combine(0, final=True)
+        launch_combine(1)
+        complete_combine(1, final=True)
 
     def _forward_ubatches_graph_compute_pipeline(
         self,
