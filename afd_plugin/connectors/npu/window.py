@@ -911,56 +911,21 @@ class WindowAFDConnector(AFDConnectorBase):
                 active_mask=active_mask,
             )
 
-        if self.attention_graph_compute_pipeline_active():
+        if (
+            self.attention_graph_compute_pipeline_active()
+            or self._attention_stream_pipeline_active()
+        ):
             if stage_idx in self.attention_receive_dependencies:
                 raise RuntimeError(
                     "Window Attention stage has an unconsumed Combine result: "
                     f"stage={stage_idx}"
             )
             events = self._attention_events(model_layer_idx, stage_idx)
-            parent_stream = torch.npu.current_stream()
-            # Gate/top-k and fixed-capacity A2F inputs are produced on the
-            # parent capture stream after Attention compute has joined it.
-            # A distinct event prevents the send stream from reading them
-            # as soon as the earlier compute_done event fires.
-            events.send_ready.record(parent_stream)
-            assert self.a2f_send_stream is not None
-            with torch.npu.stream(self.a2f_send_stream):
-                events.send_ready.wait(self.a2f_send_stream)
-                for tensor in (
-                    x,
-                    session_id,
-                    micro_batch_id,
-                    layer_id,
-                    padded_expert_ids,
-                    active_mask,
-                ):
-                    _record_npu_stream(tensor, self.a2f_send_stream)
-                enqueue_a2f()
-                events.send_done.record(self.a2f_send_stream)
-        elif self._attention_stream_pipeline_active():
-            if stage_idx in self.attention_receive_dependencies:
-                raise RuntimeError(
-                    "Window Attention stage has an unconsumed Combine result: "
-                    f"stage={stage_idx}"
-                )
-            events = self._attention_events(model_layer_idx, stage_idx)
-            compute_stream = torch.npu.current_stream()
-            events.compute_done.record(compute_stream)
-            assert self.a2f_send_stream is not None
-            with torch.npu.stream(self.a2f_send_stream):
-                events.compute_done.wait(self.a2f_send_stream)
-                for tensor in (
-                    x,
-                    session_id,
-                    micro_batch_id,
-                    layer_id,
-                    padded_expert_ids,
-                    active_mask,
-                ):
-                    _record_npu_stream(tensor, self.a2f_send_stream)
-                enqueue_a2f()
-                events.send_done.record(self.a2f_send_stream)
+            # Submit A2F immediately after its Attention computation on the
+            # same stream. The model-level interleaved schedule delays Combine
+            # until this stage needs to advance to its next layer.
+            enqueue_a2f()
+            events.send_done.record(torch.npu.current_stream())
         else:
             enqueue_a2f()
         logger.debug(
