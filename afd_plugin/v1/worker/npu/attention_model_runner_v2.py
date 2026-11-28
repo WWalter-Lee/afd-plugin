@@ -27,7 +27,7 @@ from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV
 
 from afd_plugin.compat.npu import fail_if_unsupported_npu_afd_features
 from afd_plugin.compat.npu.profiler import (
-    create_afd_npu_profiler,
+    create_afd_npu_profiler_session,
     step_afd_npu_profiler,
     stop_afd_npu_profiler,
 )
@@ -398,7 +398,7 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             self._afd_pending_metadata: AFDForwardContextMetadata | None = None
             self._afd_suppress_metadata_send = False
             self._afd_transaction_counter = 0
-            self.prof = create_afd_npu_profiler("attention")
+            self.prof = create_afd_npu_profiler_session("attention", self.connector)
         except BaseException:
             try:
                 if connector is not None:

@@ -22,7 +22,7 @@ from afd_plugin.compat.npu import (
 )
 from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.compat.npu.profiler import (
-    create_afd_npu_profiler,
+    create_afd_npu_profiler_session,
     step_afd_npu_profiler,
     stop_afd_npu_profiler,
 )
@@ -102,7 +102,7 @@ class AsyncNPUFFNModelRunner:
         self._graph_failure: Exception | None = None
         self._service_announced = self._is_shutdown = False
         self._failure: Exception | None = None
-        self.prof = create_afd_npu_profiler("ffn")
+        self.prof = create_afd_npu_profiler_session("ffn", self.connector)
 
     def load_model(self) -> None:
         # Import the loader only in the isolated, initialized NPU worker.
