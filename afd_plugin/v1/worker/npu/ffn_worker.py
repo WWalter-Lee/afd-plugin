@@ -24,6 +24,7 @@ from afd_plugin.compat.npu import (
     fix_all2all_backend_for_afd,
     npu_afd_num_ubatches,
 )
+from afd_plugin.compat.npu.profiler import stop_afd_npu_profiler
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import AFDConnectorFactory
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
@@ -76,6 +77,13 @@ class AFDNPUFFNWorker(NPUWorker):
         self._ffn_shutdown_event: threading.Event | None = None
         self._ffn_loop_error: BaseException | None = None
         self._cpu_binding_attempted = False
+
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+        """Control the plugin-owned profiler from vLLM's profile endpoint."""
+        del profile_prefix
+        session = self.model_runner.prof
+        if session is not None:
+            session.request(is_start)
 
     def init_device(self) -> None:
         assert_compatible_afd_stack(
@@ -140,7 +148,11 @@ class AFDNPUFFNWorker(NPUWorker):
 
         def ffn_worker_loop() -> None:
             try:
-                self._run_ffn_server_loop()
+                try:
+                    self._run_ffn_server_loop()
+                finally:
+                    # torch-npu must close CPU trace callbacks on their owner thread.
+                    stop_afd_npu_profiler(self.model_runner.prof)
             except Exception as exc:
                 shutdown_event = self._ffn_shutdown_event
                 if (

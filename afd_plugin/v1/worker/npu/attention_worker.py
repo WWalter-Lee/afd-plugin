@@ -40,6 +40,13 @@ class AFDNPUAttentionWorker(NPUWorker):
         apply_afd_ascend_patches_if_needed()
         super().__init__(*args, **kwargs)
 
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+        """Control the plugin-owned profiler from vLLM's profile endpoint."""
+        del profile_prefix
+        session = self.model_runner.prof
+        if session is not None:
+            session.request(is_start)
+
     def init_device(self) -> None:
         assert_compatible_afd_stack(
             self.vllm_config,

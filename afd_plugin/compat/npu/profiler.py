@@ -7,7 +7,11 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import Final, Literal, Protocol
+from threading import Lock
+from typing import TYPE_CHECKING, Final, Literal, Protocol
+
+if TYPE_CHECKING:
+    from afd_plugin.connectors.base import AFDConnectorBase
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +46,7 @@ class AFDNPUProfilerConfig:
     skip_first: int
     trace_dir: str
     with_stack: bool
+    ranks: frozenset[int] | None = frozenset({0})
 
 
 class AFDNPUProfiler(Protocol):
@@ -65,17 +70,27 @@ def afd_npu_profiler_config(role: AFDNPUProfilerRole) -> AFDNPUProfilerConfig:
             default=_DEFAULT_SKIP_FIRST_STEPS,
         ),
         trace_dir=_env_dir(f"{prefix}_DIR", default=_DEFAULT_DIR[role]),
+        ranks=_env_ranks(f"{prefix}_RANKS"),
         with_stack=_env_bool(f"{prefix}_WITH_STACK", default=False),
     )
 
 
-def create_afd_npu_profiler(role: AFDNPUProfilerRole) -> AFDNPUProfiler | None:
+def create_afd_npu_profiler(
+    role: AFDNPUProfilerRole, *, role_rank: int = 0
+) -> AFDNPUProfiler | None:
     """Create a torch-npu profiler when the plugin-owned env enables it."""
 
     config = afd_npu_profiler_config(role)
-    if not config.enabled:
+    if not config.enabled or (
+        config.ranks is not None and role_rank not in config.ranks
+    ):
         return None
+    return _start_trace(role, role_rank, config)
 
+
+def _start_trace(
+    role: AFDNPUProfilerRole, role_rank: int, config: AFDNPUProfilerConfig
+) -> AFDNPUProfiler:
     import torch_npu
 
     experimental_config = torch_npu.profiler._ExperimentalConfig(
@@ -84,8 +99,9 @@ def create_afd_npu_profiler(role: AFDNPUProfilerRole) -> AFDNPUProfiler | None:
         aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
     )
     logger.info(
-        "AFD NPU %s profiler enabled. Traces will be saved to: %s; with_stack=%s",
+        "AFD NPU %s rank %d profiler enabled: dir=%s, with_stack=%s",
         role,
+        role_rank,
         config.trace_dir,
         config.with_stack,
     )
@@ -113,6 +129,67 @@ def create_afd_npu_profiler(role: AFDNPUProfilerRole) -> AFDNPUProfiler | None:
     return profiler
 
 
+class AFDNPUProfilerSession:
+    """One runner's profiler controlled by explicit profile RPCs."""
+
+    def __init__(
+        self, role: AFDNPUProfilerRole, role_rank: int, config: AFDNPUProfilerConfig
+    ) -> None:
+        self.role = role
+        self.role_rank = role_rank
+        self.config = config
+        self._trace: AFDNPUProfiler | None = None
+        self._selected = config.ranks is None or role_rank in config.ranks
+        self._generation = 0
+        self._requested: int | None = None
+        self._active: int | None = None
+        self._lock = Lock()
+
+    def request(self, is_start: bool) -> None:
+        """Arm/disarm FFN from RPC; the connector thread owns torch-npu TLS."""
+        if not self._selected:
+            return
+        with self._lock:
+            if is_start and self._requested is None:
+                self._generation += 1
+                self._requested = self._generation
+            elif not is_start:
+                self._requested = None
+        if self.role == "attention":
+            self._apply_request()
+
+    def _apply_request(self) -> None:
+        with self._lock:
+            requested = self._requested
+        if requested == self._active:
+            return
+        self.stop()
+        if requested is not None:
+            self._trace = _start_trace(self.role, self.role_rank, self.config)
+            self._active = requested
+
+    def step(self) -> None:
+        if self.role == "ffn" and self._selected:
+            self._apply_request()
+        step_afd_npu_profiler(self._trace)
+
+    def stop(self) -> None:
+        """Close the live trace on its owner thread, including loop exit."""
+        trace = self._trace
+        self._trace = None
+        self._active = None
+        stop_afd_npu_profiler(trace)
+
+
+def create_afd_npu_profiler_session(
+    role: AFDNPUProfilerRole, connector: AFDConnectorBase
+) -> AFDNPUProfilerSession | None:
+    config = afd_npu_profiler_config(role)
+    if not config.enabled:
+        return None
+    return AFDNPUProfilerSession(role, connector.role_rank, config)
+
+
 def step_afd_npu_profiler(profiler: AFDNPUProfiler | None) -> None:
     if profiler is not None:
         profiler.step()
@@ -121,6 +198,19 @@ def step_afd_npu_profiler(profiler: AFDNPUProfiler | None) -> None:
 def stop_afd_npu_profiler(profiler: AFDNPUProfiler | None) -> None:
     if profiler is not None:
         profiler.stop()
+
+
+def _env_ranks(name: str) -> frozenset[int] | None:
+    value = os.getenv(name, "0").strip()
+    if value.lower() == "all":
+        return None
+    try:
+        ranks = frozenset(int(rank.strip()) for rank in value.split(","))
+    except ValueError as exc:
+        raise ValueError(f"{name} expects 'all' or comma-separated ranks") from exc
+    if any(rank < 0 for rank in ranks):
+        raise ValueError(f"{name} expects non-negative role ranks")
+    return ranks
 
 
 def _env_bool(name: str, *, default: bool) -> bool:
@@ -154,6 +244,7 @@ __all__ = [
     "AFDNPUProfiler",
     "afd_npu_profiler_config",
     "create_afd_npu_profiler",
+    "create_afd_npu_profiler_session",
     "step_afd_npu_profiler",
     "stop_afd_npu_profiler",
 ]

@@ -21,7 +21,7 @@ from afd_plugin.compat.npu import (
     fail_if_unsupported_npu_afd_features,
 )
 from afd_plugin.compat.npu.profiler import (
-    create_afd_npu_profiler,
+    create_afd_npu_profiler_session,
     step_afd_npu_profiler,
     stop_afd_npu_profiler,
 )
@@ -155,7 +155,7 @@ class AFDNPUFFNModelRunner:
         self.graph_pool = (
             current_platform.get_global_graph_pool() if self.use_aclgraph else None
         )
-        self.prof = create_afd_npu_profiler("ffn")
+        self.prof = create_afd_npu_profiler_session("ffn", self.connector)
         self._is_shutdown = False
 
     @staticmethod
